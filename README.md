@@ -26,7 +26,7 @@ or
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft." -debug
 ```
 
-## Web build (only supports Q2 & Q3 GGUF files, up to 800 MB):
+## Web build (only supports GGUF files up to 800 MB):
 
 https://lrusso.github.io/llama3pure/llama3pure.htm
 
