@@ -378,15 +378,10 @@ Tell me in 1 line what is Microsoft.</textarea
           if (!file) return
 
           var maxSize = 800 * 1024 * 1024 // 800 MB
-          var isQ2orQ3 =
-            file.name.indexOf("Q2_K") !== -1 ||
-            file.name.indexOf("Q3_K") !== -1 ||
-            file.name.indexOf("Q2_k") !== -1 ||
-            file.name.indexOf("Q3_k") !== -1
 
-          if (!isQ2orQ3 || file.size > maxSize) {
+          if (file.size > maxSize) {
             showStatus(
-              "The Web port has a technical limitation where models bigger than Q2 or Q3 or 800 MB are taking too long to reply. Please select a different GGUF file.",
+              "The Web port has a technical limitation, it only supports GGUF files up to 800 MB. Please select a different GGUF file.",
               "error"
             )
             return
