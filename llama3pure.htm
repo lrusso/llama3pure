@@ -1,0 +1,458 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llama3pure</title>
+    <style>
+      * {
+          box-sizing: border-box;
+      }
+
+      html, body {
+        overscroll-behavior: none;
+      }
+
+      body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+          max-width: 900px;
+          margin: 0 auto;
+          padding: 20px;
+          background-color: #f5f5f5;
+          color: #333;
+      }
+
+      h1 {
+          text-align: center;
+          color: #2c3e50;
+          margin-bottom: 30px;
+      }
+
+      .container {
+          background: white;
+          border-radius: 10px;
+          padding: 25px;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+      }
+
+      .section {
+          margin-bottom: 15px;
+      }
+
+      label {
+          display: block;
+          font-weight: 600;
+          margin-bottom: 8px;
+          color: #34495e;
+      }
+
+      input[type="file"] {
+          display: block;
+          width: 100%;
+          padding: 12px;
+          border: 2px dashed #bdc3c7;
+          border-radius: 8px;
+          background: #ecf0f1;
+          cursor: pointer;
+          transition: border-color 0.3s;
+      }
+
+      input[type="file"]:hover {
+          border-color: #3498db;
+      }
+
+      input[type="text"],
+      input[type="number"],
+      textarea {
+          width: 100%;
+          padding: 12px;
+          border: 1px solid #bdc3c7;
+          border-radius: 8px;
+          font-size: 14px;
+          transition: border-color 0.3s;
+      }
+
+      input[type="text"]:focus,
+      input[type="number"]:focus,
+      textarea:focus {
+          outline: none;
+          border-color: #3498db;
+      }
+
+      textarea {
+          min-height: 100px;
+          resize: vertical;
+          font-family: inherit;
+      }
+
+      .row {
+          display: flex;
+          gap: 15px;
+      }
+
+      .row .section {
+          flex: 1;
+      }
+
+      button {
+          background: #3498db;
+          color: white;
+          border: none;
+          padding: 14px 28px;
+          font-size: 16px;
+          font-weight: 600;
+          border-radius: 8px;
+          cursor: pointer;
+          transition: background 0.3s;
+          width: 100%;
+      }
+
+      button:hover:not(:disabled) {
+          background: #2980b9;
+      }
+
+      button:disabled {
+          background: #bdc3c7;
+          cursor: not-allowed;
+      }
+
+      #output-container {
+          margin-top: 25px;
+          display: none;
+      }
+
+      #output {
+          background: #2c3e50;
+          color: #ecf0f1;
+          padding: 20px;
+          border-radius: 8px;
+          font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
+          font-size: 14px;
+          line-height: 1.6;
+          white-space: pre-wrap;
+          word-wrap: break-word;
+          min-height: 150px;
+          max-height: 400px;
+          overflow-y: auto;
+      }
+
+      #status {
+          text-align: center;
+          padding: 15px;
+          margin-top: 15px;
+          border-radius: 8px;
+          font-weight: 500;
+          display: none;
+      }
+
+      #status.loading {
+          display: block;
+          background: #fff3cd;
+          color: #856404;
+      }
+
+      #status.success {
+          display: block;
+          background: #d4edda;
+          color: #155724;
+      }
+
+      #status.error {
+          display: block;
+          background: #f8d7da;
+          color: #721c24;
+      }
+
+      #model-info {
+          background: #e8f4f8;
+          padding: 15px;
+          border-radius: 8px;
+          margin-top: 15px;
+          margin-bottom: 15px;
+          display: none;
+          font-size: 13px;
+      }
+
+      #model-info h3 {
+          margin: 0 0 10px 0;
+          color: #2c3e50;
+      }
+
+      #output-label {
+          margin: 0 0 8px 0;
+          font-weight: 600;
+          color: #34495e;
+          font-size: 14px;
+      }
+
+      #model-info p {
+          margin: 5px 0;
+          color: #34495e;
+      }
+
+      .credits {
+          text-align: center;
+          margin-top: 30px;
+          color: #7f8c8d;
+          font-size: 13px;
+      }
+
+      .credits a {
+          color: #3498db;
+          text-decoration: none;
+      }
+
+      .credits a:hover {
+          text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>llama3pure</h1>
+
+    <div class="container">
+      <div class="section" id="model-file-section">
+        <label for="model-file">Select GGUF Model File</label>
+        <input type="file" id="model-file" accept=".gguf">
+      </div>
+
+      <div id="model-info">
+        <h3>Model Information</h3>
+        <p id="info-arch"></p>
+        <p id="info-params"></p>
+        <p id="info-vocab"></p>
+      </div>
+
+      <div class="section">
+        <label for="system-prompt">System Prompt</label>
+        <input type="text" id="system-prompt" value="You are a helpful assistant.">
+      </div>
+
+      <div class="section">
+        <label for="prompt">User Prompt</label>
+        <textarea id="prompt" placeholder="Enter your prompt here...">
+Tell me in 1 line what is Microsoft.</textarea
+        >
+      </div>
+
+      <div class="row">
+        <div class="section">
+          <label for="temperature">Temperature</label>
+          <input
+            type="number"
+            id="temperature"
+            value="0.9"
+            min="0"
+            max="2"
+            step="0.1"
+          >
+        </div>
+        <div class="section">
+          <label for="max-tokens">Max Tokens</label>
+          <input
+            type="number"
+            id="max-tokens"
+            value="256"
+            min="1"
+            max="2048"
+            step="1"
+          >
+        </div>
+      </div>
+
+      <div class="section">
+        <button id="generate-btn" disabled>Load a model first</button>
+      </div>
+
+      <div id="status"></div>
+
+      <div id="output-container">
+        <h3 id="output-label">Response</h3>
+        <div id="output"></div>
+      </div>
+    </div>
+
+    <div class="credits">
+      Designed by
+      <a href="https://www.lrusso.com" target="_blank">Leonardo Javier Russo</a>
+    </div>
+
+    <script>
+      ;(function () {
+        var modelFileInput = document.getElementById("model-file")
+        var systemPromptInput = document.getElementById("system-prompt")
+        var promptInput = document.getElementById("prompt")
+        var temperatureInput = document.getElementById("temperature")
+        var maxTokensInput = document.getElementById("max-tokens")
+        var generateBtn = document.getElementById("generate-btn")
+        var statusDiv = document.getElementById("status")
+        var outputContainer = document.getElementById("output-container")
+        var outputDiv = document.getElementById("output")
+        var modelInfoDiv = document.getElementById("model-info")
+        var infoArch = document.getElementById("info-arch")
+        var infoParams = document.getElementById("info-params")
+        var infoVocab = document.getElementById("info-vocab")
+
+        var modelLoaded = false
+        var worker = null
+
+        function showStatus(message, type) {
+          statusDiv.textContent = message
+          statusDiv.className = type
+        }
+
+        function hideStatus() {
+          statusDiv.className = ""
+          statusDiv.style.display = "none"
+        }
+
+        function initWorker() {
+          if (worker) {
+            worker.terminate()
+          }
+
+          worker = new Worker("llama3pure.js")
+
+          worker.onmessage = function (e) {
+            var data = e.data
+
+            switch (data.type) {
+              case "progress":
+                showStatus(data.message, "loading")
+                break
+
+              case "loaded":
+                var config = data.config
+                infoArch.textContent =
+                  "Architecture: " + (config.isGemma ? "Gemma" : "Llama")
+                infoParams.textContent =
+                  "Layers: " +
+                  config.nLayers +
+                  ", Heads: " +
+                  config.nHeads +
+                  ", Dim: " +
+                  config.dim
+                infoVocab.textContent = "Vocabulary: " + config.vocabSize + " tokens"
+                modelInfoDiv.style.display = "block"
+
+                modelLoaded = true
+                generateBtn.disabled = false
+                generateBtn.textContent = "Generate"
+                showStatus("Model loaded successfully!", "success")
+                setTimeout(hideStatus, 3000)
+                break
+
+              case "token":
+                outputDiv.textContent += data.token
+                outputDiv.scrollTop = outputDiv.scrollHeight
+                break
+
+              case "complete":
+                generateBtn.disabled = false
+                generateBtn.textContent = "Generate"
+                showStatus("Generation complete!", "success")
+                setTimeout(hideStatus, 3000)
+                break
+
+              case "error":
+                showStatus("Error: " + data.message, "error")
+                generateBtn.disabled = modelLoaded ? false : true
+                generateBtn.textContent = modelLoaded
+                  ? "Generate"
+                  : "Load a model first"
+                console.error(data.message)
+                break
+            }
+          }
+
+          worker.onerror = function (err) {
+            showStatus("Worker error: " + err.message, "error")
+            generateBtn.disabled = true
+            generateBtn.textContent = "Load a model first"
+            console.error(err)
+          }
+        }
+
+        modelFileInput.addEventListener("change", function (e) {
+          var file = e.target.files[0]
+          if (!file) return
+
+          var maxSize = 800 * 1024 * 1024 // 800 MB
+          var isQ2orQ3 =
+            file.name.indexOf("Q2_K") !== -1 ||
+            file.name.indexOf("Q3_K") !== -1 ||
+            file.name.indexOf("Q2_k") !== -1 ||
+            file.name.indexOf("Q3_k") !== -1
+
+          if (!isQ2orQ3 || file.size > maxSize) {
+            showStatus(
+              "The Web port has a technical limitation where models bigger than Q2 or Q3 or 800 MB are taking too long to reply. Please select a different GGUF file.",
+              "error"
+            )
+            return
+          }
+
+          document.querySelectorAll(".section")[0].style.display = "none"
+          showStatus("Loading model: " + file.name + "...", "loading")
+          generateBtn.disabled = true
+          generateBtn.textContent = "Loading..."
+          modelInfoDiv.style.display = "none"
+          modelLoaded = false
+
+          initWorker()
+
+          var reader = new FileReader()
+
+          reader.onload = function (event) {
+            var arrayBuffer = event.target.result
+            worker.postMessage(
+              {
+                type: "load",
+                arrayBuffer: arrayBuffer,
+              },
+              [arrayBuffer]
+            )
+          }
+
+          reader.onerror = function () {
+            showStatus("Error reading file", "error")
+            generateBtn.disabled = true
+            generateBtn.textContent = "Load a model first"
+          }
+
+          reader.readAsArrayBuffer(file)
+        })
+
+        generateBtn.addEventListener("click", function () {
+          if (!modelLoaded || !worker) {
+            showStatus("Please load a model first", "error")
+            return
+          }
+
+          var prompt = promptInput.value.trim()
+          if (!prompt) {
+            showStatus("Please enter a prompt", "error")
+            return
+          }
+
+          generateBtn.disabled = true
+          generateBtn.textContent = "Generating..."
+          outputContainer.style.display = "block"
+          outputDiv.textContent = ""
+
+          var options = {
+            temperature: parseFloat(temperatureInput.value) || 0.9,
+            maxTokens: parseInt(maxTokensInput.value) || 256,
+            systemPrompt: systemPromptInput.value || "You are a helpful assistant.",
+          }
+
+          worker.postMessage({
+            type: "generate",
+            prompt: prompt,
+            options: options,
+          })
+        })
+      })()
+    </script>
+  </body>
+</html>
