@@ -278,176 +278,167 @@ Tell me in 1 line what is Microsoft.</textarea
     </div>
 
     <script>
-      ;(function () {
-        var modelFileInput = document.getElementById("model-file")
-        var systemPromptInput = document.getElementById("system-prompt")
-        var promptInput = document.getElementById("prompt")
-        var temperatureInput = document.getElementById("temperature")
-        var maxTokensInput = document.getElementById("max-tokens")
-        var generateBtn = document.getElementById("generate-btn")
-        var statusDiv = document.getElementById("status")
-        var outputContainer = document.getElementById("output-container")
-        var outputDiv = document.getElementById("output")
-        var modelInfoDiv = document.getElementById("model-info")
-        var infoArch = document.getElementById("info-arch")
-        var infoParams = document.getElementById("info-params")
-        var infoVocab = document.getElementById("info-vocab")
+      var modelFileInput = document.getElementById("model-file")
+      var systemPromptInput = document.getElementById("system-prompt")
+      var promptInput = document.getElementById("prompt")
+      var temperatureInput = document.getElementById("temperature")
+      var maxTokensInput = document.getElementById("max-tokens")
+      var generateBtn = document.getElementById("generate-btn")
+      var statusDiv = document.getElementById("status")
+      var outputContainer = document.getElementById("output-container")
+      var outputDiv = document.getElementById("output")
 
-        var modelLoaded = false
-        var worker = null
+      var modelLoaded = false
+      var worker = null
 
-        function showStatus(message, type) {
-          statusDiv.textContent = message
-          statusDiv.className = type
+      function showStatus(message, type) {
+        statusDiv.textContent = message
+        statusDiv.className = type
+      }
+
+      function hideStatus() {
+        statusDiv.className = ""
+        statusDiv.style.display = "none"
+      }
+
+      function initWorker() {
+        if (worker) {
+          worker.terminate()
         }
 
-        function hideStatus() {
-          statusDiv.className = ""
-          statusDiv.style.display = "none"
-        }
+        worker = new Worker("llama3pure.js")
 
-        function initWorker() {
-          if (worker) {
-            worker.terminate()
-          }
+        worker.onmessage = function (e) {
+          var data = e.data
 
-          worker = new Worker("llama3pure.js")
+          switch (data.type) {
+            case "progress":
+              showStatus(data.message, "loading")
+              break
 
-          worker.onmessage = function (e) {
-            var data = e.data
-
-            switch (data.type) {
-              case "progress":
-                showStatus(data.message, "loading")
-                break
-
-              case "loaded":
-                var config = data.config
-                infoArch.textContent =
-                  "Architecture: " + (config.isGemma ? "Gemma" : "Llama")
-                infoParams.textContent =
-                  "Layers: " +
-                  config.nLayers +
+            case "loaded":
+              console.log(
+                "Architecture: " + (data.config.isGemma ? "Gemma" : "Llama")
+              )
+              console.log(
+                "Layers: " +
+                  data.config.nLayers +
                   ", Heads: " +
-                  config.nHeads +
+                  data.config.nHeads +
                   ", Dim: " +
-                  config.dim
-                infoVocab.textContent = "Vocabulary: " + config.vocabSize + " tokens"
-                modelInfoDiv.style.display = "block"
+                  data.config.dim
+              )
+              console.log("Vocabulary: " + data.config.vocabSize + " tokens")
 
-                modelLoaded = true
-                generateBtn.disabled = false
-                generateBtn.textContent = "Generate"
-                showStatus("Model loaded successfully!", "success")
-                setTimeout(hideStatus, 3000)
-                break
+              modelLoaded = true
+              generateBtn.disabled = false
+              generateBtn.textContent = "Generate"
+              showStatus("Model loaded successfully!", "success")
+              setTimeout(hideStatus, 3000)
+              break
 
-              case "token":
-                outputDiv.textContent += data.token
-                outputDiv.scrollTop = outputDiv.scrollHeight
-                break
+            case "token":
+              outputDiv.textContent += data.token
+              outputDiv.scrollTop = outputDiv.scrollHeight
+              break
 
-              case "complete":
-                generateBtn.disabled = false
-                generateBtn.textContent = "Generate"
-                showStatus("Generation complete!", "success")
-                setTimeout(hideStatus, 3000)
-                break
+            case "complete":
+              generateBtn.disabled = false
+              generateBtn.textContent = "Generate"
+              showStatus("Generation complete!", "success")
+              setTimeout(hideStatus, 3000)
+              break
 
-              case "error":
-                showStatus("Error: " + data.message, "error")
-                generateBtn.disabled = modelLoaded ? false : true
-                generateBtn.textContent = modelLoaded
-                  ? "Generate"
-                  : "Load a model first"
-                console.error(data.message)
-                break
-            }
-          }
-
-          worker.onerror = function (err) {
-            showStatus("Worker error: " + err.message, "error")
-            generateBtn.disabled = true
-            generateBtn.textContent = "Load a model first"
-            console.error(err)
+            case "error":
+              showStatus("Error: " + data.message, "error")
+              generateBtn.disabled = modelLoaded ? false : true
+              generateBtn.textContent = modelLoaded
+                ? "Generate"
+                : "Load a model first"
+              console.error(data.message)
+              break
           }
         }
 
-        modelFileInput.addEventListener("change", function (e) {
-          var file = e.target.files[0]
-          if (!file) return
-
-          var maxSize = 800 * 1024 * 1024 // 800 MB
-
-          if (file.size > maxSize) {
-            showStatus(
-              "The Web port has a technical limitation, it only supports GGUF files up to 800 MB. Please select a different GGUF file.",
-              "error"
-            )
-            return
-          }
-
-          document.querySelectorAll(".section")[0].style.display = "none"
-          showStatus("Loading model: " + file.name + "...", "loading")
+        worker.onerror = function (err) {
+          showStatus("Worker error: " + err.message, "error")
           generateBtn.disabled = true
-          generateBtn.textContent = "Loading..."
-          modelInfoDiv.style.display = "none"
-          modelLoaded = false
+          generateBtn.textContent = "Load a model first"
+          console.error(err)
+        }
+      }
 
-          initWorker()
+      modelFileInput.addEventListener("change", function (e) {
+        var file = e.target.files[0]
+        if (!file) return
 
-          var reader = new FileReader()
+        var maxSize = 800 * 1024 * 1024 // 800 MB
 
-          reader.onload = function (event) {
-            var arrayBuffer = event.target.result
-            worker.postMessage(
-              {
-                type: "load",
-                arrayBuffer: arrayBuffer,
-              },
-              [arrayBuffer]
-            )
-          }
+        if (file.size > maxSize) {
+          showStatus(
+            "The Web port has a technical limitation, it only supports GGUF files up to 800 MB. Please select a different GGUF file.",
+            "error"
+          )
+          return
+        }
 
-          reader.onerror = function () {
-            showStatus("Error reading file", "error")
-            generateBtn.disabled = true
-            generateBtn.textContent = "Load a model first"
-          }
+        document.querySelectorAll(".section")[0].style.display = "none"
+        showStatus("Loading model: " + file.name + "...", "loading")
+        generateBtn.disabled = true
+        generateBtn.textContent = "Loading..."
+        modelLoaded = false
 
-          reader.readAsArrayBuffer(file)
-        })
+        initWorker()
 
-        generateBtn.addEventListener("click", function () {
-          if (!modelLoaded || !worker) {
-            showStatus("Please load a model first", "error")
-            return
-          }
+        var reader = new FileReader()
 
-          var prompt = promptInput.value.trim()
-          if (!prompt) {
-            showStatus("Please enter a prompt", "error")
-            return
-          }
+        reader.onload = function (event) {
+          var arrayBuffer = event.target.result
+          worker.postMessage(
+            {
+              type: "load",
+              arrayBuffer: arrayBuffer,
+            },
+            [arrayBuffer]
+          )
+        }
 
+        reader.onerror = function () {
+          showStatus("Error reading file", "error")
           generateBtn.disabled = true
-          generateBtn.textContent = "Generating..."
-          outputContainer.style.display = "block"
-          outputDiv.textContent = ""
+          generateBtn.textContent = "Load a model first"
+        }
 
-          var options = {
+        reader.readAsArrayBuffer(file)
+      })
+
+      generateBtn.addEventListener("click", function () {
+        if (!modelLoaded || !worker) {
+          showStatus("Please load a model first", "error")
+          return
+        }
+
+        var prompt = promptInput.value.trim()
+        if (!prompt) {
+          showStatus("Please enter a prompt", "error")
+          return
+        }
+
+        generateBtn.disabled = true
+        generateBtn.textContent = "Generating..."
+        outputContainer.style.display = "block"
+        outputDiv.textContent = ""
+
+        worker.postMessage({
+          type: "generate",
+          prompt: prompt,
+          options: {
             temperature: parseFloat(temperatureInput.value) || 0.9,
             maxTokens: parseInt(maxTokensInput.value) || 256,
             systemPrompt: systemPromptInput.value || "You are a helpful assistant.",
-          }
-
-          worker.postMessage({
-            type: "generate",
-            prompt: prompt,
-            options: options,
-          })
+          },
         })
-      })()
+      })
     </script>
   </body>
 </html>
