@@ -97,11 +97,6 @@ input[type=file]{display:none}
 .input_send{display:block;margin-left:10px;margin-bottom:2px;cursor:default}
 .input_send.active{cursor:pointer}
 
-.actions_container{display:flex}
-.action_button{display:flex;text-align:center;border-radius:10px;padding:12px;min-width:48px;min-height:48px;margin-right:10px;margin-bottom:10px;cursor:default;outline:0 solid;border:0;box-shadow:0 5px 5px rgba(0,0,0,0.1);white-space:nowrap;overflow:hidden;justify-content:center;align-items:center}
-.action_button:focus{outline-width:2px;outline-style:solid}
-.action_button.active{cursor:pointer}
-
 .prompt_container{margin-bottom:10px;margin-left:10px;text-align:right;word-break:break-word}
 .prompt_background{box-shadow:0 5px 5px rgba(0,0,0,0.1)}
 .prompt_content{display:block}
@@ -114,9 +109,6 @@ table{border-collapse:collapse;margin:10px 0}
 table th,table td{border:1px solid silver;padding:8px}
 
 .pointer{line-height:16px;display:inline-block;border-radius:6px;width:12px;height:12px;overflow:hidden;animation:processing 1s ease-in-out infinite}
-
-.regenerate{display:block}
-.speak{display:block}
 
 @keyframes processing{0%{transform:scale(1)}50%{transform:scale(1.4)}100%{transform:scale(1)}}
 
@@ -149,10 +141,6 @@ em{color:#808080}
 .input_send{fill:#C8C8C8}
 .input_send.active{fill:#000}
 
-.action_button{background-color:#FFF;color:#C8C8C8}
-.action_button:focus{outline-color:#C8C8C8}
-.action_button.active{color:#000}
-
 .prompt_background{background-color:#D9FDD3 !important}
 
 .reply{background-color:#FFF}
@@ -160,11 +148,6 @@ em{color:#808080}
 .highlighted{background-color:#ECECEC}
 
 .pointer{background-color:#000}
-
-.regenerate{fill:#C8C8C8}
-.regenerate.active{fill:#000}
-.speak{fill:#C8C8C8}
-.speak.active{fill:#000}
 `
 
       var COLORS_DARK_MODE = `
@@ -190,10 +173,6 @@ em{color:#8D8D8D}
 .input_send{fill:rgba(206,206,206,0.2)}
 .input_send.active{fill:#FFF}
 
-.action_button{background-color:#202C33;color:rgba(206,206,206,0.2)}
-.action_button:focus{outline-color:#858DA2}
-.action_button.active{color:#FFF}
-
 .prompt_background{background-color:#005C4B !important;color:#FFF !important}
 
 .reply{background-color:#202C33 !important;color:#FFF !important}
@@ -201,11 +180,6 @@ em{color:#8D8D8D}
 .highlighted{background-color:#2C1D0E !important}
 
 .pointer{background-color:#FFF}
-
-.regenerate{fill:rgba(206,206,206,0.2)}
-.regenerate.active{fill:#FFF}
-.speak{fill:rgba(206,206,206,0.2)}
-.speak.active{fill:#FFF}
 `
 
       var STYLES_LIGHT_MODE = BASE_STYLES + COLORS_LIGHT_MODE
@@ -230,7 +204,6 @@ em{color:#8D8D8D}
       }
 
       var rendering = false
-      var chatHistory = []
 
       var modelLoaded = false
       var worker = null
@@ -667,8 +640,6 @@ em{color:#8D8D8D}
             styleNode.appendChild(document.createTextNode(STYLES_ALL))
           }
           document.head.appendChild(styleNode)
-
-          chatHistory.push({ role: "system", content: t("system_prompt") })
 
           document.body.style.display = "block"
 
