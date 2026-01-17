@@ -114,6 +114,24 @@
               break
 
             case "loaded":
+              var content = document.querySelector(".content")
+              var inputContainer = document.querySelector(".input_container")
+              var inputTextbox = document.querySelector(".input_textbox")
+              content.innerHTML = ""
+              inputContainer.style.display = "flex"
+              inputTextbox.disabled = false
+
+              resizeInputText()
+
+              var welcomeMessage = document.createElement("span")
+              welcomeMessage.className = "reply"
+              welcomeMessage.innerText = t("system_welcome")
+              content.appendChild(welcomeMessage)
+
+              if (!isMobileDevice()) {
+                inputTextbox.focus()
+              }
+
               console.log(
                 "Architecture: " + (data.config.isGemma ? "Gemma" : "Llama")
               )
@@ -189,20 +207,6 @@
         var reader = new FileReader()
 
         reader.onload = function (event) {
-          content.innerHTML = ""
-          inputContainer.style.display = "flex"
-          inputTextbox.disabled = false
-
-          resizeInputText()
-
-          var welcomeMessage = document.createElement("span")
-          welcomeMessage.className = "reply"
-          welcomeMessage.innerText = t("system_welcome")
-          content.appendChild(welcomeMessage)
-
-          if (!isMobileDevice()) {
-            inputTextbox.focus()
-          }
           var arrayBuffer = event.target.result
           worker.postMessage(
             {
