@@ -208,6 +208,10 @@
             {
               type: "load",
               arrayBuffer: arrayBuffer,
+              maxTokens: 2048,
+              contextSize: 2048,
+              systemPrompt: t("system_prompt"),
+              temperature: 0.8,
             },
             [arrayBuffer]
           )
@@ -278,11 +282,6 @@
         worker.postMessage({
           type: "generate",
           prompt: prompt,
-          options: {
-            temperature: 0.8,
-            maxTokens: 2048,
-            systemPrompt: t("system_prompt"),
-          },
         })
       }
 

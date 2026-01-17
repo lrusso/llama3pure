@@ -82,6 +82,8 @@ Supports GGUF file format with various quantization types.
 
   var temperature = 0.9
   var systemPrompt = "You are a helpful assistant."
+  var maxTokens = 256
+  var contextSize = 2048
 
   // QuantizedTensor structure: { dataOffset, type, rows, cols }
   // Stores metadata to read quantized weights on-the-fly during matmul
@@ -1923,7 +1925,6 @@ Supports GGUF file format with various quantization types.
     var vocabTokens = meta["tokenizer.ggml.tokens"] || []
 
     // Limit context length to avoid massive KV cache allocations in browser
-    var maxSeqLen = 2048
     var modelSeqLen = meta[keyPrefix + ".context_length"] || 2048
 
     config = {
@@ -1936,7 +1937,7 @@ Supports GGUF file format with various quantization types.
         meta[keyPrefix + ".attention.head_count"] ||
         32,
       vocabSize: meta[keyPrefix + ".vocab_size"] || 32000,
-      seqLen: Math.min(modelSeqLen, maxSeqLen),
+      seqLen: Math.min(modelSeqLen, contextSize),
       ropeTheta:
         meta[keyPrefix + ".rope.freq_base"] || (isGemma ? 1000000.0 : 500000.0),
       headDim: meta[keyPrefix + ".attention.key_length"] || 0,
@@ -2927,17 +2928,12 @@ Supports GGUF file format with various quantization types.
   // ----------------------------------------------------------------------------
   // Generation
 
-  function generate(prompt, options) {
-    options = options || {}
-    var maxTokens = options.maxTokens || 256
-    var temp = options.temperature !== undefined ? options.temperature : temperature
-    var sysPrompt = options.systemPrompt || systemPrompt
-
+  function generate(prompt) {
     var promptTokens
     if (config.isGemma) {
-      promptTokens = encodeGemma3Chat(prompt, sysPrompt)
+      promptTokens = encodeGemma3Chat(prompt, systemPrompt)
     } else {
-      promptTokens = encodeLlama3Chat(prompt, sysPrompt)
+      promptTokens = encodeLlama3Chat(prompt, systemPrompt)
     }
 
     if (promptTokens.length === 0) {
@@ -2965,7 +2961,7 @@ Supports GGUF file format with various quantization types.
       if (pos < numPromptTokens - 1) {
         next = promptTokens[pos + 1]
       } else {
-        next = sample(state.logits, temp)
+        next = sample(state.logits, temperature)
       }
 
       if (pos >= numPromptTokens - 1) {
@@ -3032,6 +3028,18 @@ Supports GGUF file format with various quantization types.
     try {
       switch (data.type) {
         case "load":
+          if (data.maxTokens !== undefined) {
+            maxTokens = data.maxTokens
+          }
+          if (data.contextSize !== undefined) {
+            contextSize = data.contextSize
+          }
+          if (data.systemPrompt !== undefined) {
+            systemPrompt = data.systemPrompt
+          }
+          if (data.temperature !== undefined) {
+            temperature = data.temperature
+          }
           var result = loadModel(data.arrayBuffer)
           postMessage({
             type: "loaded",
@@ -3040,7 +3048,7 @@ Supports GGUF file format with various quantization types.
           break
 
         case "generate":
-          generate(data.prompt, data.options)
+          generate(data.prompt)
           break
 
         case "setTemperature":
