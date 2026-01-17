@@ -2903,6 +2903,7 @@ Supports GGUF file format with various quantization types.
     var pos = 0
     var output = ""
     var numPromptTokens = promptTokens.length
+    var pendingNewline = false
 
     for (var step = 0; step < maxTokens; step++) {
       transformer(token, pos)
@@ -2927,9 +2928,19 @@ Supports GGUF file format with various quantization types.
         }
 
         var decoded = decodeToken(next)
-        output += decoded
 
-        postMessage({ type: "token", token: decoded })
+        // Buffer newlines - only output if followed by non-end token
+        if (decoded === "\n") {
+          pendingNewline = true
+        } else {
+          if (pendingNewline) {
+            output += "\n"
+            postMessage({ type: "token", token: "\n" })
+            pendingNewline = false
+          }
+          output += decoded
+          postMessage({ type: "token", token: decoded })
+        }
       }
 
       token = next
