@@ -2954,7 +2954,8 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
 // Global state
 
 float temperature = 0.9f;
-int steps = 256;
+int max_tokens = 256;
+int context_size = 0;  // 0 means use model's default
 char *system_prompt = "You are a helpful assistant.";
 Config config;
 TransformerWeights weights;
@@ -3042,8 +3043,10 @@ int main(int argc, char *argv[]) {
             checkpoint = argv[++i];
         } else if (strcmp(argv[i], "-temperature") == 0 && i + 1 < argc) {
             temperature = atof(argv[++i]);
-        } else if (strcmp(argv[i], "-steps") == 0 && i + 1 < argc) {
-            steps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-max_tokens") == 0 && i + 1 < argc) {
+            max_tokens = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-context_size") == 0 && i + 1 < argc) {
+            context_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
         } else if (strcmp(argv[i], "-system_prompt") == 0 && i + 1 < argc) {
@@ -3062,7 +3065,8 @@ int main(int argc, char *argv[]) {
         printf("\nOptional arguments:\n");
         printf("  -system_prompt system prompt (default: \"You are a helpful assistant.\")\n");
         printf("  -temperature   sampling temperature (default: 0.9, use 0.0 for greedy)\n");
-        printf("  -steps         number of tokens to generate (default: 256)\n");
+        printf("  -max_tokens    number of tokens to generate (default: 256)\n");
+        printf("  -context_size  context size for the AI model (default: model's max)\n");
         printf("  -debug         show detailed model loading and performance logs\n");
         printf("\nExample:\n");
         printf("  %s -model Llama3.gguf -prompt \"tell me what is microsoft\"\n", argv[0]);
@@ -3187,8 +3191,13 @@ int main(int argc, char *argv[]) {
     // Initial token will be set from prompt_tokens[0] if prompt provided
     token = tokenizer.bos_token;
 
-    if (steps <= 0 || steps > config.seq_len) {
-        steps = config.seq_len;
+    // Apply context_size override if specified
+    if (context_size > 0) {
+        config.seq_len = context_size;
+    }
+
+    if (max_tokens <= 0 || max_tokens > config.seq_len) {
+        max_tokens = config.seq_len;
     }
 
     malloc_run_state(&state, &config);
@@ -3223,7 +3232,7 @@ int main(int argc, char *argv[]) {
 
     long start = 0;
 
-    while (pos < steps) {
+    while (pos < max_tokens) {
         generate_token();
         if (start == 0) {
             start = time_in_ms();
