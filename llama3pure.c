@@ -2337,14 +2337,76 @@ int str_lookup(char *str, char **vocab, int vocab_size) {
 
 // Decode token string to printable text
 // Handles both tiktoken (BPE) and SentencePiece formats:
-// - tiktoken: Ġ (U+0120) -> space, Ċ (U+010A) -> newline
-// - SentencePiece: ▁ (U+2581) -> space
+// Decodes token strings to printable text
+// - tiktoken (Llama): uses OpenAI's bytes_to_unicode() mapping
+// - SentencePiece (Gemma): ▁ (U+2581) -> space, rest is already UTF-8
 // Returns a newly allocated string that must be freed by caller
-char* decode_tiktoken(const char* tiktoken_str) {
+
+// Build the tiktoken unicode-to-byte mapping table
+// This is the inverse of OpenAI's bytes_to_unicode() function
+static int tiktoken_initialized = 0;
+static int tiktoken_map[512];  // Maps unicode codepoint -> byte value (-1 if not mapped)
+
+void init_tiktoken_decode_map(void) {
+    if (tiktoken_initialized) return;
+
+    for (int i = 0; i < 512; i++) tiktoken_map[i] = -1;
+
+    // OpenAI's bytes_to_unicode() mapping:
+    // - Bytes 33-126 (! to ~) map to themselves
+    // - Bytes 161-172 (¡ to ¬) map to themselves
+    // - Bytes 174-255 (® to ÿ) map to themselves
+    // - All other bytes (0-32, 127-160, 173) map to 256, 257, 258, ...
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
+            tiktoken_map[b] = b;
+        } else {
+            tiktoken_map[256 + n] = b;
+            n++;
+        }
+    }
+
+    tiktoken_initialized = 1;
+}
+
+// Forward declaration
+extern int use_sentencepiece;
+
+// Decode SentencePiece token: just replace ▁ with space
+char* decode_sentencepiece(const char* str) {
+    if (!str) return NULL;
+
+    size_t len = strlen(str);
+    char* result = malloc(len + 1);
+    if (!result) return NULL;
+
+    int out_idx = 0;
+    const unsigned char* ptr = (const unsigned char*)str;
+
+    while (*ptr) {
+        // Check for ▁ (U+2581) which is 0xE2 0x96 0x81 in UTF-8
+        if (ptr[0] == 0xE2 && ptr[1] == 0x96 && ptr[2] == 0x81) {
+            result[out_idx++] = ' ';
+            ptr += 3;
+        } else {
+            result[out_idx++] = *ptr;
+            ptr++;
+        }
+    }
+
+    result[out_idx] = '\0';
+    return result;
+}
+
+// Decode tiktoken token: convert OpenAI's byte-to-unicode mapping back to bytes
+char* decode_tiktoken_internal(const char* tiktoken_str) {
     if (!tiktoken_str) return NULL;
 
+    init_tiktoken_decode_map();
+
     size_t len = strlen(tiktoken_str);
-    char* result = malloc(len + 1);
+    char* result = malloc(len * 4 + 1);  // Enough for UTF-8 expansion
     if (!result) return NULL;
 
     int out_idx = 0;
@@ -2358,53 +2420,46 @@ char* decode_tiktoken(const char* tiktoken_str) {
         if ((*ptr & 0x80) == 0) {
             codepoint = *ptr;
             char_len = 1;
-        } else if ((*ptr & 0xE0) == 0xC0) {
+        } else if ((*ptr & 0xE0) == 0xC0 && (ptr[1] & 0xC0) == 0x80) {
             codepoint = (*ptr & 0x1F) << 6;
             codepoint |= (ptr[1] & 0x3F);
             char_len = 2;
-        } else if ((*ptr & 0xF0) == 0xE0) {
+        } else if ((*ptr & 0xF0) == 0xE0 && (ptr[1] & 0xC0) == 0x80 && (ptr[2] & 0xC0) == 0x80) {
             codepoint = (*ptr & 0x0F) << 12;
             codepoint |= (ptr[1] & 0x3F) << 6;
             codepoint |= (ptr[2] & 0x3F);
             char_len = 3;
-        } else if ((*ptr & 0xF8) == 0xF0) {
+        } else if ((*ptr & 0xF8) == 0xF0 && (ptr[1] & 0xC0) == 0x80 && (ptr[2] & 0xC0) == 0x80 && (ptr[3] & 0xC0) == 0x80) {
             codepoint = (*ptr & 0x07) << 18;
             codepoint |= (ptr[1] & 0x3F) << 12;
             codepoint |= (ptr[2] & 0x3F) << 6;
             codepoint |= (ptr[3] & 0x3F);
             char_len = 4;
         } else {
-            // Invalid UTF-8, copy as-is
-            result[out_idx++] = *ptr;
+            // Invalid UTF-8, skip byte
             ptr++;
             continue;
         }
 
-        // SentencePiece: U+2581 (▁) = space
-        if (codepoint == 0x2581) {
-            result[out_idx++] = ' ';
-            ptr += char_len;
-            continue;
-        }
-
-        // GPT-4/tiktoken byte-to-unicode mapping (reverse):
-        // Codepoints 0x100-0x120 map to bytes 0x00-0x20 (control chars + space)
-        // Codepoint 0x120 (Ġ) = space (0x20)
-        // Codepoint 0x10A (Ċ) = newline (0x0A)
-        if (codepoint >= 0x100 && codepoint <= 0x120) {
-            // These map to bytes 0x00-0x20
-            result[out_idx++] = (char)(codepoint - 0x100);
-        } else if (codepoint >= 0x121 && codepoint <= 0x17E) {
-            // Map to remaining control bytes and extended
-            // This is approximate - exact mapping depends on tiktoken implementation
-            result[out_idx++] = (char)(codepoint - 0x100);
-        } else if (codepoint < 256) {
-            // Direct byte value
-            result[out_idx++] = (char)codepoint;
+        // Look up in tiktoken map
+        if (codepoint < 512 && tiktoken_map[codepoint] >= 0) {
+            result[out_idx++] = (char)tiktoken_map[codepoint];
         } else {
-            // Copy original UTF-8 bytes for other codepoints (like emojis)
-            for (int i = 0; i < char_len; i++) {
-                result[out_idx++] = ptr[i];
+            // Unknown codepoint - encode as UTF-8
+            if (codepoint < 0x80) {
+                result[out_idx++] = (char)codepoint;
+            } else if (codepoint < 0x800) {
+                result[out_idx++] = (char)(0xC0 | (codepoint >> 6));
+                result[out_idx++] = (char)(0x80 | (codepoint & 0x3F));
+            } else if (codepoint < 0x10000) {
+                result[out_idx++] = (char)(0xE0 | (codepoint >> 12));
+                result[out_idx++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                result[out_idx++] = (char)(0x80 | (codepoint & 0x3F));
+            } else {
+                result[out_idx++] = (char)(0xF0 | (codepoint >> 18));
+                result[out_idx++] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+                result[out_idx++] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+                result[out_idx++] = (char)(0x80 | (codepoint & 0x3F));
             }
         }
 
@@ -2413,6 +2468,15 @@ char* decode_tiktoken(const char* tiktoken_str) {
 
     result[out_idx] = '\0';
     return result;
+}
+
+// Main decode function - dispatches based on tokenizer type
+char* decode_tiktoken(const char* str) {
+    if (use_sentencepiece) {
+        return decode_sentencepiece(str);
+    } else {
+        return decode_tiktoken_internal(str);
+    }
 }
 
 // Convert text to tiktoken format (space -> Ġ, newline -> Ċ, etc.)
