@@ -2597,20 +2597,69 @@ Supports GGUF file format with various quantization types.
     return -1
   }
 
+  // Build tiktoken byte-to-unicode mapping (OpenAI's bytes_to_unicode)
+  var tiktokenByteToUnicode = null
+
+  function buildTiktokenByteToUnicodeMap() {
+    if (tiktokenByteToUnicode) return
+    tiktokenByteToUnicode = {}
+
+    // This is OpenAI's bytes_to_unicode() function
+    // Printable ASCII and some extended chars map to themselves
+    var n = 0
+    for (var b = 0; b < 256; b++) {
+      // These byte ranges map directly: ! to ~, ¡ to ¬, ® to ÿ
+      if (
+        (b >= 33 && b <= 126) ||
+        (b >= 161 && b <= 172) ||
+        (b >= 174 && b <= 255)
+      ) {
+        tiktokenByteToUnicode[b] = b
+      } else {
+        // Other bytes (0-32, 127-160, 173) map to 256+n, 257+n, etc.
+        tiktokenByteToUnicode[b] = 256 + n
+        n++
+      }
+    }
+  }
+
   function textToTiktoken(text) {
+    buildTiktokenByteToUnicodeMap()
+
     var result = ""
     for (var i = 0; i < text.length; i++) {
-      var c = text.charAt(i)
-      if (c === " ") {
-        result += "\u0120" // Ġ
-      } else if (c === "\n") {
-        result += "\u010A" // Ċ
-      } else if (c === "\t") {
-        result += "\u0109" // ĉ
-      } else if (c === "\r") {
-        result += "\u010D" // č
+      var code = text.charCodeAt(i)
+
+      // Handle UTF-16 surrogate pairs
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < text.length) {
+        var low = text.charCodeAt(i + 1)
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
+          i++
+        }
+      }
+
+      // Convert unicode to UTF-8 bytes, then map each byte to tiktoken unicode
+      if (code < 0x80) {
+        result += String.fromCharCode(tiktokenByteToUnicode[code])
+      } else if (code < 0x800) {
+        result += String.fromCharCode(tiktokenByteToUnicode[0xc0 | (code >> 6)])
+        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+      } else if (code < 0x10000) {
+        result += String.fromCharCode(tiktokenByteToUnicode[0xe0 | (code >> 12)])
+        result += String.fromCharCode(
+          tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)]
+        )
+        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
       } else {
-        result += c
+        result += String.fromCharCode(tiktokenByteToUnicode[0xf0 | (code >> 18)])
+        result += String.fromCharCode(
+          tiktokenByteToUnicode[0x80 | ((code >> 12) & 0x3f)]
+        )
+        result += String.fromCharCode(
+          tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)]
+        )
+        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
       }
     }
     return result
