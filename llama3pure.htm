@@ -83,15 +83,11 @@
       var STYLES_DARK_MODE = BASE_STYLES + COLORS_DARK_MODE
 
       var STYLES_ALL =
-        `
-@media (prefers-color-scheme: light) {` +
+        "@media (prefers-color-scheme: light) {" +
         STYLES_LIGHT_MODE +
-        `}
-
-@media (prefers-color-scheme: dark) {` +
+        "}@media (prefers-color-scheme: dark) {" +
         STYLES_DARK_MODE +
-        `}
-`
+        "}"
 
       var USER_LANG = window.navigator.language.substring(0, 2).toLowerCase()
       var GET_APP_STRING = APP_STRINGS[USER_LANG] || APP_STRINGS["en"]
@@ -473,9 +469,9 @@
           buttonUpload.className = "input_upload"
           buttonUpload.type = "button"
           buttonUpload.value = t("upload")
-          buttonUpload.onclick = function () {
+          buttonUpload.addEventListener("click", function () {
             uploader.click()
-          }
+          })
           content.appendChild(buttonUpload)
 
           inputTextbox.placeholder = t("placeholder")
