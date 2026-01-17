@@ -2479,39 +2479,72 @@ char* decode_tiktoken(const char* str) {
     }
 }
 
-// Convert text to tiktoken format (space -> Ġ, newline -> Ċ, etc.)
+// Build tiktoken byte-to-unicode mapping (OpenAI's bytes_to_unicode)
+static int tiktoken_encode_initialized = 0;
+static int tiktoken_byte_to_unicode[256];  // Maps byte value -> unicode codepoint
+
+void init_tiktoken_encode_map(void) {
+    if (tiktoken_encode_initialized) return;
+
+    // OpenAI's bytes_to_unicode() mapping:
+    // - Bytes 33-126 (! to ~) map to themselves
+    // - Bytes 161-172 (¡ to ¬) map to themselves
+    // - Bytes 174-255 (® to ÿ) map to themselves
+    // - All other bytes (0-32, 127-160, 173) map to 256, 257, 258, ...
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        if ((b >= 33 && b <= 126) || (b >= 161 && b <= 172) || (b >= 174 && b <= 255)) {
+            tiktoken_byte_to_unicode[b] = b;
+        } else {
+            tiktoken_byte_to_unicode[b] = 256 + n;
+            n++;
+        }
+    }
+
+    tiktoken_encode_initialized = 1;
+}
+
+// Helper to write a unicode codepoint as UTF-8
+static int write_utf8(char* out, int codepoint) {
+    if (codepoint < 0x80) {
+        out[0] = (char)codepoint;
+        return 1;
+    } else if (codepoint < 0x800) {
+        out[0] = (char)(0xC0 | (codepoint >> 6));
+        out[1] = (char)(0x80 | (codepoint & 0x3F));
+        return 2;
+    } else if (codepoint < 0x10000) {
+        out[0] = (char)(0xE0 | (codepoint >> 12));
+        out[1] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[2] = (char)(0x80 | (codepoint & 0x3F));
+        return 3;
+    } else {
+        out[0] = (char)(0xF0 | (codepoint >> 18));
+        out[1] = (char)(0x80 | ((codepoint >> 12) & 0x3F));
+        out[2] = (char)(0x80 | ((codepoint >> 6) & 0x3F));
+        out[3] = (char)(0x80 | (codepoint & 0x3F));
+        return 4;
+    }
+}
+
+// Convert text to tiktoken format using OpenAI's bytes_to_unicode mapping
+// Each byte in the input is mapped to a unicode codepoint, then encoded as UTF-8
 // Returns a newly allocated string
 char* text_to_tiktoken(const char* text) {
     if (!text) return NULL;
 
-    // Allocate enough space (each char could become 2 bytes for UTF-8)
+    init_tiktoken_encode_map();
+
     size_t len = strlen(text);
+    // Each input byte could become up to 3 UTF-8 bytes (for codepoints 256-511)
     char* result = malloc(len * 3 + 1);
     if (!result) return NULL;
 
     int out_idx = 0;
     for (size_t i = 0; i < len; i++) {
-        unsigned char c = (unsigned char)text[i];
-        if (c == ' ') {
-            // Space -> Ġ (U+0120) = 0xC4 0xA0
-            result[out_idx++] = 0xC4;
-            result[out_idx++] = 0xA0;
-        } else if (c == '\n') {
-            // Newline -> Ċ (U+010A) = 0xC4 0x8A
-            result[out_idx++] = 0xC4;
-            result[out_idx++] = 0x8A;
-        } else if (c == '\t') {
-            // Tab -> ĉ (U+0109) = 0xC4 0x89
-            result[out_idx++] = 0xC4;
-            result[out_idx++] = 0x89;
-        } else if (c == '\r') {
-            // CR -> č (U+010D) = 0xC4 0x8D
-            result[out_idx++] = 0xC4;
-            result[out_idx++] = 0x8D;
-        } else {
-            // Keep as-is
-            result[out_idx++] = c;
-        }
+        unsigned char byte = (unsigned char)text[i];
+        int codepoint = tiktoken_byte_to_unicode[byte];
+        out_idx += write_utf8(result + out_idx, codepoint);
     }
     result[out_idx] = '\0';
     return result;
