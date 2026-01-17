@@ -3006,6 +3006,9 @@ static int recent_tokens[64];
 static int recent_count = 0;
 static float repetition_penalty = 1.0f;  // Disabled: Penalty factor for repeated tokens
 
+// Buffer newlines - only output if followed by non-end token
+static int pending_newline = 0;
+
 void generate_token(void) {
     transformer(token, pos, &config, &state, &weights);
 
@@ -3055,7 +3058,16 @@ void generate_token(void) {
         // Decode tiktoken representation to normal text
         char* decoded = decode_tiktoken(tokenizer.vocab[next]);
         if (decoded) {
-            printf("%s", decoded);
+            // Buffer newlines - only output if followed by non-end token
+            if (strcmp(decoded, "\n") == 0) {
+                pending_newline = 1;
+            } else {
+                if (pending_newline) {
+                    printf("\n");
+                    pending_newline = 0;
+                }
+                printf("%s", decoded);
+            }
             fflush(stdout);
             free(decoded);
         }
