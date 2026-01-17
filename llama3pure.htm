@@ -51,13 +51,13 @@
           upload: "Seleccione un archivo GGUF",
           loading: "Cargando, por favor espere...",
           placeholder: "Escribe un mensaje",
-          system_prompt: "T\u00FA eres un \u00FAtil asistente AI.",
-          system_welcome: "Hola, \u00BFc\u00F3mo puedo ayudarte hoy?",
+          system_prompt: "T\xFA eres un \xFAtil asistente AI.",
+          system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
           error_filesize:
-            "Error. El tama\u00F1o del archivo no puede superar los 2 GB.",
-          error_invalid: "Error. El modelo es inv\u00E1lido.",
+            "Error. El tama\xF1o del archivo no puede superar los 2 GB.",
+          error_invalid: "Error. El modelo es inv\xE1lido.",
           error_incognito:
-            "Error. No se puede ejecutar el modelo en una ventana de inc\u00F3gnito.",
+            "Error. No se puede ejecutar el modelo en una ventana de inc\xF3gnito.",
         },
       }
 
@@ -97,12 +97,12 @@
       }
 
       var rendering = false
-
-      var modelLoaded = false
-      var worker = null
       var responseInProgress = ""
       var lastPrompt = ""
       var lastReply = ""
+
+      var modelLoaded = false
+      var worker = null
 
       function initWorker() {
         if (worker) {
@@ -147,7 +147,10 @@
 
             case "complete":
               rendering = false
-              document.querySelector(".pointer")?.remove()
+              var pointerElement = document.querySelector(".pointer")
+              if (pointerElement) {
+                pointerElement.remove()
+              }
               if (responseInProgress === "") {
                 lastReply.innerHTML = "&nbsp;" + lastReply.innerHTML
               }
@@ -215,7 +218,14 @@
         reader.readAsArrayBuffer(files[0])
       }
 
-      function createComponent(tag, className = "", innerHTML = "", innerText) {
+      function createComponent(tag, className, innerHTML, innerText) {
+        if (className === void 0) {
+          className = ""
+        }
+        if (innerHTML === void 0) {
+          innerHTML = ""
+        }
+
         var element = document.createElement(tag)
         element.className = className
         element.innerHTML = innerHTML
@@ -352,7 +362,7 @@
           { regex: /`(.*?)`/g, replacement: '<div class="highlighted">$1</div>' },
           {
             regex: /^(#{1,6})\s*(.*)$/gm,
-            replacement: function (match, hashes, content) {
+            replacement: function replacement(match, hashes, content) {
               return (
                 "<h" + hashes.length + ">" + content + "</h" + hashes.length + ">"
               )
@@ -360,7 +370,7 @@
           },
           {
             regex: /^[\*\-\+] (.+)$/gm,
-            replacement: function (match, item) {
+            replacement: function replacement(match, item) {
               return "&#8226; " + item
             },
           },
