@@ -40,9 +40,7 @@
           placeholder: "Write a message",
           system_prompt: "You are a useful AI assistant.",
           system_welcome: "Hello, how can I help you today?",
-          error_filesize: "Error. The file size cannot exceed 2 GB.",
-          error_invalid: "Error. The model is invalid.",
-          error_incognito: "Error. The model cannot run in an incognito window.",
+          error_filesize: "Error. The file size cannot exceed 1 GB.",
         },
         es: {
           title: "Llama",
@@ -53,11 +51,7 @@
           placeholder: "Escribe un mensaje",
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
           system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
-          error_filesize:
-            "Error. El tama\xF1o del archivo no puede superar los 2 GB.",
-          error_invalid: "Error. El modelo es inv\xE1lido.",
-          error_incognito:
-            "Error. No se puede ejecutar el modelo en una ventana de inc\xF3gnito.",
+          error_filesize: "Error. El tama\xF1o del archivo no puede superar 1 GB.",
         },
       }
 
@@ -185,7 +179,7 @@
         content.innerHTML = ""
         content.appendChild(loadingMessage)
 
-        if (files[0].length >= 8000000) {
+        if (files[0].size >= 1073741824) {
           loadingMessage.innerText = t("error_filesize")
           return
         }
