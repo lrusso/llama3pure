@@ -3044,6 +3044,8 @@ Supports GGUF file format with various quantization types.
           postMessage({
             type: "loaded",
             config: result.config,
+            maxTokens: maxTokens,
+            contextSize: contextSize,
           })
           break
 
