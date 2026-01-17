@@ -84,6 +84,7 @@ Supports GGUF file format with various quantization types.
   var systemPrompt = "You are a helpful assistant."
   var maxTokens = 256
   var contextSize = 2048
+  var modelFilename = ""
 
   // QuantizedTensor structure: { dataOffset, type, rows, cols }
   // Stores metadata to read quantized weights on-the-fly during matmul
@@ -3089,10 +3090,14 @@ Supports GGUF file format with various quantization types.
           if (data.temperature !== undefined) {
             temperature = data.temperature
           }
+          if (data.filename !== undefined) {
+            modelFilename = data.filename
+          }
           var result = loadModel(data.arrayBuffer)
           postMessage({
             type: "loaded",
             config: result.config,
+            filename: modelFilename,
             maxTokens: maxTokens,
             contextSize: contextSize,
           })
