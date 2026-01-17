@@ -2649,6 +2649,96 @@ Supports GGUF file format with various quantization types.
     return result
   }
 
+  // Streaming UTF-8 decoder for Llama tokens
+  var utf8Decoder = new TextDecoder("utf-8")
+
+  // Build tiktoken unicode-to-byte mapping (inverse of bytes_to_unicode)
+  var tiktokenUnicodeToByte = null
+
+  function buildTiktokenMap() {
+    if (tiktokenUnicodeToByte) return
+    tiktokenUnicodeToByte = {}
+
+    // This is the inverse of OpenAI's bytes_to_unicode() function
+    // Printable ASCII and some extended chars map to themselves
+    var n = 0
+    for (var b = 0; b < 256; b++) {
+      // These byte ranges map directly: ! to ~, ¡ to ¬, ® to ÿ
+      if (
+        (b >= 33 && b <= 126) ||
+        (b >= 161 && b <= 172) ||
+        (b >= 174 && b <= 255)
+      ) {
+        tiktokenUnicodeToByte[b] = b
+      } else {
+        // Other bytes (0-32, 127-160, 173) map to 256+n, 257+n, etc.
+        tiktokenUnicodeToByte[256 + n] = b
+        n++
+      }
+    }
+  }
+
+  function tokenToBytes(token) {
+    if (token < 0 || token >= tokenizer.vocab.length) {
+      return new Uint8Array(0)
+    }
+    var piece = tokenizer.vocab[token]
+    if (!piece) return new Uint8Array(0)
+
+    // Handle <0xNN> byte tokens
+    if (
+      piece.length === 6 &&
+      piece.charAt(0) === "<" &&
+      piece.charAt(1) === "0" &&
+      piece.charAt(2) === "x"
+    ) {
+      var hex = piece.substring(3, 5)
+      var byte = parseInt(hex, 16)
+      return new Uint8Array([byte])
+    }
+
+    buildTiktokenMap()
+
+    // Collect bytes from tiktoken encoding
+    var bytes = []
+    for (var i = 0; i < piece.length; i++) {
+      var code = piece.charCodeAt(i)
+
+      // Handle UTF-16 surrogate pairs
+      if (code >= 0xd800 && code <= 0xdbff && i + 1 < piece.length) {
+        var low = piece.charCodeAt(i + 1)
+        if (low >= 0xdc00 && low <= 0xdfff) {
+          code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
+          i++
+        }
+      }
+
+      // Look up in tiktoken mapping
+      if (tiktokenUnicodeToByte[code] !== undefined) {
+        bytes.push(tiktokenUnicodeToByte[code])
+      } else {
+        // Fallback: encode unknown unicode as UTF-8
+        if (code < 0x80) {
+          bytes.push(code)
+        } else if (code < 0x800) {
+          bytes.push(0xc0 | (code >> 6))
+          bytes.push(0x80 | (code & 0x3f))
+        } else if (code < 0x10000) {
+          bytes.push(0xe0 | (code >> 12))
+          bytes.push(0x80 | ((code >> 6) & 0x3f))
+          bytes.push(0x80 | (code & 0x3f))
+        } else {
+          bytes.push(0xf0 | (code >> 18))
+          bytes.push(0x80 | ((code >> 12) & 0x3f))
+          bytes.push(0x80 | ((code >> 6) & 0x3f))
+          bytes.push(0x80 | (code & 0x3f))
+        }
+      }
+    }
+
+    return new Uint8Array(bytes)
+  }
+
   function decodeToken(token) {
     if (token < 0 || token >= tokenizer.vocab.length) {
       return ""
@@ -2673,51 +2763,9 @@ Supports GGUF file format with various quantization types.
       return piece.replace(/\u2581/g, " ")
     }
 
-    // For Llama (tiktoken), decode the byte-to-unicode mapping
-    var result = ""
-    for (var i = 0; i < piece.length; i++) {
-      var code = piece.charCodeAt(i)
-
-      // Handle UTF-16 surrogate pairs
-      if (code >= 0xd800 && code <= 0xdbff && i + 1 < piece.length) {
-        var low = piece.charCodeAt(i + 1)
-        if (low >= 0xdc00 && low <= 0xdfff) {
-          code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
-          i++
-        }
-      }
-
-      // SentencePiece underscore (in case mixed)
-      if (code === 0x2581) {
-        result += " "
-      }
-      // tiktoken byte-to-unicode mapping:
-      // Codepoints 0x100-0x120 map to bytes 0x00-0x20
-      else if (code >= 0x100 && code <= 0x120) {
-        result += String.fromCharCode(code - 0x100)
-      }
-      // Codepoints 0x121-0x17E map to additional bytes
-      else if (code >= 0x121 && code <= 0x17e) {
-        result += String.fromCharCode(code - 0x100)
-      }
-      // Direct byte values (printable ASCII and extended)
-      else if (code < 256) {
-        result += String.fromCharCode(code)
-      }
-      // Other Unicode (emojis, etc.) - keep as-is
-      else {
-        if (code > 0xffff) {
-          // Encode back as surrogate pair
-          var adjusted = code - 0x10000
-          result += String.fromCharCode(0xd800 + (adjusted >> 10))
-          result += String.fromCharCode(0xdc00 + (adjusted & 0x3ff))
-        } else {
-          result += String.fromCharCode(code)
-        }
-      }
-    }
-
-    return result
+    // For Llama (tiktoken), use TextDecoder for proper UTF-8 handling
+    var bytes = tokenToBytes(token)
+    return utf8Decoder.decode(bytes)
   }
 
   function bpeEncode(text) {
@@ -2905,6 +2953,11 @@ Supports GGUF file format with various quantization types.
     var numPromptTokens = promptTokens.length
     var pendingNewline = false
 
+    // Use streaming TextDecoder for Llama to handle UTF-8 across token boundaries
+    var streamDecoder = config.isGemma
+      ? null
+      : new TextDecoder("utf-8", { fatal: false })
+
     for (var step = 0; step < maxTokens; step++) {
       transformer(token, pos)
 
@@ -2927,7 +2980,14 @@ Supports GGUF file format with various quantization types.
           if (next === 128009) break // Default EOT token ID
         }
 
-        var decoded = decodeToken(next)
+        var decoded
+        if (config.isGemma) {
+          decoded = decodeToken(next)
+        } else {
+          // For Llama, use streaming decoder to handle multi-byte UTF-8 across tokens
+          var bytes = tokenToBytes(next)
+          decoded = streamDecoder.decode(bytes, { stream: true })
+        }
 
         // Buffer newlines - only output if followed by non-end token
         if (decoded === "\n") {
@@ -2938,13 +2998,24 @@ Supports GGUF file format with various quantization types.
             postMessage({ type: "token", token: "\n" })
             pendingNewline = false
           }
-          output += decoded
-          postMessage({ type: "token", token: decoded })
+          if (decoded.length > 0) {
+            output += decoded
+            postMessage({ type: "token", token: decoded })
+          }
         }
       }
 
       token = next
       pos++
+    }
+
+    // Flush any remaining bytes in the decoder
+    if (!config.isGemma) {
+      var remaining = streamDecoder.decode()
+      if (remaining.length > 0) {
+        output += remaining
+        postMessage({ type: "token", token: remaining })
+      }
     }
 
     postMessage({ type: "complete", output: output })
