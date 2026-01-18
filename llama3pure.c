@@ -195,6 +195,10 @@ typedef struct {
     int is_gemma3;                    // flag to indicate Gemma3 architecture
     float final_logit_softcapping;    // final logit softcapping value (30.0 for Gemma3)
     float rms_norm_eps;               // RMS norm epsilon
+    // Sliding window attention parameters
+    int swa_window;                   // sliding window attention window size (0 = no SWA)
+    float rope_theta_swa;             // RoPE theta for SWA layers (default 10000.0)
+    int swa_pattern;                  // SWA pattern (6 for Gemma3: every 6th layer is dense)
 } Config;
 
 // Quantized tensor - keeps weights in compressed form
@@ -249,11 +253,13 @@ typedef struct {
     float* key_cache;   // (layer, seq_len, n_kv_heads * head_size)
     float* value_cache; // (layer, seq_len, n_kv_heads * head_size)
     // pre-computed RoPE frequencies (avoids powf in hot loop)
-    float* rope_freqs;  // (head_size / 2,)
+    float* rope_freqs;      // (head_size / 2,) - for dense (non-SWA) layers
+    float* rope_freqs_swa;  // (head_size / 2,) - for SWA layers (different theta)
     // RoPE sin/cos cache (avoids recomputing sin/cos for each head)
     float* rope_cos;    // (head_size / 2,) - cosf(pos * freq) for current position
     float* rope_sin;    // (head_size / 2,) - sinf(pos * freq) for current position
     int rope_cache_pos; // position for which rope_cos/rope_sin are valid (-1 = invalid)
+    int rope_cache_is_swa; // 0 = cache is for dense layers, 1 = cache is for SWA layers
     // cached constants to avoid recomputation in transformer
     int head_size;
     int kv_dim;
@@ -299,10 +305,18 @@ void malloc_run_state(RunState* s, Config* p) {
         s->rope_freqs[i] = 1.0f / powf(p->rope_theta, (float)(i * 2) / (float)head_size);
     }
 
+    // Pre-compute SWA RoPE frequencies (for Gemma3 sliding window attention layers)
+    s->rope_freqs_swa = calloc(rope_size, sizeof(float));
+    float swa_theta = p->rope_theta_swa > 0 ? p->rope_theta_swa : 10000.0f;
+    for (int i = 0; i < rope_size; i++) {
+        s->rope_freqs_swa[i] = 1.0f / powf(swa_theta, (float)(i * 2) / (float)head_size);
+    }
+
     // Allocate RoPE sin/cos cache buffers
     s->rope_cos = calloc(rope_size, sizeof(float));
     s->rope_sin = calloc(rope_size, sizeof(float));
     s->rope_cache_pos = -1;  // invalid initially
+    s->rope_cache_is_swa = -1;  // invalid initially
 
     // Cache frequently used values
     s->head_size = head_size;
@@ -315,7 +329,8 @@ void malloc_run_state(RunState* s, Config* p) {
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
-     || !s->value_cache || !s->rope_freqs || !s->rope_cos || !s->rope_sin) {
+     || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
+     || !s->rope_cos || !s->rope_sin) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
     }
@@ -335,6 +350,7 @@ void free_run_state(RunState* s) {
     free(s->key_cache);
     free(s->value_cache);
     free(s->rope_freqs);
+    free(s->rope_freqs_swa);
     free(s->rope_cos);
     free(s->rope_sin);
 }
@@ -1793,6 +1809,16 @@ int load_tensor_quantized(GGUFFile* gguf, const char* name, QuantizedTensor* qt,
         n_elements *= tensor->ne[i];
     }
 
+    // Verify dimensions match GGUF tensor (GGUF: ne[0]=cols, ne[1]=rows)
+    if (debug_mode && tensor->n_dims >= 2) {
+        int gguf_cols = (int)tensor->ne[0];
+        int gguf_rows = (int)tensor->ne[1];
+        if (gguf_rows != rows || gguf_cols != cols) {
+            printf("[DEBUG] Tensor %s: expected (%d, %d), GGUF has (%d, %d)\n",
+                   name, rows, cols, gguf_rows, gguf_cols);
+        }
+    }
+
     // Store quantized data directly - points into mmap'd file!
     qt->data = tensor->data;
     qt->type = tensor->type;
@@ -2096,20 +2122,28 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
         // Gemma3 uses NEOX mode: pairs (i, i+half) instead of consecutive (i, i+1)
         // Use pre-computed frequencies and cache sin/cos per position
-        float* rope_freqs = s->rope_freqs;
+        //
+        // For Gemma3 with SWA: different layers use different RoPE frequencies
+        // SWA layers (most layers): use rope_freqs_swa (theta=10000)
+        // Dense layers (every swa_pattern-th): use rope_freqs (theta=1000000)
+        // Pattern 6: layers 0,1,2,3,4 are SWA, layer 5 is dense, 6,7,8,9,10 are SWA, layer 11 is dense, etc.
+        int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
+        float* rope_freqs = (p->is_gemma3 && is_swa_layer) ? s->rope_freqs_swa : s->rope_freqs;
         float* rope_cos = s->rope_cos;
         float* rope_sin = s->rope_sin;
         int half = head_size / 2;
 
-        // Compute sin/cos once per position (cached across all layers)
-        // This avoids redundant trig calls - only compute when position changes
-        if (s->rope_cache_pos != pos) {
+        // Compute sin/cos for this position and layer type
+        // Cache is invalidated when position changes OR when switching between SWA/dense layer types
+        int current_is_swa = is_swa_layer ? 1 : 0;
+        if (s->rope_cache_pos != pos || s->rope_cache_is_swa != current_is_swa) {
             for (int i = 0; i < half; i++) {
                 float val = pos * rope_freqs[i];
                 rope_cos[i] = cosf(val);
                 rope_sin[i] = sinf(val);
             }
             s->rope_cache_pos = pos;
+            s->rope_cache_is_swa = current_is_swa;
         }
 
         if (p->is_gemma3) {
@@ -3012,6 +3046,32 @@ static int pending_newline = 0;
 void generate_token(void) {
     transformer(token, pos, &config, &state, &weights);
 
+    // Debug: print first few logits to see if they make sense
+    if (debug_mode && pos >= num_prompt_tokens - 1 && pos < num_prompt_tokens + 3) {
+        printf("\n[DEBUG pos=%d] Top 5 logits: ", pos);
+        // Find top 5 logits
+        int top_ids[5] = {0, 1, 2, 3, 4};
+        float top_vals[5];
+        for (int i = 0; i < 5; i++) top_vals[i] = state.logits[i];
+        for (int i = 5; i < config.vocab_size; i++) {
+            for (int j = 0; j < 5; j++) {
+                if (state.logits[i] > top_vals[j]) {
+                    for (int k = 4; k > j; k--) {
+                        top_ids[k] = top_ids[k-1];
+                        top_vals[k] = top_vals[k-1];
+                    }
+                    top_ids[j] = i;
+                    top_vals[j] = state.logits[i];
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < 5; i++) {
+            printf("%d(%.2f) ", top_ids[i], top_vals[i]);
+        }
+        printf("\n");
+    }
+
     // During prompt phase: use the next prompt token
     // During generation phase: sample from logits
     // Note: pos is 0-indexed, and prompt_tokens[0] was used as initial token
@@ -3180,6 +3240,31 @@ int main(int argc, char *argv[]) {
     snprintf(key_head_dim, sizeof(key_head_dim), "%s.attention.key_length", key_prefix);
     snprintf(key_rms_eps, sizeof(key_rms_eps), "%s.attention.layer_norm_rms_epsilon", key_prefix);
     snprintf(key_softcap, sizeof(key_softcap), "%s.final_logit_softcapping", key_prefix);
+
+    // Read sliding window attention parameters
+    char key_swa[64], key_rope_swa[64];
+    snprintf(key_swa, sizeof(key_swa), "%s.attention.sliding_window", key_prefix);
+    snprintf(key_rope_swa, sizeof(key_rope_swa), "%s.rope.freq_base_swa", key_prefix);
+
+    config.swa_window = get_gguf_int(gguf_file, key_swa, 0);
+    config.rope_theta_swa = get_gguf_float(gguf_file, key_rope_swa, 10000.0f);  // default 10000 for SWA
+    config.swa_pattern = 6;  // Gemma3 uses pattern 6: layers 0-4 are SWA, layer 5 is dense, etc.
+
+    if (debug_mode) {
+        if (config.swa_window > 0) {
+            printf("[DEBUG] Sliding window attention: %d\n", config.swa_window);
+        }
+        if (config.rope_theta_swa > 0) {
+            printf("[DEBUG] SWA RoPE freq base: %.0f\n", config.rope_theta_swa);
+        }
+        // Check for rope dimension count
+        char key_rope_dim[64];
+        snprintf(key_rope_dim, sizeof(key_rope_dim), "%s.rope.dimension_count", key_prefix);
+        int rope_dim = get_gguf_int(gguf_file, key_rope_dim, 0);
+        if (rope_dim > 0) {
+            printf("[DEBUG] RoPE dimension count: %d\n", rope_dim);
+        }
+    }
 
     config.dim = get_gguf_int(gguf_file, key_dim, 4096);
     config.hidden_dim = get_gguf_int(gguf_file, key_hidden, 11008);
