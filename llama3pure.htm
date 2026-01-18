@@ -96,10 +96,8 @@
 
       var rendering = false
       var responseInProgress = ""
-      var lastPrompt = ""
       var lastReply = ""
 
-      var modelLoaded = false
       var worker = null
 
       function initWorker() {
@@ -182,16 +180,10 @@
               break
           }
         }
-
-        worker.onerror = function (err) {
-          console.error(err)
-        }
       }
 
       function initialize(files) {
         var content = document.querySelector(".content")
-        var inputContainer = document.querySelector(".input_container")
-        var inputTextbox = document.querySelector(".input_textbox")
 
         var loadingMessage = document.createElement("span")
         loadingMessage.className = "reply"
@@ -265,8 +257,6 @@
           return
         }
 
-        lastPrompt = prompt
-
         var content = document.querySelector(".content")
         var inputTextbox = document.querySelector(".input_textbox")
         var promptContainer = createComponent("div", "prompt_container")
@@ -315,7 +305,7 @@
         // STORING AND REMOVING ALL THE CODE BLOCKS
         markdown = markdown.replace(
           /\`\`\`.*?\n([\s\S]*?)\`\`\`/g,
-          function (match, group) {
+          function (_match, group) {
             codeBlocks.push(group)
             return "%%CODELLAMABLOCK" + (codeBlocks.length - 1) + "%%"
           }
@@ -324,7 +314,7 @@
         // PARSING MARKDOWN TABLES
         markdown = markdown.replace(
           /^(\|.+\|)\r?\n(\|[-:\s|]+\|)\r?\n((?:\|.+\|\r?\n?)+)/gm,
-          function (match, headerRow, separatorRow, bodyRows) {
+          function (_match, headerRow, _separatorRow, bodyRows) {
             function parseRow(row) {
               return row
                 .split("|")
@@ -344,17 +334,17 @@
 
             var html = "<table><thead><tr>"
             headers.forEach(function (header) {
-              return (html += "<th>" + header + "</th>")
+              html = html + "<th>" + header + "</th>"
             })
-            html += "</tr></thead><tbody>"
+            html = html + "</tr></thead><tbody>"
             rows.forEach(function (row) {
-              html += "<tr>"
+              html = html + "<tr>"
               row.forEach(function (cell) {
-                return (html += "<td>" + cell + "</td>")
+                html = html + "<td>" + cell + "</td>"
               })
-              return (html += "</tr>")
+              html = html + "</tr>"
             })
-            html += "</tbody></table>"
+            html = html + "</tbody></table>"
             return html
           }
         )
@@ -369,7 +359,7 @@
           { regex: /`(.*?)`/g, replacement: '<div class="highlighted">$1</div>' },
           {
             regex: /^(#{1,6})\s*(.*)$/gm,
-            replacement: function replacement(match, hashes, content) {
+            replacement: function replacement(_match, hashes, content) {
               return (
                 "<h" + hashes.length + ">" + content + "</h" + hashes.length + ">"
               )
@@ -377,7 +367,7 @@
           },
           {
             regex: /^[\*\-\+] (.+)$/gm,
-            replacement: function replacement(match, item) {
+            replacement: function replacement(_match, item) {
               return "&#8226; " + item
             },
           },
@@ -391,7 +381,7 @@
         // RESTORING ALL THE CODE BLOCKS
         markdown = markdown.replace(
           /%%CODELLAMABLOCK(\d+)%%/g,
-          function (match, index) {
+          function (_match, index) {
             return "<code>" + codeBlocks[index].replace(/```/g, "") + "</code>"
           }
         )
@@ -524,7 +514,7 @@
 
           inputSend.addEventListener("click", function () {
             if (!rendering) {
-              sendPrompt(inputTextbox.value)
+              ask(inputTextbox.value)
               inputTextbox.value = ""
               resizeInputText()
               if (inputSend.classList.contains("active")) {
