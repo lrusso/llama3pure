@@ -530,6 +530,7 @@
             }
 
             xhr.onerror = function () {
+              content.removeChild(buttonDemo)
               var errorMessage = document.createElement("span")
               errorMessage.className = "reply"
               errorMessage.innerText = t("error_download")
