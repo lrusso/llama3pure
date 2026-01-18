@@ -53,6 +53,10 @@ https://lrusso.github.io/llama3pure/llama3pure.htm
 - [Llama-3.2-1B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf?download=true)
 - [Llama-3.2-1B-Instruct-F16.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf?download=true)
 
+## Disclaimer
+
+You are legally responsible for any damage that you could cause with this software.
+
 ## Based on the work of:
 
 https://github.com/karpathy/llama2.c
