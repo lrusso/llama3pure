@@ -38,11 +38,14 @@
           upload: "Select a GGUF file",
           loading: "Loading, please wait...",
           placeholder: "Write a message",
+          download: "Download Gemma 3 370M",
+          downloading: "Downloading...",
           system_prompt: "You are a useful AI assistant.",
           system_welcome:
             "Hello, how can I help you today? *This demo has no session memory. Single-turn interactions only.*",
           error_filesize:
             "Error. This web port cannot handle files larger than 1 GB.",
+          error_download: "Error. Something went wrong during the download process.",
         },
         es: {
           title: "Llama",
@@ -51,11 +54,14 @@
           upload: "Seleccione un archivo GGUF",
           loading: "Cargando, por favor espere...",
           placeholder: "Escribe un mensaje",
+          download: "Descargar Gemma 3 370M",
+          downloading: "Descargando...",
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
           system_welcome:
             "Hola, \xBFc\xF3mo puedo ayudarte hoy? *Esta demostraci\xF3n no tiene memoria de sesi\xF3n. Solo interacciones de un solo turno.*",
           error_filesize:
             "Error. Este port web no puede procesar archivos de m\xE1s de 1 GB.",
+          error_download: "Error. Something went wrong during the download process.",
         },
       }
 
@@ -484,12 +490,14 @@
           var buttonDemo = document.createElement("button")
           buttonDemo.className = "input_upload"
           buttonDemo.type = "button"
-          buttonDemo.innerText = "Download Gemma 3 270M"
+          buttonDemo.innerText = t("download")
           buttonDemo.addEventListener("click", function () {
             content.removeChild(buttonUpload)
             buttonDemo.disabled = true
-            buttonDemo.innerText = "Downloading... 0%"
+            buttonDemo.innerText = t("downloading") + " 0%"
 
+            // no fetch here because the entire project
+            // is compatible with pre 2015 environments.
             var xhr = new XMLHttpRequest()
             xhr.open(
               "GET",
@@ -501,7 +509,7 @@
             xhr.onprogress = function (event) {
               if (event.lengthComputable) {
                 var percent = Math.round((event.loaded / event.total) * 100)
-                buttonDemo.innerText = "Downloading... " + percent + "%"
+                buttonDemo.innerText = t("downloading") + " " + percent + "%"
               }
             }
 
@@ -515,14 +523,14 @@
               } else {
                 buttonDemo.disabled = false
                 buttonDemo.innerText = "Descargar Gemma 3 270M"
-                alert("Error during downloading.")
+                alert(t("error_download"))
               }
             }
 
             xhr.onerror = function () {
               buttonDemo.disabled = false
               buttonDemo.innerText = "Descargar Gemma 3 270M"
-              alert("Network error.")
+              alert(t("error_download"))
             }
 
             xhr.send()
