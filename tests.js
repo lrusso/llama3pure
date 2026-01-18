@@ -25,8 +25,6 @@ const models = [
 
 const prompt = "Tell me in 1 line what is Microsoft."
 
-const startTime = Date.now()
-
 models.forEach(function (model) {
   console.log(model)
 
@@ -38,7 +36,3 @@ models.forEach(function (model) {
     console.error(error.message)
   }
 })
-
-const endTime = Date.now()
-const elapsedSeconds = (endTime - startTime) / 1000
-console.log("Total elapsed time: " + elapsedSeconds.toFixed(2) + " seconds")
