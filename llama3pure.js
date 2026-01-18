@@ -94,73 +94,67 @@ Supports GGUF file format with various quantization types.
 
   function readUint8() {
     var val = dataView.getUint8(offset)
-    offset += 1
+    offset = offset + 1
     return val
   }
 
   function readUint16() {
     var val = dataView.getUint16(offset, true)
-    offset += 2
+    offset = offset + 2
     return val
   }
 
   function readUint32() {
     var val = dataView.getUint32(offset, true)
-    offset += 4
+    offset = offset + 4
     return val
   }
 
   function readUint64() {
     var low = dataView.getUint32(offset, true)
     var high = dataView.getUint32(offset + 4, true)
-    offset += 8
+    offset = offset + 8
     return low + high * 0x100000000
   }
 
   function readInt8() {
     var val = dataView.getInt8(offset)
-    offset += 1
+    offset = offset + 1
     return val
   }
 
   function readInt32() {
     var val = dataView.getInt32(offset, true)
-    offset += 4
+    offset = offset + 4
     return val
   }
 
   function readInt64() {
     var low = dataView.getUint32(offset, true)
     var high = dataView.getInt32(offset + 4, true)
-    offset += 8
+    offset = offset + 8
     return low + high * 0x100000000
   }
 
   function readFloat32() {
     var val = dataView.getFloat32(offset, true)
-    offset += 4
+    offset = offset + 4
     return val
   }
 
   function readFloat64() {
     var val = dataView.getFloat64(offset, true)
-    offset += 8
+    offset = offset + 8
     return val
   }
 
   function readString() {
     var len = readUint64()
     var bytes = new Uint8Array(ggufData, offset, len)
-    offset += len
+    offset = offset + len
     // Decode UTF-8 properly
     var decoder = new TextDecoder("utf-8")
     return decoder.decode(bytes)
-  }
-
-  function readBytes(n) {
-    var arr = new Uint8Array(ggufData, offset, n)
-    offset += n
-    return arr
   }
 
   // Cached full-buffer typed array views (initialized on model load)
@@ -198,7 +192,7 @@ Supports GGUF file format with various quantization types.
   // Pre-computed FP16 to FP32 lookup table (256KB)
   var fp16Table = new Float32Array(65536)
   ;(function () {
-    for (var h = 0; h < 65536; h++) {
+    for (var h = 0; h < 65536; h = h + 1) {
       var sign = (h & 0x8000) >> 15
       var exp = (h >> 10) & 0x1f
       var mant = h & 0x3ff
@@ -211,9 +205,9 @@ Supports GGUF file format with various quantization types.
         // Denormalized
         while (!(mant & 0x400)) {
           mant <<= 1
-          exp--
+          exp = exp - 1
         }
-        exp++
+        exp = exp + 1
         mant &= ~0x400
       } else if (exp === 31) {
         fp16Table[h] = mant === 0 ? (sign ? -Infinity : Infinity) : NaN
@@ -246,7 +240,10 @@ Supports GGUF file format with various quantization types.
 
     if (exp <= 0) {
       // Denormalized or zero
-      if (exp < -10) return sign // Too small, return signed zero
+      if (exp < -10) {
+        // Too small, return signed zero
+        return sign
+      }
       mant = (mant | 0x400) >> (1 - exp)
       return sign | mant
     } else if (exp >= 31) {
@@ -270,15 +267,19 @@ Supports GGUF file format with various quantization types.
     var nb = count >> 5 // count / 32
     var bo = dstOffset // byte offset in destination
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockStart = srcOffset + (i << 5) // i * 32
 
       // Find max absolute value in block
       var amax = 0.0
-      for (var j = 0; j < 32; j++) {
+      for (var j = 0; j < 32; j = j + 1) {
         var av = src[blockStart + j]
-        if (av < 0) av = -av
-        if (av > amax) amax = av
+        if (av < 0) {
+          av = -av
+        }
+        if (av > amax) {
+          amax = av
+        }
       }
 
       // Compute scale
@@ -291,16 +292,20 @@ Supports GGUF file format with various quantization types.
       dst[bo + 1] = (dFp16 >> 8) & 0xff
 
       // Quantize and store values
-      for (var j = 0; j < 32; j++) {
+      for (var j = 0; j < 32; j = j + 1) {
         var v = src[blockStart + j] * id
         // Round to nearest int8
         var q = v > 0 ? (v + 0.5) | 0 : (v - 0.5) | 0
-        if (q > 127) q = 127
-        if (q < -128) q = -128
+        if (q > 127) {
+          q = 127
+        }
+        if (q < -128) {
+          q = -128
+        }
         dstInt8[bo + 2 + j] = q
       }
 
-      bo += Q8_0_BLOCK_SIZE
+      bo = bo + Q8_0_BLOCK_SIZE
     }
   }
 
@@ -315,17 +320,17 @@ Supports GGUF file format with various quantization types.
     var bo = cacheOffset
     var xb = xOffset
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(cache[bo] | (cache[bo + 1] << 8))
       var qOff = bo + 2
 
       var blockSum = 0.0
-      for (var j = 0; j < 32; j++) {
-        blockSum += x[xb + j] * cacheInt8[qOff + j]
+      for (var j = 0; j < 32; j = j + 1) {
+        blockSum = blockSum + x[xb + j] * cacheInt8[qOff + j]
       }
-      sum += blockSum * d
-      bo += Q8_0_BLOCK_SIZE
-      xb += 32
+      sum = sum + blockSum * d
+      bo = bo + Q8_0_BLOCK_SIZE
+      xb = xb + 32
     }
     return sum
   }
@@ -349,16 +354,16 @@ Supports GGUF file format with various quantization types.
     var bo = cacheOffset
     var ob = outOffset
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(cache[bo] | (cache[bo + 1] << 8))
       var scale = d * weight
       var qOff = bo + 2
 
-      for (var j = 0; j < 32; j++) {
-        out[ob + j] += cacheInt8[qOff + j] * scale
+      for (var j = 0; j < 32; j = j + 1) {
+        out[ob + j] = out[ob + j] + cacheInt8[qOff + j] * scale
       }
-      bo += Q8_0_BLOCK_SIZE
-      ob += 32
+      bo = bo + Q8_0_BLOCK_SIZE
+      ob = ob + 32
     }
   }
 
@@ -367,21 +372,21 @@ Supports GGUF file format with various quantization types.
 
   function dequantizeF16(srcOffset, dst, dstOffset, count) {
     var src = getUint16ArrayAt(srcOffset, count)
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < count; i = i + 1) {
       dst[dstOffset + i] = fp16ToFp32(src[i])
     }
   }
 
   function dequantizeBF16(srcOffset, dst, dstOffset, count) {
     var src = getUint16ArrayAt(srcOffset, count)
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < count; i = i + 1) {
       dst[dstOffset + i] = bf16ToFp32(src[i])
     }
   }
 
   function dequantizeF32(srcOffset, dst, dstOffset, count) {
     var src = getFloat32ArrayAt(srcOffset, count)
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < count; i = i + 1) {
       dst[dstOffset + i] = src[i]
     }
   }
@@ -392,11 +397,11 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
 
-      for (var j = 0; j < QK4_0 / 2; j++) {
+      for (var j = 0; j < QK4_0 / 2; j = j + 1) {
         var qsByte = src[blockOffset + 2 + j]
         var x0 = (qsByte & 0x0f) - 8
         var x1 = (qsByte >> 4) - 8
@@ -413,12 +418,12 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
       var m = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
 
-      for (var j = 0; j < QK4_1 / 2; j++) {
+      for (var j = 0; j < QK4_1 / 2; j = j + 1) {
         var qsByte = src[blockOffset + 4 + j]
         var x0 = qsByte & 0x0f
         var x1 = qsByte >> 4
@@ -436,11 +441,11 @@ Supports GGUF file format with various quantization types.
     var src = getUint8ArrayAt(srcOffset, totalBytes)
     var srcSigned = getInt8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
 
-      for (var j = 0; j < QK8_0; j++) {
+      for (var j = 0; j < QK8_0; j = j + 1) {
         dst[dstOffset + i * QK8_0 + j] = srcSigned[blockOffset + 2 + j] * d
       }
     }
@@ -452,7 +457,7 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
       var qh =
@@ -461,7 +466,7 @@ Supports GGUF file format with various quantization types.
         (src[blockOffset + 4] << 16) |
         (src[blockOffset + 5] << 24)
 
-      for (var j = 0; j < QK5_0 / 2; j++) {
+      for (var j = 0; j < QK5_0 / 2; j = j + 1) {
         var xh_0 = ((qh >> j) & 1) << 4
         var xh_1 = ((qh >> (j + 16)) & 1) << 4
 
@@ -481,7 +486,7 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
       var m = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
@@ -491,7 +496,7 @@ Supports GGUF file format with various quantization types.
         (src[blockOffset + 6] << 16) |
         (src[blockOffset + 7] << 24)
 
-      for (var j = 0; j < QK5_1 / 2; j++) {
+      for (var j = 0; j < QK5_1 / 2; j = j + 1) {
         var xh_0 = ((qh >> j) & 1) << 4
         var xh_1 = ((qh >> (j + 16)) & 1) << 4
 
@@ -511,7 +516,7 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var scales = src.subarray(blockOffset, blockOffset + QK_K / 16)
       var qs = src.subarray(
@@ -526,26 +531,30 @@ Supports GGUF file format with various quantization types.
       var is = 0
       var qIdx = 0
 
-      for (var n = 0; n < QK_K; n += 128) {
+      for (var n = 0; n < QK_K; n = n + 128) {
         var shift = 0
-        for (var j = 0; j < 4; ++j) {
-          var sc = scales[is++]
+        for (var j = 0; j < 4; j = j + 1) {
+          var sc = scales[is]
+          is = is + 1
           var dl = d * (sc & 0xf)
           var ml = dmin * (sc >> 4)
-          for (var l = 0; l < 16; ++l) {
-            dst[y++] = dl * ((qs[qIdx + l] >> shift) & 3) - ml
+          for (var l = 0; l < 16; l = l + 1) {
+            dst[y] = dl * ((qs[qIdx + l] >> shift) & 3) - ml
+            y = y + 1
           }
 
-          sc = scales[is++]
+          sc = scales[is]
+          is = is + 1
           dl = d * (sc & 0xf)
           ml = dmin * (sc >> 4)
-          for (var l = 0; l < 16; ++l) {
-            dst[y++] = dl * ((qs[qIdx + l + 16] >> shift) & 3) - ml
+          for (var l = 0; l < 16; l = l + 1) {
+            dst[y] = dl * ((qs[qIdx + l + 16] >> shift) & 3) - ml
+            y = y + 1
           }
 
-          shift += 2
+          shift = shift + 2
         }
-        qIdx += 32
+        qIdx = qIdx + 32
       }
     }
   }
@@ -559,7 +568,7 @@ Supports GGUF file format with various quantization types.
     var kmask1 = 0x03030303
     var kmask2 = 0x0f0f0f0f
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var hmask = src.subarray(blockOffset, blockOffset + QK_K / 8)
       var qs = src.subarray(
@@ -613,8 +622,10 @@ Supports GGUF file format with various quantization types.
       scales[14] = (s3 >> 16) & 0xff
       scales[15] = (s3 >> 24) & 0xff
 
-      for (var si = 0; si < 16; si++) {
-        if (scales[si] > 127) scales[si] -= 256
+      for (var si = 0; si < 16; si = si + 1) {
+        if (scales[si] > 127) {
+          scales[si] = scales[si] - 256
+        }
       }
 
       var y = dstOffset + i * QK_K
@@ -622,27 +633,31 @@ Supports GGUF file format with various quantization types.
       var m = 1
       var qIdx = 0
 
-      for (var n = 0; n < QK_K; n += 128) {
+      for (var n = 0; n < QK_K; n = n + 128) {
         var shift = 0
-        for (var j = 0; j < 4; ++j) {
-          var dl = d_all * (scales[is++] - 32)
-          for (var l = 0; l < 16; ++l) {
+        for (var j = 0; j < 4; j = j + 1) {
+          var dl = d_all * (scales[is] - 32)
+          is = is + 1
+          for (var l = 0; l < 16; l = l + 1) {
             var q = (qs[qIdx + l] >> shift) & 3
             var h = hmask[l] & m ? 0 : 4
-            dst[y++] = dl * (q - h)
+            dst[y] = dl * (q - h)
+            y = y + 1
           }
 
-          dl = d_all * (scales[is++] - 32)
-          for (var l = 0; l < 16; ++l) {
+          dl = d_all * (scales[is] - 32)
+          is = is + 1
+          for (var l = 0; l < 16; l = l + 1) {
             var q = (qs[qIdx + l + 16] >> shift) & 3
             var h = hmask[l + 16] & m ? 0 : 4
-            dst[y++] = dl * (q - h)
+            dst[y] = dl * (q - h)
+            y = y + 1
           }
 
-          shift += 2
+          shift = shift + 2
           m <<= 1
         }
-        qIdx += 32
+        qIdx = qIdx + 32
       }
     }
   }
@@ -653,7 +668,7 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
       var dmin = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
@@ -670,8 +685,9 @@ Supports GGUF file format with various quantization types.
       var u2 = 2
       var qlIdx = 0
 
-      for (var j = 0; j < QK_K; j += 64) {
-        var sc, m
+      for (var j = 0; j < QK_K; j = j + 64) {
+        var sc
+        var m
         if (is < 4) {
           sc = scales[is] & 63
           m = scales[is + 4] & 63
@@ -682,7 +698,7 @@ Supports GGUF file format with various quantization types.
         var d1 = d * sc
         var m1 = dmin * m
 
-        is++
+        is = is + 1
         if (is < 4) {
           sc = scales[is] & 63
           m = scales[is + 4] & 63
@@ -692,17 +708,17 @@ Supports GGUF file format with various quantization types.
         }
         var d2 = d * sc
         var m2 = dmin * m
-        is++
+        is = is + 1
 
-        for (var l = 0; l < 32; ++l) {
+        for (var l = 0; l < 32; l = l + 1) {
           dst[y + j + l] = d1 * ((ql[qlIdx + l] & 0xf) + (qh[l] & u1 ? 16 : 0)) - m1
         }
-        for (var l = 0; l < 32; ++l) {
+        for (var l = 0; l < 32; l = l + 1) {
           dst[y + j + l + 32] =
             d2 * ((ql[qlIdx + l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2
         }
 
-        qlIdx += 32
+        qlIdx = qlIdx + 32
         u1 <<= 2
         u2 <<= 2
       }
@@ -715,7 +731,7 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
       var dmin = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
@@ -725,8 +741,9 @@ Supports GGUF file format with various quantization types.
       var is = 0
       var y = dstOffset + i * QK_K
 
-      for (var j = 0; j < QK_K; j += 64) {
-        var sc, m
+      for (var j = 0; j < QK_K; j = j + 64) {
+        var sc
+        var m
         if (is < 4) {
           sc = scales[is] & 63
           m = scales[is + 4] & 63
@@ -737,7 +754,7 @@ Supports GGUF file format with various quantization types.
         var d1 = d * sc
         var m1 = dmin * m
 
-        is++
+        is = is + 1
         if (is < 4) {
           sc = scales[is] & 63
           m = scales[is + 4] & 63
@@ -747,10 +764,10 @@ Supports GGUF file format with various quantization types.
         }
         var d2 = d * sc
         var m2 = dmin * m
-        is++
+        is = is + 1
 
         var qIdx = j / 2
-        for (var l = 0; l < 32; ++l) {
+        for (var l = 0; l < 32; l = l + 1) {
           var qByte = qs[qIdx + l]
           dst[y + j + l] = d1 * (qByte & 0xf) - m1
           dst[y + j + l + 32] = d2 * (qByte >> 4) - m2
@@ -766,7 +783,7 @@ Supports GGUF file format with various quantization types.
     var src = getUint8ArrayAt(srcOffset, totalBytes)
     var srcSigned = getInt8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var ql = src.subarray(blockOffset, blockOffset + QK_K / 2)
       var qh = src.subarray(
@@ -779,8 +796,8 @@ Supports GGUF file format with various quantization types.
 
       var y = dstOffset + i * QK_K
 
-      for (var n = 0; n < QK_K; n += 128) {
-        for (var l = 0; l < 32; ++l) {
+      for (var n = 0; n < QK_K; n = n + 128) {
+        for (var l = 0; l < 32; l = l + 1) {
           var is = Math.floor(l / 16)
           var scBase = scalesOffset + Math.floor(n / 128) * 8
           var q1 = ((ql[n / 2 + l] & 0xf) | (((qh[n / 4 + l] >> 0) & 3) << 4)) - 32
@@ -805,11 +822,11 @@ Supports GGUF file format with various quantization types.
     var totalBytes = nb * blockSize
     var src = getUint8ArrayAt(srcOffset, totalBytes)
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var blockOffset = i * blockSize
       var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
 
-      for (var j = 0; j < QK4_NL / 2; j++) {
+      for (var j = 0; j < QK4_NL / 2; j = j + 1) {
         var qsByte = src[blockOffset + 2 + j]
         dst[dstOffset + i * QK4_NL + j] = d * kvalues_iq4nl[qsByte & 0xf]
         dst[dstOffset + i * QK4_NL + j + QK4_NL / 2] = d * kvalues_iq4nl[qsByte >> 4]
@@ -1017,19 +1034,19 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset // block offset in buffer
     var xb = 0 // x offset
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
 
       var blockSum = 0.0
-      for (var j = 0; j < 16; j++) {
+      for (var j = 0; j < 16; j = j + 1) {
         var qsByte = ggufUint8[bo + 2 + j]
         var x0 = (qsByte & 0x0f) - 8
         var x1 = (qsByte >> 4) - 8
-        blockSum += x[xb + j] * x0 + x[xb + j + 16] * x1
+        blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
       }
-      sum += blockSum * d
-      bo += 18 // 2 + 16
-      xb += 32
+      sum = sum + blockSum * d
+      bo = bo + 18 // 2 + 16
+      xb = xb + 32
     }
     return sum
   }
@@ -1041,22 +1058,22 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
       var m = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
 
       var blockSum = 0.0
       var xSum = 0.0
-      for (var j = 0; j < 16; j++) {
+      for (var j = 0; j < 16; j = j + 1) {
         var qsByte = ggufUint8[bo + 4 + j]
         var x0 = qsByte & 0x0f
         var x1 = qsByte >> 4
-        blockSum += x[xb + j] * x0 + x[xb + j + 16] * x1
-        xSum += x[xb + j] + x[xb + j + 16]
+        blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
+        xSum = xSum + x[xb + j] + x[xb + j + 16]
       }
-      sum += blockSum * d + xSum * m
-      bo += 20 // 2 + 2 + 16
-      xb += 32
+      sum = sum + blockSum * d + xSum * m
+      bo = bo + 20 // 2 + 2 + 16
+      xb = xb + 32
     }
     return sum
   }
@@ -1068,7 +1085,7 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
       var qh =
         ggufUint8[bo + 2] |
@@ -1077,17 +1094,17 @@ Supports GGUF file format with various quantization types.
         (ggufUint8[bo + 5] << 24)
 
       var blockSum = 0.0
-      for (var j = 0; j < 16; j++) {
+      for (var j = 0; j < 16; j = j + 1) {
         var xh_0 = ((qh >> j) & 1) << 4
         var xh_1 = ((qh >> (j + 16)) & 1) << 4
         var qsByte = ggufUint8[bo + 6 + j]
         var x0 = ((qsByte & 0x0f) | xh_0) - 16
         var x1 = ((qsByte >> 4) | xh_1) - 16
-        blockSum += x[xb + j] * x0 + x[xb + j + 16] * x1
+        blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
       }
-      sum += blockSum * d
-      bo += 22 // 2 + 4 + 16
-      xb += 32
+      sum = sum + blockSum * d
+      bo = bo + 22 // 2 + 4 + 16
+      xb = xb + 32
     }
     return sum
   }
@@ -1099,7 +1116,7 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
       var m = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
       var qh =
@@ -1110,18 +1127,18 @@ Supports GGUF file format with various quantization types.
 
       var blockSum = 0.0
       var xSum = 0.0
-      for (var j = 0; j < 16; j++) {
+      for (var j = 0; j < 16; j = j + 1) {
         var xh_0 = ((qh >> j) & 1) << 4
         var xh_1 = ((qh >> (j + 16)) & 1) << 4
         var qsByte = ggufUint8[bo + 8 + j]
         var x0 = (qsByte & 0x0f) | xh_0
         var x1 = (qsByte >> 4) | xh_1
-        blockSum += x[xb + j] * x0 + x[xb + j + 16] * x1
-        xSum += x[xb + j] + x[xb + j + 16]
+        blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
+        xSum = xSum + x[xb + j] + x[xb + j + 16]
       }
-      sum += blockSum * d + xSum * m
-      bo += 24 // 2 + 2 + 4 + 16
-      xb += 32
+      sum = sum + blockSum * d + xSum * m
+      bo = bo + 24 // 2 + 2 + 4 + 16
+      xb = xb + 32
     }
     return sum
   }
@@ -1136,7 +1153,7 @@ Supports GGUF file format with various quantization types.
     var u8 = ggufUint8
     var i8 = ggufInt8
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
       var qOff = bo + 2
 
@@ -1175,9 +1192,9 @@ Supports GGUF file format with various quantization types.
         x[xb + 30] * i8[qOff + 30] +
         x[xb + 31] * i8[qOff + 31]
 
-      sum += blockSum * d
-      bo += 34
-      xb += 32
+      sum = sum + blockSum * d
+      bo = bo + 34
+      xb = xb + 32
     }
     return sum
   }
@@ -1191,7 +1208,7 @@ Supports GGUF file format with various quantization types.
     // Cache typed array reference for JIT
     var u8 = ggufUint8
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var scOff = bo
       var qsOff = bo + 16
       var dOff = bo + 80
@@ -1202,32 +1219,36 @@ Supports GGUF file format with various quantization types.
       var qIdx = 0
       var blockSum = 0.0
 
-      for (var nOuter = 0; nOuter < 256; nOuter += 128) {
+      for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
         var shift = 0
-        for (var j = 0; j < 4; ++j) {
-          var sc = u8[scOff + is++]
+        for (var j = 0; j < 4; j = j + 1) {
+          var sc = u8[scOff + is]
+          is = is + 1
           var dl = d * (sc & 0xf)
           var ml = dmin * (sc >> 4)
           var baseIdx = xb + nOuter + j * 32
           var qBase = qsOff + qIdx
-          for (var l = 0; l < 16; ++l) {
-            blockSum += x[baseIdx + l] * (dl * ((u8[qBase + l] >> shift) & 3) - ml)
+          for (var l = 0; l < 16; l = l + 1) {
+            blockSum =
+              blockSum + x[baseIdx + l] * (dl * ((u8[qBase + l] >> shift) & 3) - ml)
           }
 
-          sc = u8[scOff + is++]
+          sc = u8[scOff + is]
+          is = is + 1
           dl = d * (sc & 0xf)
           ml = dmin * (sc >> 4)
-          for (var l = 0; l < 16; ++l) {
-            blockSum +=
+          for (var l = 0; l < 16; l = l + 1) {
+            blockSum =
+              blockSum +
               x[baseIdx + 16 + l] * (dl * ((u8[qBase + l + 16] >> shift) & 3) - ml)
           }
-          shift += 2
+          shift = shift + 2
         }
-        qIdx += 32
+        qIdx = qIdx + 32
       }
-      sum += blockSum
-      bo += 84
-      xb += 256
+      sum = sum + blockSum
+      bo = bo + 84
+      xb = xb + 256
     }
     return sum
   }
@@ -1244,7 +1265,7 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var hmOff = bo
       var qsOff = bo + 32
       var scOff = bo + 96
@@ -1289,8 +1310,10 @@ Supports GGUF file format with various quantization types.
       q3kScales[14] = (s3 >> 16) & 0xff
       q3kScales[15] = (s3 >> 24) & 0xff
 
-      for (var si = 0; si < 16; si++) {
-        if (q3kScales[si] > 127) q3kScales[si] -= 256
+      for (var si = 0; si < 16; si = si + 1) {
+        if (q3kScales[si] > 127) {
+          q3kScales[si] = q3kScales[si] - 256
+        }
       }
 
       var is = 0
@@ -1298,30 +1321,32 @@ Supports GGUF file format with various quantization types.
       var qIdx = 0
       var blockSum = 0.0
 
-      for (var nOuter = 0; nOuter < 256; nOuter += 128) {
+      for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
         var shift = 0
-        for (var j = 0; j < 4; ++j) {
-          var dl = dAll * (q3kScales[is++] - 32)
-          for (var l = 0; l < 16; ++l) {
+        for (var j = 0; j < 4; j = j + 1) {
+          var dl = dAll * (q3kScales[is] - 32)
+          is = is + 1
+          for (var l = 0; l < 16; l = l + 1) {
             var q = (ggufUint8[qsOff + qIdx + l] >> shift) & 3
             var h = ggufUint8[hmOff + l] & m ? 0 : 4
-            blockSum += x[xb + nOuter + j * 32 + l] * dl * (q - h)
+            blockSum = blockSum + x[xb + nOuter + j * 32 + l] * dl * (q - h)
           }
 
-          dl = dAll * (q3kScales[is++] - 32)
-          for (var l = 0; l < 16; ++l) {
+          dl = dAll * (q3kScales[is] - 32)
+          is = is + 1
+          for (var l = 0; l < 16; l = l + 1) {
             var q = (ggufUint8[qsOff + qIdx + l + 16] >> shift) & 3
             var h = ggufUint8[hmOff + l + 16] & m ? 0 : 4
-            blockSum += x[xb + nOuter + j * 32 + 16 + l] * dl * (q - h)
+            blockSum = blockSum + x[xb + nOuter + j * 32 + 16 + l] * dl * (q - h)
           }
-          shift += 2
+          shift = shift + 2
           m <<= 1
         }
-        qIdx += 32
+        qIdx = qIdx + 32
       }
-      sum += blockSum
-      bo += 110 // 32 + 64 + 12 + 2
-      xb += 256
+      sum = sum + blockSum
+      bo = bo + 110 // 32 + 64 + 12 + 2
+      xb = xb + 256
     }
     return sum
   }
@@ -1335,7 +1360,7 @@ Supports GGUF file format with various quantization types.
     // Cache typed array reference for JIT
     var u8 = ggufUint8
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
       var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
       var scOff = bo + 4
@@ -1344,18 +1369,18 @@ Supports GGUF file format with various quantization types.
       var blockSum = 0.0
 
       // Unrolled: j=0 (is=0,1)
-      var sc0 = u8[scOff] & 63,
-        m0 = u8[scOff + 4] & 63
-      var sc1 = u8[scOff + 1] & 63,
-        m1 = u8[scOff + 5] & 63
-      var d1 = d * sc0,
-        dm1 = dmin * m0
-      var d2 = d * sc1,
-        dm2 = dmin * m1
-      for (var l = 0; l < 32; ++l) {
+      var sc0 = u8[scOff] & 63
+      var m0 = u8[scOff + 4] & 63
+      var sc1 = u8[scOff + 1] & 63
+      var m1 = u8[scOff + 5] & 63
+      var d1 = d * sc0
+      var dm1 = dmin * m0
+      var d2 = d * sc1
+      var dm2 = dmin * m1
+      for (var l = 0; l < 32; l = l + 1) {
         var qByte = u8[qsOff + l]
-        blockSum += x[xb + l] * (d1 * (qByte & 0xf) - dm1)
-        blockSum += x[xb + l + 32] * (d2 * (qByte >> 4) - dm2)
+        blockSum = blockSum + x[xb + l] * (d1 * (qByte & 0xf) - dm1)
+        blockSum = blockSum + x[xb + l + 32] * (d2 * (qByte >> 4) - dm2)
       }
 
       // Unrolled: j=64 (is=2,3)
@@ -1367,10 +1392,10 @@ Supports GGUF file format with various quantization types.
       dm1 = dmin * m0
       d2 = d * sc1
       dm2 = dmin * m1
-      for (var l = 0; l < 32; ++l) {
+      for (var l = 0; l < 32; l = l + 1) {
         var qByte = u8[qsOff + 32 + l]
-        blockSum += x[xb + 64 + l] * (d1 * (qByte & 0xf) - dm1)
-        blockSum += x[xb + 64 + l + 32] * (d2 * (qByte >> 4) - dm2)
+        blockSum = blockSum + x[xb + 64 + l] * (d1 * (qByte & 0xf) - dm1)
+        blockSum = blockSum + x[xb + 64 + l + 32] * (d2 * (qByte >> 4) - dm2)
       }
 
       // Unrolled: j=128 (is=4,5)
@@ -1382,10 +1407,10 @@ Supports GGUF file format with various quantization types.
       dm1 = dmin * m0
       d2 = d * sc1
       dm2 = dmin * m1
-      for (var l = 0; l < 32; ++l) {
+      for (var l = 0; l < 32; l = l + 1) {
         var qByte = u8[qsOff + 64 + l]
-        blockSum += x[xb + 128 + l] * (d1 * (qByte & 0xf) - dm1)
-        blockSum += x[xb + 128 + l + 32] * (d2 * (qByte >> 4) - dm2)
+        blockSum = blockSum + x[xb + 128 + l] * (d1 * (qByte & 0xf) - dm1)
+        blockSum = blockSum + x[xb + 128 + l + 32] * (d2 * (qByte >> 4) - dm2)
       }
 
       // Unrolled: j=192 (is=6,7)
@@ -1397,15 +1422,15 @@ Supports GGUF file format with various quantization types.
       dm1 = dmin * m0
       d2 = d * sc1
       dm2 = dmin * m1
-      for (var l = 0; l < 32; ++l) {
+      for (var l = 0; l < 32; l = l + 1) {
         var qByte = u8[qsOff + 96 + l]
-        blockSum += x[xb + 192 + l] * (d1 * (qByte & 0xf) - dm1)
-        blockSum += x[xb + 192 + l + 32] * (d2 * (qByte >> 4) - dm2)
+        blockSum = blockSum + x[xb + 192 + l] * (d1 * (qByte & 0xf) - dm1)
+        blockSum = blockSum + x[xb + 192 + l + 32] * (d2 * (qByte >> 4) - dm2)
       }
 
-      sum += blockSum
-      bo += 144
-      xb += 256
+      sum = sum + blockSum
+      bo = bo + 144
+      xb = xb + 256
     }
     return sum
   }
@@ -1417,7 +1442,7 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
       var dmin = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
       var scOff = bo + 4
@@ -1430,8 +1455,9 @@ Supports GGUF file format with various quantization types.
       var qlIdx = 0
       var blockSum = 0.0
 
-      for (var j = 0; j < 256; j += 64) {
-        var sc, m
+      for (var j = 0; j < 256; j = j + 64) {
+        var sc
+        var m
         if (is < 4) {
           sc = ggufUint8[scOff + is] & 63
           m = ggufUint8[scOff + is + 4] & 63
@@ -1443,7 +1469,7 @@ Supports GGUF file format with various quantization types.
         }
         var d1 = d * sc
         var m1 = dmin * m
-        is++
+        is = is + 1
 
         if (is < 4) {
           sc = ggufUint8[scOff + is] & 63
@@ -1456,29 +1482,31 @@ Supports GGUF file format with various quantization types.
         }
         var d2 = d * sc
         var m2 = dmin * m
-        is++
+        is = is + 1
 
-        for (var l = 0; l < 32; ++l) {
-          blockSum +=
+        for (var l = 0; l < 32; l = l + 1) {
+          blockSum =
+            blockSum +
             x[xb + j + l] *
-            (d1 *
-              ((ggufUint8[qlOff + qlIdx + l] & 0xf) +
-                (ggufUint8[qhOff + l] & u1 ? 16 : 0)) -
-              m1)
-          blockSum +=
+              (d1 *
+                ((ggufUint8[qlOff + qlIdx + l] & 0xf) +
+                  (ggufUint8[qhOff + l] & u1 ? 16 : 0)) -
+                m1)
+          blockSum =
+            blockSum +
             x[xb + j + l + 32] *
-            (d2 *
-              ((ggufUint8[qlOff + qlIdx + l] >> 4) +
-                (ggufUint8[qhOff + l] & u2 ? 16 : 0)) -
-              m2)
+              (d2 *
+                ((ggufUint8[qlOff + qlIdx + l] >> 4) +
+                  (ggufUint8[qhOff + l] & u2 ? 16 : 0)) -
+                m2)
         }
-        qlIdx += 32
+        qlIdx = qlIdx + 32
         u1 <<= 2
         u2 <<= 2
       }
-      sum += blockSum
-      bo += 176 // 2 + 2 + 12 + 32 + 128
-      xb += 256
+      sum = sum + blockSum
+      bo = bo + 176 // 2 + 2 + 12 + 32 + 128
+      xb = xb + 256
     }
     return sum
   }
@@ -1490,7 +1518,7 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var qlOff = bo
       var qhOff = bo + 128
       var scOff = bo + 192
@@ -1498,11 +1526,11 @@ Supports GGUF file format with various quantization types.
       var d = fp16ToFp32(ggufUint8[dOff] | (ggufUint8[dOff + 1] << 8))
 
       var blockSum = 0.0
-      for (var nOuter = 0; nOuter < 256; nOuter += 128) {
+      for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
         var scBase = scOff + (nOuter >> 7) * 8
         var qlBase = qlOff + (nOuter >> 1)
         var qhBase = qhOff + (nOuter >> 2)
-        for (var l = 0; l < 32; ++l) {
+        for (var l = 0; l < 32; l = l + 1) {
           var is = l >> 4
           var q1 =
             ((ggufUint8[qlBase + l] & 0xf) |
@@ -1521,15 +1549,18 @@ Supports GGUF file format with various quantization types.
               (((ggufUint8[qhBase + l] >> 6) & 3) << 4)) -
             32
 
-          blockSum += x[xb + nOuter + l] * d * ggufInt8[scBase + is] * q1
-          blockSum += x[xb + nOuter + l + 32] * d * ggufInt8[scBase + is + 2] * q2
-          blockSum += x[xb + nOuter + l + 64] * d * ggufInt8[scBase + is + 4] * q3
-          blockSum += x[xb + nOuter + l + 96] * d * ggufInt8[scBase + is + 6] * q4
+          blockSum = blockSum + x[xb + nOuter + l] * d * ggufInt8[scBase + is] * q1
+          blockSum =
+            blockSum + x[xb + nOuter + l + 32] * d * ggufInt8[scBase + is + 2] * q2
+          blockSum =
+            blockSum + x[xb + nOuter + l + 64] * d * ggufInt8[scBase + is + 4] * q3
+          blockSum =
+            blockSum + x[xb + nOuter + l + 96] * d * ggufInt8[scBase + is + 6] * q4
         }
       }
-      sum += blockSum
-      bo += 210 // 128 + 64 + 16 + 2
-      xb += 256
+      sum = sum + blockSum
+      bo = bo + 210 // 128 + 64 + 16 + 2
+      xb = xb + 256
     }
     return sum
   }
@@ -1541,18 +1572,18 @@ Supports GGUF file format with various quantization types.
     var bo = srcOffset
     var xb = 0
 
-    for (var i = 0; i < nb; i++) {
+    for (var i = 0; i < nb; i = i + 1) {
       var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
 
       var blockSum = 0.0
-      for (var j = 0; j < 16; ++j) {
+      for (var j = 0; j < 16; j = j + 1) {
         var qsByte = ggufUint8[bo + 2 + j]
-        blockSum += x[xb + j] * kvalues_iq4nl[qsByte & 0xf]
-        blockSum += x[xb + j + 16] * kvalues_iq4nl[qsByte >> 4]
+        blockSum = blockSum + x[xb + j] * kvalues_iq4nl[qsByte & 0xf]
+        blockSum = blockSum + x[xb + j + 16] * kvalues_iq4nl[qsByte >> 4]
       }
-      sum += blockSum * d
-      bo += 18 // 2 + 16
-      xb += 32
+      sum = sum + blockSum * d
+      bo = bo + 18 // 2 + 16
+      xb = xb + 32
     }
     return sum
   }
@@ -1561,10 +1592,10 @@ Supports GGUF file format with various quantization types.
   function vecDotF16(x, srcOffset, n) {
     var sum = 0.0
     var bo = srcOffset
-    for (var i = 0; i < n; i++) {
+    for (var i = 0; i < n; i = i + 1) {
       var h = ggufUint8[bo] | (ggufUint8[bo + 1] << 8)
-      sum += x[i] * fp16ToFp32(h)
-      bo += 2
+      sum = sum + x[i] * fp16ToFp32(h)
+      bo = bo + 2
     }
     return sum
   }
@@ -1573,10 +1604,10 @@ Supports GGUF file format with various quantization types.
   function vecDotBF16(x, srcOffset, n) {
     var sum = 0.0
     var bo = srcOffset
-    for (var i = 0; i < n; i++) {
+    for (var i = 0; i < n; i = i + 1) {
       var h = ggufUint8[bo] | (ggufUint8[bo + 1] << 8)
-      sum += x[i] * bf16ToFp32(h)
-      bo += 2
+      sum = sum + x[i] * bf16ToFp32(h)
+      bo = bo + 2
     }
     return sum
   }
@@ -1585,15 +1616,15 @@ Supports GGUF file format with various quantization types.
   function vecDotF32(x, srcOffset, n) {
     var sum = 0.0
     var bo = srcOffset
-    for (var i = 0; i < n; i++) {
+    for (var i = 0; i < n; i = i + 1) {
       // Read 4 bytes as little-endian float
       convInt[0] =
         ggufUint8[bo] |
         (ggufUint8[bo + 1] << 8) |
         (ggufUint8[bo + 2] << 16) |
         (ggufUint8[bo + 3] << 24)
-      sum += x[i] * convFloat[0]
-      bo += 4
+      sum = sum + x[i] * convFloat[0]
+      bo = bo + 4
     }
     return sum
   }
@@ -1646,7 +1677,7 @@ Supports GGUF file format with various quantization types.
     // Get function once before loop (avoids switch in hot path)
     var dotFunc = qw.dotFunc
 
-    for (var i = 0; i < rows; i++) {
+    for (var i = 0; i < rows; i = i + 1) {
       out[i] = dotFunc(x, baseOffset + i * rowSize, cols)
     }
   }
@@ -1661,25 +1692,25 @@ Supports GGUF file format with various quantization types.
     // Loop unrolling: process 4 elements at a time
     var size4 = size & ~3 // size - (size % 4)
     var i = 0
-    for (; i < size4; i += 4) {
-      var x0 = x[i],
-        x1 = x[i + 1],
-        x2 = x[i + 2],
-        x3 = x[i + 3]
-      ss += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
+    for (; i < size4; i = i + 4) {
+      var x0 = x[i]
+      var x1 = x[i + 1]
+      var x2 = x[i + 2]
+      var x3 = x[i + 3]
+      ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
     }
-    for (; i < size; i++) {
-      ss += x[i] * x[i]
+    for (; i < size; i = i + 1) {
+      ss = ss + x[i] * x[i]
     }
     ss = 1.0 / Math.sqrt(ss * invSize + eps)
     i = 0
-    for (; i < size4; i += 4) {
+    for (; i < size4; i = i + 4) {
       out[i] = w[i] * ss * x[i]
       out[i + 1] = w[i + 1] * ss * x[i + 1]
       out[i + 2] = w[i + 2] * ss * x[i + 2]
       out[i + 3] = w[i + 3] * ss * x[i + 3]
     }
-    for (; i < size; i++) {
+    for (; i < size; i = i + 1) {
       out[i] = w[i] * ss * x[i]
     }
   }
@@ -1691,25 +1722,25 @@ Supports GGUF file format with various quantization types.
     // Loop unrolling: process 4 elements at a time
     var size4 = size & ~3
     var i = 0
-    for (; i < size4; i += 4) {
-      var x0 = x[i],
-        x1 = x[i + 1],
-        x2 = x[i + 2],
-        x3 = x[i + 3]
-      ss += x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
+    for (; i < size4; i = i + 4) {
+      var x0 = x[i]
+      var x1 = x[i + 1]
+      var x2 = x[i + 2]
+      var x3 = x[i + 3]
+      ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
     }
-    for (; i < size; i++) {
-      ss += x[i] * x[i]
+    for (; i < size; i = i + 1) {
+      ss = ss + x[i] * x[i]
     }
     ss = 1.0 / Math.sqrt(ss * invSize + eps)
     i = 0
-    for (; i < size4; i += 4) {
+    for (; i < size4; i = i + 4) {
       out[i] = w[i] * ss * x[i]
       out[i + 1] = w[i + 1] * ss * x[i + 1]
       out[i + 2] = w[i + 2] * ss * x[i + 2]
       out[i + 3] = w[i + 3] * ss * x[i + 3]
     }
-    for (; i < size; i++) {
+    for (; i < size; i = i + 1) {
       out[i] = w[i] * ss * x[i]
     }
   }
@@ -1719,19 +1750,29 @@ Supports GGUF file format with various quantization types.
     var size4 = size & ~3
     var i = 1
     // Find max with unrolled loop
-    for (; i < size4; i += 4) {
-      if (x[i] > maxVal) maxVal = x[i]
-      if (x[i + 1] > maxVal) maxVal = x[i + 1]
-      if (x[i + 2] > maxVal) maxVal = x[i + 2]
-      if (x[i + 3] > maxVal) maxVal = x[i + 3]
+    for (; i < size4; i = i + 4) {
+      if (x[i] > maxVal) {
+        maxVal = x[i]
+      }
+      if (x[i + 1] > maxVal) {
+        maxVal = x[i + 1]
+      }
+      if (x[i + 2] > maxVal) {
+        maxVal = x[i + 2]
+      }
+      if (x[i + 3] > maxVal) {
+        maxVal = x[i + 3]
+      }
     }
-    for (; i < size; i++) {
-      if (x[i] > maxVal) maxVal = x[i]
+    for (; i < size; i = i + 1) {
+      if (x[i] > maxVal) {
+        maxVal = x[i]
+      }
     }
     // Exp and sum with unrolled loop
     var sum = 0.0
     i = 0
-    for (; i < size4; i += 4) {
+    for (; i < size4; i = i + 4) {
       var e0 = Math.exp(x[i] - maxVal)
       var e1 = Math.exp(x[i + 1] - maxVal)
       var e2 = Math.exp(x[i + 2] - maxVal)
@@ -1740,37 +1781,37 @@ Supports GGUF file format with various quantization types.
       x[i + 1] = e1
       x[i + 2] = e2
       x[i + 3] = e3
-      sum += e0 + e1 + e2 + e3
+      sum = sum + e0 + e1 + e2 + e3
     }
-    for (; i < size; i++) {
+    for (; i < size; i = i + 1) {
       x[i] = Math.exp(x[i] - maxVal)
-      sum += x[i]
+      sum = sum + x[i]
     }
     // Normalize with reciprocal multiply
     var invSum = 1.0 / sum
     i = 0
-    for (; i < size4; i += 4) {
-      x[i] *= invSum
-      x[i + 1] *= invSum
-      x[i + 2] *= invSum
-      x[i + 3] *= invSum
+    for (; i < size4; i = i + 4) {
+      x[i] = x[i] * invSum
+      x[i + 1] = x[i + 1] * invSum
+      x[i + 2] = x[i + 2] * invSum
+      x[i + 3] = x[i + 3] * invSum
     }
-    for (; i < size; i++) {
-      x[i] *= invSum
+    for (; i < size; i = i + 1) {
+      x[i] = x[i] * invSum
     }
   }
 
   function accum(a, b, size) {
     var size4 = size & ~3
     var i = 0
-    for (; i < size4; i += 4) {
-      a[i] += b[i]
-      a[i + 1] += b[i + 1]
-      a[i + 2] += b[i + 2]
-      a[i + 3] += b[i + 3]
+    for (; i < size4; i = i + 4) {
+      a[i] = a[i] + b[i]
+      a[i + 1] = a[i + 1] + b[i + 1]
+      a[i + 2] = a[i + 2] + b[i + 2]
+      a[i + 3] = a[i + 3] + b[i + 3]
     }
-    for (; i < size; i++) {
-      a[i] += b[i]
+    for (; i < size; i = i + 1) {
+      a[i] = a[i] + b[i]
     }
   }
 
@@ -1797,27 +1838,29 @@ Supports GGUF file format with various quantization types.
     var nKV = readUint64()
 
     var metadata = {}
-    var i, key, valueType
+    var i
+    var key
+    var valueType
 
-    for (i = 0; i < nKV; i++) {
+    for (i = 0; i < nKV; i = i + 1) {
       key = readString()
       valueType = readUint32()
       metadata[key] = readGGUFValue(valueType)
     }
 
     var tensors = {}
-    for (i = 0; i < nTensors; i++) {
+    for (i = 0; i < nTensors; i = i + 1) {
       var name = readString()
       var nDims = readUint32()
       var dims = []
-      for (var d = 0; d < nDims; d++) {
+      for (var d = 0; d < nDims; d = d + 1) {
         dims.push(readUint64())
       }
       var type = readUint32()
       var tensorOffset = readUint64()
 
       var nElements = 1
-      for (var d = 0; d < dims.length; d++) {
+      for (var d = 0; d < dims.length; d = d + 1) {
         nElements *= dims[d]
       }
 
@@ -1849,9 +1892,9 @@ Supports GGUF file format with various quantization types.
       case GGUF_TYPE.UINT16:
         return readUint16()
       case GGUF_TYPE.INT16:
-        return dataView.getInt16(offset, true)
-        offset += 2
-        return
+        var int16Val = dataView.getInt16(offset, true)
+        offset = offset + 2
+        return int16Val
       case GGUF_TYPE.UINT32:
         return readUint32()
       case GGUF_TYPE.INT32:
@@ -1872,7 +1915,7 @@ Supports GGUF file format with various quantization types.
         var arrType = readUint32()
         var arrLen = readUint64()
         var arr = []
-        for (var i = 0; i < arrLen; i++) {
+        for (var i = 0; i < arrLen; i = i + 1) {
           arr.push(readGGUFValue(arrType))
         }
         return arr
@@ -1991,7 +2034,9 @@ Supports GGUF file format with various quantization types.
     // Load tensor as dequantized float (for small tensors like norms and embeddings)
     function loadTensorFloat(name) {
       var t = tensors[name]
-      if (!t) return null
+      if (!t) {
+        return null
+      }
       return dequantizeTensor(baseOffset + t.offset, t.nElements, t.type)
     }
 
@@ -1999,7 +2044,9 @@ Supports GGUF file format with various quantization types.
     // Returns a QuantizedTensor object with pre-computed rowSize and dotFunc
     function loadTensorQuantized(name, rows, cols) {
       var t = tensors[name]
-      if (!t) return null
+      if (!t) {
+        return null
+      }
       return {
         dataOffset: baseOffset + t.offset,
         type: t.type,
@@ -2038,7 +2085,7 @@ Supports GGUF file format with various quantization types.
     // Use per-layer arrays
     w.layers = []
 
-    for (var l = 0; l < config.nLayers; l++) {
+    for (var l = 0; l < config.nLayers; l = l + 1) {
       postMessage({
         type: "progress",
         message: "Loading layer " + (l + 1) + "/" + config.nLayers + "...",
@@ -2121,7 +2168,7 @@ Supports GGUF file format with various quantization types.
     // For each position and each dimension pair, we store cos and sin
     var ropeSize = headSize / 2
     var ropeFreqs = new Float32Array(ropeSize)
-    for (var i = 0; i < ropeSize; i++) {
+    for (var i = 0; i < ropeSize; i = i + 1) {
       var dimIdx = i * 2
       ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, dimIdx / headSize)
     }
@@ -2129,7 +2176,7 @@ Supports GGUF file format with various quantization types.
     // Pre-compute SWA RoPE frequencies (for Gemma3 sliding window attention layers)
     var ropeFreqsSwa = new Float32Array(ropeSize)
     var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
-    for (var i = 0; i < ropeSize; i++) {
+    for (var i = 0; i < ropeSize; i = i + 1) {
       var dimIdx = i * 2
       ropeFreqsSwa[i] = 1.0 / Math.pow(swaTheta, dimIdx / headSize)
     }
@@ -2231,12 +2278,12 @@ Supports GGUF file format with various quantization types.
     // Gemma: Scale embeddings by sqrt(dim) - use pre-computed value
     if (isGemma) {
       var scale = s.embedScale
-      for (var i = 0; i < dim; i++) {
+      for (var i = 0; i < dim; i = i + 1) {
         xArr[i] *= scale
       }
     }
 
-    for (var l = 0; l < nLayers; l++) {
+    for (var l = 0; l < nLayers; l = l + 1) {
       var lw = w.layers[l] // Layer weights
 
       if (isGemma) {
@@ -2251,7 +2298,7 @@ Supports GGUF file format with various quantization types.
       matmulQuantized(s.v, xbArr, lw.wv)
 
       if (isGemma && lw.attnQNorm && lw.attnKNorm) {
-        for (var h = 0; h < nHeads; h++) {
+        for (var h = 0; h < nHeads; h = h + 1) {
           rmsnormGemma(
             s.q.subarray(h * headSize, (h + 1) * headSize),
             s.q.subarray(h * headSize, (h + 1) * headSize),
@@ -2261,7 +2308,7 @@ Supports GGUF file format with various quantization types.
             invHeadSize
           )
         }
-        for (var h = 0; h < nKvHeads; h++) {
+        for (var h = 0; h < nKvHeads; h = h + 1) {
           rmsnormGemma(
             s.k.subarray(h * headSize, (h + 1) * headSize),
             s.k.subarray(h * headSize, (h + 1) * headSize),
@@ -2292,7 +2339,7 @@ Supports GGUF file format with various quantization types.
       // Cache is invalidated when position changes OR when switching between SWA/dense layer types
       var currentIsSwa = isSwaLayer ? 1 : 0
       if (s.ropeCachePos !== pos || s.ropeCacheIsSwa !== currentIsSwa) {
-        for (var i = 0; i < half; i++) {
+        for (var i = 0; i < half; i = i + 1) {
           var val = pos * ropeFreqs[i]
           ropeCos[i] = Math.cos(val)
           ropeSin[i] = Math.sin(val)
@@ -2302,9 +2349,9 @@ Supports GGUF file format with various quantization types.
       }
 
       if (isGemma) {
-        for (var h = 0; h < nHeads; h++) {
+        for (var h = 0; h < nHeads; h = h + 1) {
           var idx = h * headSize
-          for (var i = 0; i < half; i++) {
+          for (var i = 0; i < half; i = i + 1) {
             var fcr = ropeCos[i]
             var fci = ropeSin[i]
             var v0 = qArr[idx + i]
@@ -2313,9 +2360,9 @@ Supports GGUF file format with various quantization types.
             qArr[idx + i + half] = v0 * fci + v1 * fcr
           }
         }
-        for (var h = 0; h < nKvHeads; h++) {
+        for (var h = 0; h < nKvHeads; h = h + 1) {
           var idx = h * headSize
-          for (var i = 0; i < half; i++) {
+          for (var i = 0; i < half; i = i + 1) {
             var fcr = ropeCos[i]
             var fci = ropeSin[i]
             var v0 = kArr[idx + i]
@@ -2325,7 +2372,7 @@ Supports GGUF file format with various quantization types.
           }
         }
       } else {
-        for (var i = 0; i < qDim; i += 2) {
+        for (var i = 0; i < qDim; i = i + 2) {
           var freqIdx = (i >> 1) % half
           var fcr = ropeCos[freqIdx]
           var fci = ropeSin[freqIdx]
@@ -2347,7 +2394,7 @@ Supports GGUF file format with various quantization types.
       // Gemma: Scale Q by attention_scale - use pre-computed value
       if (isGemma) {
         var attnScale = s.attnScale
-        for (var i = 0; i < qDim; i++) {
+        for (var i = 0; i < qDim; i = i + 1) {
           qArr[i] *= attnScale
         }
       }
@@ -2374,14 +2421,14 @@ Supports GGUF file format with various quantization types.
       var seqLen = s.seqLen
 
       // Zero xb once for all heads - more efficient than per-head zeroing
-      for (var i = 0; i < qDim; i++) {
+      for (var i = 0; i < qDim; i = i + 1) {
         xbArr[i] = 0
       }
 
       // Bytes per KV head = (headSize / 32) * 34
       var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
 
-      for (var h = 0; h < nHeads; h++) {
+      for (var h = 0; h < nHeads; h = h + 1) {
         var qOffset = h * headSize
         var attOffset = h * seqLen
         // Use integer division via bitwise for kvMul (kvMul is always power of 2 or 1)
@@ -2390,7 +2437,7 @@ Supports GGUF file format with various quantization types.
 
         // Compute attention scores using Q8_0 dot product
         var kBase = loff + kvHeadByteOff
-        for (var t = 0; t <= pos; t++) {
+        for (var t = 0; t <= pos; t = t + 1) {
           var kByteOffset = kBase + t * kvBytesPerVec
           var score = dotQ8_0Cache(
             qArr,
@@ -2406,24 +2453,26 @@ Supports GGUF file format with various quantization types.
         // Inline softmax to avoid subarray allocation
         var softmaxSize = pos + 1
         var maxVal = sAtt[attOffset]
-        for (var i = 1; i < softmaxSize; i++) {
-          if (sAtt[attOffset + i] > maxVal) maxVal = sAtt[attOffset + i]
+        for (var i = 1; i < softmaxSize; i = i + 1) {
+          if (sAtt[attOffset + i] > maxVal) {
+            maxVal = sAtt[attOffset + i]
+          }
         }
         var expSum = 0.0
-        for (var i = 0; i < softmaxSize; i++) {
+        for (var i = 0; i < softmaxSize; i = i + 1) {
           var e = Math.exp(sAtt[attOffset + i] - maxVal)
           sAtt[attOffset + i] = e
-          expSum += e
+          expSum = expSum + e
         }
         var invSum = 1.0 / expSum
-        for (var i = 0; i < softmaxSize; i++) {
-          sAtt[attOffset + i] *= invSum
+        for (var i = 0; i < softmaxSize; i = i + 1) {
+          sAtt[attOffset + i] = sAtt[attOffset + i] * invSum
         }
 
         // Accumulate weighted values using Q8_0 cache
         var xbOffset = h * headSize
         var vBase = loff + kvHeadByteOff
-        for (var t = 0; t <= pos; t++) {
+        for (var t = 0; t <= pos; t = t + 1) {
           var vByteOffset = vBase + t * kvBytesPerVec
           var a = sAtt[attOffset + t]
           accumQ8_0Cache(
@@ -2463,11 +2512,11 @@ Supports GGUF file format with various quantization types.
       var hd4 = hiddenDim & ~3
       if (isGemma) {
         // GELU activation
-        for (var i = 0; i < hd4; i += 4) {
-          var x0 = hbArr[i],
-            x1 = hbArr[i + 1],
-            x2 = hbArr[i + 2],
-            x3 = hbArr[i + 3]
+        for (var i = 0; i < hd4; i = i + 4) {
+          var x0 = hbArr[i]
+          var x1 = hbArr[i + 1]
+          var x2 = hbArr[i + 2]
+          var x3 = hbArr[i + 3]
           hbArr[i] =
             0.5 *
             x0 *
@@ -2489,7 +2538,7 @@ Supports GGUF file format with various quantization types.
             (1.0 + Math.tanh(0.7978845608 * x3 * (1.0 + 0.044715 * x3 * x3))) *
             hb2Arr[i + 3]
         }
-        for (var i = hd4; i < hiddenDim; i++) {
+        for (var i = hd4; i < hiddenDim; i = i + 1) {
           var x = hbArr[i]
           hbArr[i] =
             0.5 *
@@ -2499,17 +2548,17 @@ Supports GGUF file format with various quantization types.
         }
       } else {
         // SiLU activation
-        for (var i = 0; i < hd4; i += 4) {
-          var v0 = hbArr[i],
-            v1 = hbArr[i + 1],
-            v2 = hbArr[i + 2],
-            v3 = hbArr[i + 3]
+        for (var i = 0; i < hd4; i = i + 4) {
+          var v0 = hbArr[i]
+          var v1 = hbArr[i + 1]
+          var v2 = hbArr[i + 2]
+          var v3 = hbArr[i + 3]
           hbArr[i] = (v0 / (1.0 + Math.exp(-v0))) * hb2Arr[i]
           hbArr[i + 1] = (v1 / (1.0 + Math.exp(-v1))) * hb2Arr[i + 1]
           hbArr[i + 2] = (v2 / (1.0 + Math.exp(-v2))) * hb2Arr[i + 2]
           hbArr[i + 3] = (v3 / (1.0 + Math.exp(-v3))) * hb2Arr[i + 3]
         }
-        for (var i = hd4; i < hiddenDim; i++) {
+        for (var i = hd4; i < hiddenDim; i = i + 1) {
           var val = hbArr[i]
           hbArr[i] = (val / (1.0 + Math.exp(-val))) * hb2Arr[i]
         }
@@ -2538,7 +2587,7 @@ Supports GGUF file format with various quantization types.
     if (isGemma && config.finalLogitSoftcapping > 0) {
       var cap = config.finalLogitSoftcapping
       var vocabSize = s.vocabSize
-      for (var i = 0; i < vocabSize; i++) {
+      for (var i = 0; i < vocabSize; i = i + 1) {
         s.logits[i] = cap * Math.tanh(s.logits[i] / cap)
       }
     }
@@ -2555,7 +2604,7 @@ Supports GGUF file format with various quantization types.
   function sampleArgmax(logits, n) {
     var maxI = 0
     var maxP = logits[0]
-    for (var i = 1; i < n; i++) {
+    for (var i = 1; i < n; i = i + 1) {
       if (logits[i] > maxP) {
         maxI = i
         maxP = logits[i]
@@ -2567,8 +2616,8 @@ Supports GGUF file format with various quantization types.
   function sampleMultinomial(probabilities, n) {
     var r = randomF32()
     var cdf = 0.0
-    for (var i = 0; i < n; i++) {
-      cdf += probabilities[i]
+    for (var i = 0; i < n; i = i + 1) {
+      cdf = cdf + probabilities[i]
       if (r < cdf) {
         return i
       }
@@ -2581,8 +2630,8 @@ Supports GGUF file format with various quantization types.
       return sampleArgmax(logits, config.vocabSize)
     }
 
-    for (var i = 0; i < config.vocabSize; i++) {
-      logits[i] /= temp
+    for (var i = 0; i < config.vocabSize; i = i + 1) {
+      logits[i] = logits[i] / temp
     }
 
     softmax(logits, config.vocabSize)
@@ -2596,12 +2645,14 @@ Supports GGUF file format with various quantization types.
   var vocabMap = null
 
   function buildSortedVocab() {
-    if (sortedVocab) return
+    if (sortedVocab) {
+      return
+    }
 
     sortedVocab = []
     vocabMap = {}
 
-    for (var i = 0; i < tokenizer.vocab.length; i++) {
+    for (var i = 0; i < tokenizer.vocab.length; i = i + 1) {
       var token = tokenizer.vocab[i]
       if (token && token.length > 0) {
         sortedVocab.push({ id: i, len: token.length, token: token })
@@ -2627,13 +2678,15 @@ Supports GGUF file format with various quantization types.
   var tiktokenByteToUnicode = null
 
   function buildTiktokenByteToUnicodeMap() {
-    if (tiktokenByteToUnicode) return
+    if (tiktokenByteToUnicode) {
+      return
+    }
     tiktokenByteToUnicode = {}
 
     // This is OpenAI's bytes_to_unicode() function
     // Printable ASCII and some extended chars map to themselves
     var n = 0
-    for (var b = 0; b < 256; b++) {
+    for (var b = 0; b < 256; b = b + 1) {
       // These byte ranges map directly: ! to ~, ¡ to ¬, ® to ÿ
       if (
         (b >= 33 && b <= 126) ||
@@ -2644,7 +2697,7 @@ Supports GGUF file format with various quantization types.
       } else {
         // Other bytes (0-32, 127-160, 173) map to 256+n, 257+n, etc.
         tiktokenByteToUnicode[b] = 256 + n
-        n++
+        n = n + 1
       }
     }
   }
@@ -2653,7 +2706,7 @@ Supports GGUF file format with various quantization types.
     buildTiktokenByteToUnicodeMap()
 
     var result = ""
-    for (var i = 0; i < text.length; i++) {
+    for (var i = 0; i < text.length; i = i + 1) {
       var code = text.charCodeAt(i)
 
       // Handle UTF-16 surrogate pairs
@@ -2661,31 +2714,37 @@ Supports GGUF file format with various quantization types.
         var low = text.charCodeAt(i + 1)
         if (low >= 0xdc00 && low <= 0xdfff) {
           code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
-          i++
+          i = i + 1
         }
       }
 
       // Convert unicode to UTF-8 bytes, then map each byte to tiktoken unicode
       if (code < 0x80) {
-        result += String.fromCharCode(tiktokenByteToUnicode[code])
+        result = result + String.fromCharCode(tiktokenByteToUnicode[code])
       } else if (code < 0x800) {
-        result += String.fromCharCode(tiktokenByteToUnicode[0xc0 | (code >> 6)])
-        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0xc0 | (code >> 6)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
       } else if (code < 0x10000) {
-        result += String.fromCharCode(tiktokenByteToUnicode[0xe0 | (code >> 12)])
-        result += String.fromCharCode(
-          tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)]
-        )
-        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0xe0 | (code >> 12)])
+        result =
+          result +
+          String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
       } else {
-        result += String.fromCharCode(tiktokenByteToUnicode[0xf0 | (code >> 18)])
-        result += String.fromCharCode(
-          tiktokenByteToUnicode[0x80 | ((code >> 12) & 0x3f)]
-        )
-        result += String.fromCharCode(
-          tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)]
-        )
-        result += String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0xf0 | (code >> 18)])
+        result =
+          result +
+          String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 12) & 0x3f)])
+        result =
+          result +
+          String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)])
+        result =
+          result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
       }
     }
     return result
@@ -2695,17 +2754,17 @@ Supports GGUF file format with various quantization types.
     var result = ""
     var needPrefix = true // Add ▁ before first alphanumeric char
 
-    for (var i = 0; i < text.length; i++) {
+    for (var i = 0; i < text.length; i = i + 1) {
       var c = text.charAt(i)
       var code = text.charCodeAt(i)
 
       if (c === " ") {
         // Space -> ▁ (U+2581)
-        result += "\u2581"
+        result = result + "\u2581"
         needPrefix = false // ▁ already added for the space
       } else if (c === "\n" || c === "\t" || c === "\r") {
         // Control characters are kept as-is
-        result += c
+        result = result + c
         needPrefix = true // Next word needs prefix
       } else {
         // Regular character - add prefix if this is start of a word
@@ -2715,9 +2774,9 @@ Supports GGUF file format with various quantization types.
             (code >= 97 && code <= 122) ||
             (code >= 48 && code <= 57))
         ) {
-          result += "\u2581"
+          result = result + "\u2581"
         }
-        result += c
+        result = result + c
         needPrefix = false
       }
     }
@@ -2732,13 +2791,15 @@ Supports GGUF file format with various quantization types.
   var tiktokenUnicodeToByte = null
 
   function buildTiktokenMap() {
-    if (tiktokenUnicodeToByte) return
+    if (tiktokenUnicodeToByte) {
+      return
+    }
     tiktokenUnicodeToByte = {}
 
     // This is the inverse of OpenAI's bytes_to_unicode() function
     // Printable ASCII and some extended chars map to themselves
     var n = 0
-    for (var b = 0; b < 256; b++) {
+    for (var b = 0; b < 256; b = b + 1) {
       // These byte ranges map directly: ! to ~, ¡ to ¬, ® to ÿ
       if (
         (b >= 33 && b <= 126) ||
@@ -2749,7 +2810,7 @@ Supports GGUF file format with various quantization types.
       } else {
         // Other bytes (0-32, 127-160, 173) map to 256+n, 257+n, etc.
         tiktokenUnicodeToByte[256 + n] = b
-        n++
+        n = n + 1
       }
     }
   }
@@ -2759,7 +2820,9 @@ Supports GGUF file format with various quantization types.
       return new Uint8Array(0)
     }
     var piece = tokenizer.vocab[token]
-    if (!piece) return new Uint8Array(0)
+    if (!piece) {
+      return new Uint8Array(0)
+    }
 
     // Handle <0xNN> byte tokens
     if (
@@ -2777,7 +2840,7 @@ Supports GGUF file format with various quantization types.
 
     // Collect bytes from tiktoken encoding
     var bytes = []
-    for (var i = 0; i < piece.length; i++) {
+    for (var i = 0; i < piece.length; i = i + 1) {
       var code = piece.charCodeAt(i)
 
       // Handle UTF-16 surrogate pairs
@@ -2785,7 +2848,7 @@ Supports GGUF file format with various quantization types.
         var low = piece.charCodeAt(i + 1)
         if (low >= 0xdc00 && low <= 0xdfff) {
           code = 0x10000 + ((code - 0xd800) << 10) + (low - 0xdc00)
-          i++
+          i = i + 1
         }
       }
 
@@ -2820,7 +2883,9 @@ Supports GGUF file format with various quantization types.
       return ""
     }
     var piece = tokenizer.vocab[token]
-    if (!piece) return ""
+    if (!piece) {
+      return ""
+    }
 
     // Handle <0xNN> byte tokens
     if (
@@ -2857,21 +2922,24 @@ Supports GGUF file format with various quantization types.
 
     var tokens = []
     var pos = 0
-    var missedChars = 0
 
     while (pos < encodedText.length) {
       var bestId = -1
       var bestLen = 0
 
       // Greedy longest-match
-      for (var i = 0; i < sortedVocab.length; i++) {
+      for (var i = 0; i < sortedVocab.length; i = i + 1) {
         var entry = sortedVocab[i]
 
         // Skip if token is longer than remaining text
-        if (entry.len > encodedText.length - pos) continue
+        if (entry.len > encodedText.length - pos) {
+          continue
+        }
 
         // Skip if shorter than best match we already found (optimization)
-        if (bestLen > 0 && entry.len <= bestLen) break
+        if (bestLen > 0 && entry.len <= bestLen) {
+          break
+        }
 
         // Check if vocab entry matches
         if (encodedText.substring(pos, pos + entry.len) === entry.token) {
@@ -2883,18 +2951,16 @@ Supports GGUF file format with various quantization types.
 
       if (bestId !== -1) {
         tokens.push(bestId)
-        pos += bestLen
+        pos = pos + bestLen
       } else {
         // No match found - try to find single character token
         var singleChar = encodedText.charAt(pos)
         var singleId = vocabMap[singleChar]
         if (singleId !== undefined) {
           tokens.push(singleId)
-        } else {
-          missedChars++
         }
         // Skip this character regardless
-        pos++
+        pos = pos + 1
       }
     }
 
@@ -2906,16 +2972,24 @@ Supports GGUF file format with various quantization types.
 
     // Find special tokens
     var bosToken = findSpecialToken("<|begin_of_text|>")
-    if (bosToken < 0) bosToken = 128000
+    if (bosToken < 0) {
+      bosToken = 128000
+    }
 
     var startHeader = findSpecialToken("<|start_header_id|>")
-    if (startHeader < 0) startHeader = 128006
+    if (startHeader < 0) {
+      startHeader = 128006
+    }
 
     var endHeader = findSpecialToken("<|end_header_id|>")
-    if (endHeader < 0) endHeader = 128007
+    if (endHeader < 0) {
+      endHeader = 128007
+    }
 
     var eotToken = findSpecialToken("<|eot_id|>")
-    if (eotToken < 0) eotToken = 128009
+    if (eotToken < 0) {
+      eotToken = 128009
+    }
 
     // <|begin_of_text|>
     tokens.push(bosToken)
@@ -2924,32 +2998,44 @@ Supports GGUF file format with various quantization types.
     if (sysPrompt && sysPrompt.length > 0) {
       tokens.push(startHeader)
       var sysTokens = bpeEncode("system")
-      for (var i = 0; i < sysTokens.length; i++) tokens.push(sysTokens[i])
+      for (var i = 0; i < sysTokens.length; i = i + 1) {
+        tokens.push(sysTokens[i])
+      }
       tokens.push(endHeader)
 
       var sysTextTokens = bpeEncode("\n\n" + sysPrompt)
-      for (var i = 0; i < sysTextTokens.length; i++) tokens.push(sysTextTokens[i])
+      for (var i = 0; i < sysTextTokens.length; i = i + 1) {
+        tokens.push(sysTextTokens[i])
+      }
       tokens.push(eotToken)
     }
 
     // User prompt
     tokens.push(startHeader)
     var userTokens = bpeEncode("user")
-    for (var i = 0; i < userTokens.length; i++) tokens.push(userTokens[i])
+    for (var i = 0; i < userTokens.length; i = i + 1) {
+      tokens.push(userTokens[i])
+    }
     tokens.push(endHeader)
 
     var userTextTokens = bpeEncode("\n\n" + prompt)
-    for (var i = 0; i < userTextTokens.length; i++) tokens.push(userTextTokens[i])
+    for (var i = 0; i < userTextTokens.length; i = i + 1) {
+      tokens.push(userTextTokens[i])
+    }
     tokens.push(eotToken)
 
     // Assistant header
     tokens.push(startHeader)
     var assistantTokens = bpeEncode("assistant")
-    for (var i = 0; i < assistantTokens.length; i++) tokens.push(assistantTokens[i])
+    for (var i = 0; i < assistantTokens.length; i = i + 1) {
+      tokens.push(assistantTokens[i])
+    }
     tokens.push(endHeader)
 
     var newlineTokens = bpeEncode("\n\n")
-    for (var i = 0; i < newlineTokens.length; i++) tokens.push(newlineTokens[i])
+    for (var i = 0; i < newlineTokens.length; i = i + 1) {
+      tokens.push(newlineTokens[i])
+    }
 
     return tokens
   }
@@ -2959,13 +3045,22 @@ Supports GGUF file format with various quantization types.
 
     // Find special tokens
     var bosToken = findSpecialToken("<bos>")
-    if (bosToken < 0) bosToken = 2 // Default Gemma3 BOS
+    if (bosToken < 0) {
+      // Default Gemma3 BOS
+      bosToken = 2
+    }
 
     var startTurn = findSpecialToken("<start_of_turn>")
-    if (startTurn < 0) startTurn = 106 // Default Gemma3 start_of_turn
+    if (startTurn < 0) {
+      // Default Gemma3 start_of_turn
+      startTurn = 106
+    }
 
     var endTurn = findSpecialToken("<end_of_turn>")
-    if (endTurn < 0) endTurn = 107 // Default Gemma3 end_of_turn
+    if (endTurn < 0) {
+      // Default Gemma3 end_of_turn
+      endTurn = 107
+    }
 
     // <bos>
     tokens.push(bosToken)
@@ -2981,21 +3076,27 @@ Supports GGUF file format with various quantization types.
 
     // "user\n" + prompt
     var userTokens = bpeEncode("user\n" + fullPrompt)
-    for (var i = 0; i < userTokens.length; i++) tokens.push(userTokens[i])
+    for (var i = 0; i < userTokens.length; i = i + 1) {
+      tokens.push(userTokens[i])
+    }
 
     // <end_of_turn>
     tokens.push(endTurn)
 
     // "\n"
     var newlineTokens = bpeEncode("\n")
-    for (var i = 0; i < newlineTokens.length; i++) tokens.push(newlineTokens[i])
+    for (var i = 0; i < newlineTokens.length; i = i + 1) {
+      tokens.push(newlineTokens[i])
+    }
 
     // <start_of_turn>
     tokens.push(startTurn)
 
     // "model\n"
     var modelTokens = bpeEncode("model\n")
-    for (var i = 0; i < modelTokens.length; i++) tokens.push(modelTokens[i])
+    for (var i = 0; i < modelTokens.length; i = i + 1) {
+      tokens.push(modelTokens[i])
+    }
 
     return tokens
   }
@@ -3029,7 +3130,7 @@ Supports GGUF file format with various quantization types.
       ? null
       : new TextDecoder("utf-8", { fatal: false })
 
-    for (var step = 0; step < maxTokens; step++) {
+    for (var step = 0; step < maxTokens; step = step + 1) {
       transformer(token, pos)
 
       var next
@@ -3040,15 +3141,24 @@ Supports GGUF file format with various quantization types.
       }
 
       if (pos >= numPromptTokens - 1) {
-        if (next === tokenizer.eosToken) break
+        if (next === tokenizer.eosToken) {
+          break
+        }
 
         // Check for model-specific end tokens
         if (config.isGemma) {
-          if (tokenizer.vocab[next] === "<end_of_turn>") break
+          if (tokenizer.vocab[next] === "<end_of_turn>") {
+            break
+          }
         } else {
           // Llama: check for EOT token
-          if (tokenizer.vocab[next] === "<|eot_id|>") break
-          if (next === 128009) break // Default EOT token ID
+          if (tokenizer.vocab[next] === "<|eot_id|>") {
+            break
+          }
+          if (next === 128009) {
+            // Default EOT token ID
+            break
+          }
         }
 
         var decoded
@@ -3065,26 +3175,26 @@ Supports GGUF file format with various quantization types.
           pendingNewline = true
         } else {
           if (pendingNewline) {
-            output += "\n"
+            output = output + "\n"
             postMessage({ type: "token", token: "\n" })
             pendingNewline = false
           }
           if (decoded.length > 0) {
-            output += decoded
+            output = output + decoded
             postMessage({ type: "token", token: decoded })
           }
         }
       }
 
       token = next
-      pos++
+      pos = pos + 1
     }
 
     // Flush any remaining bytes in the decoder
     if (!config.isGemma) {
       var remaining = streamDecoder.decode()
       if (remaining.length > 0) {
-        output += remaining
+        output = output + remaining
         postMessage({ type: "token", token: remaining })
       }
     }
