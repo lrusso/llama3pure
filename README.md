@@ -32,7 +32,7 @@ https://lrusso.github.io/llama3pure/llama3pure.htm
 
 ## Tested with the following models:
 
-- Gemma-3-270M-it-Q2_K.gguf
+- Gemma-3-270M-it-Q2_K_L.gguf
 - Gemma-3-270M-it-Q3_K_M.gguf
 - Gemma-3-270M-it-Q4_K_M.gguf
 - Gemma-3-270M-it-Q5_K_M.gguf
