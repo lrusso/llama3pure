@@ -26,7 +26,7 @@ or
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft." -debug
 ```
 
-## Web build:
+## Web build (no chat history, prompts and replies only):
 
 https://lrusso.github.io/llama3pure/llama3pure.htm
 
