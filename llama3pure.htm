@@ -129,7 +129,9 @@
 
               var welcomeMessage = document.createElement("span")
               welcomeMessage.className = "reply"
-              welcomeMessage.innerText = t("system_welcome")
+              welcomeMessage.innerHTML = markdownToHTML(
+                t("system_welcome").replace(/\</g, "&#60;")
+              )
               content.appendChild(welcomeMessage)
 
               if (!isMobileDevice()) {
