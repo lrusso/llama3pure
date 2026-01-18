@@ -521,16 +521,19 @@
                 })
                 initialize([file])
               } else {
-                buttonDemo.disabled = false
-                buttonDemo.innerText = "Descargar Gemma 3 270M"
-                alert(t("error_download"))
+                content.removeChild(buttonDemo)
+                var errorMessage = document.createElement("span")
+                errorMessage.className = "reply"
+                errorMessage.innerText = t("error_download")
+                content.appendChild(errorMessage)
               }
             }
 
             xhr.onerror = function () {
-              buttonDemo.disabled = false
-              buttonDemo.innerText = "Descargar Gemma 3 270M"
-              alert(t("error_download"))
+              var errorMessage = document.createElement("span")
+              errorMessage.className = "reply"
+              errorMessage.innerText = t("error_download")
+              content.appendChild(errorMessage)
             }
 
             xhr.send()
