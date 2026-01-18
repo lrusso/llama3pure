@@ -481,6 +481,54 @@
           })
           content.appendChild(buttonUpload)
 
+          var buttonDemo = document.createElement("button")
+          buttonDemo.className = "input_upload"
+          buttonDemo.type = "button"
+          buttonDemo.innerText = "Download Gemma 3 270M"
+          buttonDemo.addEventListener("click", function () {
+            content.removeChild(buttonUpload)
+            buttonDemo.disabled = true
+            buttonDemo.innerText = "Downloading... 0%"
+
+            var xhr = new XMLHttpRequest()
+            xhr.open(
+              "GET",
+              "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf?download=true",
+              true
+            )
+            xhr.responseType = "blob"
+
+            xhr.onprogress = function (event) {
+              if (event.lengthComputable) {
+                var percent = Math.round((event.loaded / event.total) * 100)
+                buttonDemo.innerText = "Downloading... " + percent + "%"
+              }
+            }
+
+            xhr.onload = function () {
+              if (xhr.status === 200) {
+                var blob = xhr.response
+                var file = new File([blob], "gemma-3-270m-it-Q8_0.gguf", {
+                  type: "application/octet-stream",
+                })
+                initialize([file])
+              } else {
+                buttonDemo.disabled = false
+                buttonDemo.innerText = "Descargar Gemma 3 270M"
+                alert("Error during downloading.")
+              }
+            }
+
+            xhr.onerror = function () {
+              buttonDemo.disabled = false
+              buttonDemo.innerText = "Descargar Gemma 3 270M"
+              alert("Network error.")
+            }
+
+            xhr.send()
+          })
+          content.appendChild(buttonDemo)
+
           inputTextbox.placeholder = t("placeholder")
           inputTextbox.value = ""
           inputTextbox.addEventListener("input", resizeInputText)
