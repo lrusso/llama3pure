@@ -1945,6 +1945,10 @@ Supports GGUF file format with various quantization types.
       isGemma: isGemma,
       rmsNormEps: meta[keyPrefix + ".attention.layer_norm_rms_epsilon"] || 1e-6,
       finalLogitSoftcapping: meta[keyPrefix + ".final_logit_softcapping"] || 0.0,
+      // Sliding window attention parameters for Gemma3
+      swaWindow: meta[keyPrefix + ".attention.sliding_window"] || 0,
+      ropeThetaSwa: meta[keyPrefix + ".rope.freq_base_swa"] || 10000.0,
+      swaPattern: 6, // Gemma3 uses pattern 6: layers 0-4 are SWA, layer 5 is dense, etc.
     }
 
     if (config.headDim === 0) {
@@ -2122,6 +2126,14 @@ Supports GGUF file format with various quantization types.
       ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, dimIdx / headSize)
     }
 
+    // Pre-compute SWA RoPE frequencies (for Gemma3 sliding window attention layers)
+    var ropeFreqsSwa = new Float32Array(ropeSize)
+    var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
+    for (var i = 0; i < ropeSize; i++) {
+      var dimIdx = i * 2
+      ropeFreqsSwa[i] = 1.0 / Math.pow(swaTheta, dimIdx / headSize)
+    }
+
     // Q8_0 KV cache: 34 bytes per 32 floats
     // Number of Q8_0 blocks per KV vector = kvDim / 32
     var kvBlocksPerVec = kvDim >> 5 // kvDim / 32
@@ -2152,10 +2164,12 @@ Supports GGUF file format with various quantization types.
       // Cache layout info
       kvCacheBytesPerVec: kvCacheBytesPerVec,
       ropeFreqs: ropeFreqs,
+      ropeFreqsSwa: ropeFreqsSwa, // SWA RoPE frequencies for Gemma3
       // RoPE sin/cos cache (avoids recomputing sin/cos for each head)
       ropeCos: new Float32Array(ropeSize),
       ropeSin: new Float32Array(ropeSize),
       ropeCachePos: -1, // position for which ropeCos/ropeSin are valid
+      ropeCacheIsSwa: -1, // 0 = cache is for dense layers, 1 = cache is for SWA layers
       // Cached constants to avoid recomputation in transformer
       headSize: headSize,
       kvDim: kvDim,
@@ -2178,6 +2192,8 @@ Supports GGUF file format with various quantization types.
       // Pre-computed values for rmsnorm
       invDim: 1.0 / p.dim,
       invHeadSize: 1.0 / headSize,
+      // SWA pattern for per-layer RoPE frequency selection
+      swaPattern: p.swaPattern,
     }
   }
 
@@ -2258,7 +2274,13 @@ Supports GGUF file format with various quantization types.
       }
 
       // Apply RoPE using pre-computed frequencies and cached sin/cos
-      var ropeFreqs = s.ropeFreqs
+      // For Gemma3 with SWA: different layers use different RoPE frequencies
+      // SWA layers (most layers): use ropeFreqsSwa (theta=10000)
+      // Dense layers (every swaPattern-th): use ropeFreqs (theta=1000000)
+      // Pattern 6: layers 0,1,2,3,4 are SWA, layer 5 is dense, etc.
+      var swaPattern = s.swaPattern
+      var isSwaLayer = swaPattern > 0 && l % swaPattern < swaPattern - 1
+      var ropeFreqs = isGemma && isSwaLayer ? s.ropeFreqsSwa : s.ropeFreqs
       var ropeCos = s.ropeCos
       var ropeSin = s.ropeSin
       var half = headSize >> 1
@@ -2266,14 +2288,17 @@ Supports GGUF file format with various quantization types.
       var qArr = s.q
       var kArr = s.k
 
-      // Compute sin/cos once per position (cached across all layers)
-      if (s.ropeCachePos !== pos) {
+      // Compute sin/cos for this position and layer type
+      // Cache is invalidated when position changes OR when switching between SWA/dense layer types
+      var currentIsSwa = isSwaLayer ? 1 : 0
+      if (s.ropeCachePos !== pos || s.ropeCacheIsSwa !== currentIsSwa) {
         for (var i = 0; i < half; i++) {
           var val = pos * ropeFreqs[i]
           ropeCos[i] = Math.cos(val)
           ropeSin[i] = Math.sin(val)
         }
         s.ropeCachePos = pos
+        s.ropeCacheIsSwa = currentIsSwa
       }
 
       if (isGemma) {
