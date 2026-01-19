@@ -32,6 +32,10 @@ or
 
 https://lrusso.github.io/llama3pure/llama3pure.htm
 
+## Pass custom values for maxTokens and contextSize
+
+https://lrusso.github.io/llama3pure/llama3pure.htm?maxTokens=2048&contextSize=4096
+
 ## Forcing the light and dark modes:
 
 https://lrusso.github.io/llama3pure/llama3pure.htm?lightmode
