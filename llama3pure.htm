@@ -570,7 +570,7 @@
           var buttonDemo1 = document.createElement("button")
           buttonDemo1.className = "input_upload"
           buttonDemo1.type = "button"
-          buttonDemo1.innerText = t("download") + " Gemma 3 270M"
+          buttonDemo1.innerText = t("download") + " Gemma 3 1B"
           buttonDemo1.addEventListener("click", function () {
             content.removeChild(buttonUpload)
             content.removeChild(buttonDemo2)
@@ -578,7 +578,7 @@
             buttonDemo1.style.cursor = "default"
             buttonDemo1.innerText = t("downloading") + " 0%"
             downloadFile(
-              "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf?download=true",
+              "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true",
               buttonDemo1
             )
           })
@@ -587,7 +587,7 @@
           var buttonDemo2 = document.createElement("button")
           buttonDemo2.className = "input_upload"
           buttonDemo2.type = "button"
-          buttonDemo2.innerText = t("download") + " Gemma 3 1B"
+          buttonDemo2.innerText = t("download") + " Gemma 3 270M"
           buttonDemo2.addEventListener("click", function () {
             content.removeChild(buttonUpload)
             content.removeChild(buttonDemo1)
@@ -595,7 +595,7 @@
             buttonDemo2.style.cursor = "default"
             buttonDemo2.innerText = t("downloading") + " 0%"
             downloadFile(
-              "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true",
+              "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf?download=true",
               buttonDemo2
             )
           })
