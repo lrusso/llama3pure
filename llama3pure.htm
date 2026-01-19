@@ -86,6 +86,8 @@
           system_prompt: "You are a useful AI assistant.",
           system_welcome:
             "Hello, how can I help you today? *This demo has no session memory. Single-turn interactions only.*",
+          error_empty:
+            "The AI model generated an empty response. The current maxTokens () and contextSize () values may be too low. Try increasing them by browsing to the URL: /?maxTokens=NUMBER&contextSize=NUMBER",
           error_filesize:
             "Error. This web port cannot handle files larger than 1 GB.",
           error_download: "Error. Something went wrong during the download process.",
@@ -102,6 +104,8 @@
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
           system_welcome:
             "Hola, \xBFc\xF3mo puedo ayudarte hoy? *Esta demostraci\xF3n no tiene memoria de sesi\xF3n. Solo interacciones de un solo turno.*",
+          error_empty:
+            "El modelo de AI gener\xF3 una respuesta vacu\xEDa. Los valores de actuales de maxTokens () y contextSize () podr\xEDan ser bajos, prueba aumentar dichos valores navegando a la URL: /?maxTokens={n\xFAmero}&contextSize={n\xFAmero}",
           error_filesize:
             "Error. Este port web no puede procesar archivos de m\xE1s de 1 GB.",
           error_download:
@@ -143,6 +147,9 @@
       function t(stringName) {
         return GET_APP_STRING[stringName] || ""
       }
+
+      var MAX_TOKENS = 256
+      var CONTEXT_SIZE = 2048
 
       var rendering = false
       var responseInProgress = ""
@@ -219,10 +226,17 @@
                 pointerElement.remove()
               }
               if (responseInProgress === "") {
-                lastReply.innerHTML = "&nbsp;" + lastReply.innerHTML
+                lastReply.innerHTML =
+                  markdownToHTML(
+                    t("error_empty")
+                      .replace("()", "(" + MAX_TOKENS + ")")
+                      .replace("()", "(" + CONTEXT_SIZE + ")")
+                      .replace(/\</g, "&#60;")
+                  ) + lastReply.innerHTML
               }
               responseInProgress = ""
               document.title = t("title")
+              scrollToBottom()
               break
 
             case "error":
@@ -260,8 +274,8 @@
               type: "load",
               arrayBuffer: arrayBuffer,
               filename: filename,
-              maxTokens: 256,
-              contextSize: 2048,
+              maxTokens: MAX_TOKENS,
+              contextSize: CONTEXT_SIZE,
               systemPrompt: t("system_prompt"),
               temperature: 0.9,
             },
@@ -352,7 +366,7 @@
       function markdownToHTML(markdown) {
         var codeBlocks = []
 
-        // STORING AND REMOVING ALL THE CODE BLOCKS
+        // storing and removing all the code blocks
         markdown = markdown.replace(
           /\`\`\`.*?\n([\s\S]*?)\`\`\`/g,
           function (_match, group) {
@@ -361,7 +375,7 @@
           }
         )
 
-        // PARSING MARKDOWN TABLES
+        // parsing markdown tables
         markdown = markdown.replace(
           /^(\|.+\|)\r?\n(\|[-:\s|]+\|)\r?\n((?:\|.+\|\r?\n?)+)/gm,
           function (_match, headerRow, _separatorRow, bodyRows) {
@@ -399,7 +413,7 @@
           }
         )
 
-        // SETTING THE MARKDOWN RULES
+        // setting the markdown rules
         var rules = [
           { regex: /\*\*(.*?)\*\*/g, replacement: "<strong>$1</strong>" },
           { regex: /\*(.*?)\*/g, replacement: "<em>$1</em>" },
@@ -423,12 +437,12 @@
           },
         ]
 
-        // APPLYING THE MARKDOWN RULES
+        // applying the markdown rules
         rules.forEach(function (rule) {
           markdown = markdown.replace(rule.regex, rule.replacement)
         })
 
-        // RESTORING ALL THE CODE BLOCKS
+        // restoring all the code blocks
         markdown = markdown.replace(
           /%%CODELLAMABLOCK(\d+)%%/g,
           function (_match, index) {
@@ -650,6 +664,8 @@
           var currentURL = new URL(window.location.href).searchParams
           var requiredLightMode = currentURL.has("lightmode")
           var requiredDarkMode = currentURL.has("darkmode")
+          var customMaxTokens = currentURL.get("maxTokens")
+          var customContextSize = currentURL.get("contextSize")
 
           var styleNode = document.createElement("style")
           if (requiredLightMode) {
@@ -660,6 +676,22 @@
             styleNode.appendChild(document.createTextNode(STYLES_ALL))
           }
           document.head.appendChild(styleNode)
+
+          if (
+            customMaxTokens &&
+            /^\d+$/.test(customMaxTokens) &&
+            parseInt(customMaxTokens) > 0
+          ) {
+            MAX_TOKENS = parseInt(customMaxTokens)
+          }
+
+          if (
+            customContextSize &&
+            /^\d+$/.test(customContextSize) &&
+            parseInt(customContextSize) > 0
+          ) {
+            CONTEXT_SIZE = parseInt(customContextSize)
+          }
 
           pleaseWait.style.display = "none"
           container.style.display = "block"
