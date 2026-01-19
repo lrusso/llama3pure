@@ -32,6 +32,12 @@ or
 
 https://lrusso.github.io/llama3pure/llama3pure.htm
 
+## Forcing the light and dark modes:
+
+https://lrusso.github.io/llama3pure/llama3pure.htm?lightmode
+
+https://lrusso.github.io/llama3pure/llama3pure.htm?darkmode
+
 ## Tested with the following models:
 
 - [Gemma-3-270M-it-Q2_K_L.gguf](https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q2_K_L.gguf?download=true)
