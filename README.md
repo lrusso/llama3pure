@@ -2,6 +2,8 @@
 
 Inference Llama 3 in pure C and in pure vanilla JavaScript pre-ECMAScript 2015 (no WebAssembly or WebGPU). Supports both Llama and Gemma architectures.
 
+![algo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
+
 ## How to build the C project:
 
 ```
