@@ -81,7 +81,7 @@
           upload: "Select a GGUF file",
           loading: "Loading, please wait...",
           placeholder: "Write a message",
-          download: "Download Gemma 3 370M",
+          download: "Download",
           downloading: "Downloading...",
           system_prompt: "You are a useful AI assistant.",
           system_welcome:
@@ -97,7 +97,7 @@
           upload: "Seleccione un archivo GGUF",
           loading: "Cargando, por favor espere...",
           placeholder: "Escribe un mensaje",
-          download: "Descargar Gemma 3 370M",
+          download: "Descargar",
           downloading: "Descargando...",
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
           system_welcome:
@@ -505,6 +505,40 @@
         scrollToBottom()
       }
 
+      // no fetch here because the entire project
+      // is compatible with pre 2015 environments.
+      function downloadFile(url, button) {
+        var filename = url.split("/").pop().split("?")[0]
+        var xhr = new XMLHttpRequest()
+        xhr.open("GET", url, true)
+        xhr.responseType = "blob"
+
+        xhr.onprogress = function (event) {
+          if (event.lengthComputable) {
+            var percent = Math.round((event.loaded / event.total) * 100)
+            button.innerText = t("downloading") + " " + percent + "%"
+          }
+        }
+
+        xhr.onload = function () {
+          if (xhr.status === 200) {
+            var blob = xhr.response
+            var file = new File([blob], filename, {
+              type: "application/octet-stream",
+            })
+            initialize([file])
+          } else {
+            button.innerText = t("error_download")
+          }
+        }
+
+        xhr.onerror = function () {
+          button.innerText = t("error_download")
+        }
+
+        xhr.send()
+      }
+
       window.addEventListener("load", function () {
         if (window.top === window.self) {
           var pleaseWait = document.querySelector(".pleasewait")
@@ -533,59 +567,39 @@
           })
           content.appendChild(buttonUpload)
 
-          var buttonDemo = document.createElement("button")
-          buttonDemo.className = "input_upload"
-          buttonDemo.type = "button"
-          buttonDemo.innerText = t("download")
-          buttonDemo.addEventListener("click", function () {
+          var buttonDemo1 = document.createElement("button")
+          buttonDemo1.className = "input_upload"
+          buttonDemo1.type = "button"
+          buttonDemo1.innerText = t("download") + " Gemma 3 270M"
+          buttonDemo1.addEventListener("click", function () {
             content.removeChild(buttonUpload)
-            buttonDemo.disabled = true
-            buttonDemo.innerText = t("downloading") + " 0%"
-
-            // no fetch here because the entire project
-            // is compatible with pre 2015 environments.
-            var xhr = new XMLHttpRequest()
-            xhr.open(
-              "GET",
+            content.removeChild(buttonDemo2)
+            buttonDemo1.disabled = true
+            buttonDemo1.style.cursor = "default"
+            buttonDemo1.innerText = t("downloading") + " 0%"
+            downloadFile(
               "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf?download=true",
-              true
+              buttonDemo1
             )
-            xhr.responseType = "blob"
-
-            xhr.onprogress = function (event) {
-              if (event.lengthComputable) {
-                var percent = Math.round((event.loaded / event.total) * 100)
-                buttonDemo.innerText = t("downloading") + " " + percent + "%"
-              }
-            }
-
-            xhr.onload = function () {
-              if (xhr.status === 200) {
-                var blob = xhr.response
-                var file = new File([blob], "gemma-3-270m-it-Q8_0.gguf", {
-                  type: "application/octet-stream",
-                })
-                initialize([file])
-              } else {
-                content.removeChild(buttonDemo)
-                var errorMessage = document.createElement("span")
-                errorMessage.className = "reply"
-                errorMessage.innerText = t("error_download")
-                content.appendChild(errorMessage)
-              }
-            }
-
-            xhr.onerror = function () {
-              content.removeChild(buttonDemo)
-              var errorMessage = document.createElement("span")
-              errorMessage.className = "reply"
-              errorMessage.innerText = t("error_download")
-              content.appendChild(errorMessage)
-            }
-
-            xhr.send()
           })
-          content.appendChild(buttonDemo)
+          content.appendChild(buttonDemo1)
+
+          var buttonDemo2 = document.createElement("button")
+          buttonDemo2.className = "input_upload"
+          buttonDemo2.type = "button"
+          buttonDemo2.innerText = t("download") + " Gemma 3 1B"
+          buttonDemo2.addEventListener("click", function () {
+            content.removeChild(buttonUpload)
+            content.removeChild(buttonDemo1)
+            buttonDemo2.disabled = true
+            buttonDemo2.style.cursor = "default"
+            buttonDemo2.innerText = t("downloading") + " 0%"
+            downloadFile(
+              "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true",
+              buttonDemo2
+            )
+          })
+          content.appendChild(buttonDemo2)
 
           inputTextbox.placeholder = t("placeholder")
           inputTextbox.value = ""
