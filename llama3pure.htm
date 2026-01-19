@@ -507,7 +507,11 @@
 
       // no fetch here because the entire project
       // is compatible with pre 2015 environments.
-      function downloadFile(url, button) {
+      function downloadFile(url, button, content) {
+        content.removeChild(button)
+
+        var downloadStatus = appendMessage("reply", t("downloading") + " 0%")
+
         var filename = url.split("/").pop().split("?")[0]
         var xhr = new XMLHttpRequest()
         xhr.open("GET", url, true)
@@ -516,7 +520,7 @@
         xhr.onprogress = function (event) {
           if (event.lengthComputable) {
             var percent = Math.round((event.loaded / event.total) * 100)
-            button.innerText = t("downloading") + " " + percent + "%"
+            downloadStatus.innerText = t("downloading") + " " + percent + "%"
           }
         }
 
@@ -528,12 +532,12 @@
             })
             initialize([file])
           } else {
-            button.innerText = t("error_download")
+            downloadStatus.innerText = t("error_download")
           }
         }
 
         xhr.onerror = function () {
-          button.innerText = t("error_download")
+          downloadStatus.innerText = t("error_download")
         }
 
         xhr.send()
@@ -574,12 +578,10 @@
           buttonDemo1.addEventListener("click", function () {
             content.removeChild(buttonUpload)
             content.removeChild(buttonDemo2)
-            buttonDemo1.disabled = true
-            buttonDemo1.style.cursor = "default"
-            buttonDemo1.innerText = t("downloading") + " 0%"
             downloadFile(
               "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true",
-              buttonDemo1
+              buttonDemo1,
+              content
             )
           })
           content.appendChild(buttonDemo1)
@@ -591,12 +593,10 @@
           buttonDemo2.addEventListener("click", function () {
             content.removeChild(buttonUpload)
             content.removeChild(buttonDemo1)
-            buttonDemo2.disabled = true
-            buttonDemo2.style.cursor = "default"
-            buttonDemo2.innerText = t("downloading") + " 0%"
             downloadFile(
               "https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q8_0.gguf?download=true",
-              buttonDemo2
+              buttonDemo2,
+              content
             )
           })
           content.appendChild(buttonDemo2)
