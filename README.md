@@ -32,7 +32,7 @@ or
 
 https://lrusso.github.io/llama3pure/llama3pure.htm
 
-## Pass custom values for maxTokens and contextSize
+## Passing custom maxTokens and contextSize values:
 
 https://lrusso.github.io/llama3pure/llama3pure.htm?maxTokens=2048&contextSize=4096
 
