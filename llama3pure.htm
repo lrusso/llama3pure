@@ -598,6 +598,10 @@
               content
             )
           })
+          // iOS has memory limits
+          if (isUsingiOS()) {
+            buttonDemo1.style.display = "none"
+          }
           content.appendChild(buttonDemo1)
 
           var buttonDemo2 = document.createElement("button")
