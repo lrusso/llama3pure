@@ -176,7 +176,9 @@
               var content = document.querySelector(".content")
               var inputContainer = document.querySelector(".input_container")
               var inputTextbox = document.querySelector(".input_textbox")
-              content.innerHTML = ""
+              while (content.firstChild) {
+                content.removeChild(content.firstChild)
+              }
               inputContainer.style.display = "flex"
               inputTextbox.disabled = false
 
@@ -253,7 +255,9 @@
         loadingMessage.className = "reply"
         loadingMessage.innerText = t("loading")
 
-        content.innerHTML = ""
+        while (content.firstChild) {
+          content.removeChild(content.firstChild)
+        }
         content.appendChild(loadingMessage)
 
         if (files[0].size >= 1073741824) {
@@ -569,12 +573,13 @@
           var inputSend = document.querySelector(".input_send")
 
           headerName.innerText = t("title")
-          content.innerHTML = ""
-
-          uploader.value = null
-          uploader.onchange = function (event) {
-            initialize(event.target.files)
+          while (content.firstChild) {
+            content.removeChild(content.firstChild)
           }
+
+          uploader.addEventListener("change", function (event) {
+            initialize(event.target.files)
+          })
 
           var buttonUpload = document.createElement("input")
           buttonUpload.className = "input_upload"
