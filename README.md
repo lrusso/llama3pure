@@ -24,13 +24,12 @@ make llama3pure
 
 Check the sample code at [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
-## Web build:
+## How to run the Web build:
 
-https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm
+Try the Web build at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
 
-## Passing custom maxTokens and contextSize values:
-
-https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096
+Pass a custom maxTokens or contextSize value by
+[llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
 ## Tested with the following models:
 
