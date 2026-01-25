@@ -6,8 +6,8 @@ function myRenderFunction(token) {
 }
 
 function main() {
-  var buffer = fs.readFileSync("gemma-3-270m-it-Q8_0.gguf")
-  var arrayBuffer = buffer.buffer.slice(
+  const buffer = fs.readFileSync("gemma-3-270m-it-Q8_0.gguf")
+  const arrayBuffer = buffer.buffer.slice(
     buffer.byteOffset,
     buffer.byteOffset + buffer.byteLength
   )
