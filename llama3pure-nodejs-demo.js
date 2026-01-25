@@ -18,7 +18,7 @@ function main() {
     filename: "gemma-3-270m-it-Q8_0.gguf",
     cbRender: myRenderFunction,
   })
-  llama3pure({ type: "generate", prompt: "Tell me what is Microsoft in 1 line." })
+  llama3pure({ type: "generate", prompt: "Tell me in 1 line what is Microsoft." })
   process.stdout.write("\n")
 }
 
