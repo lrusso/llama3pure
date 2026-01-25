@@ -6,10 +6,14 @@ Inference Llama 3 in pure C, in pure JavaScript for Node.js, and in pure JavaScr
 
 ## How to build and run the C project:
 
-```
+```bash
 make llama3pure
 
+# simple way
+
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
+
+# passing all parameters
 
 ./llama3pure -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
