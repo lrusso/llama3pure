@@ -22,19 +22,13 @@ or
 ./llama3pure -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
-## How to debug the C project:
-
-```
-./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft." -debug
-```
-
 ## Web build:
 
-https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm.htm
+https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm
 
 ## Passing custom maxTokens and contextSize values:
 
-https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm.htm?maxTokens=2048&contextSize=4096
+https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096
 
 ## Tested with the following models:
 
