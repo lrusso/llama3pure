@@ -15,7 +15,7 @@ make llama3pure
 
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 
-# pass a prompt with additional parameters
+# pass a prompt along with additional parameters
 
 ./llama3pure -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
