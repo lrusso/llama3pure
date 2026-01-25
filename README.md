@@ -26,9 +26,7 @@ Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/l
 
 ## How to run the Web engine:
 
-Try the Web engine online at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
-
-Also, you can pass a custom values [llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
+Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens` and `contextSize` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
 ## Tested with the following models:
 
