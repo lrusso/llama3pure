@@ -1,6 +1,6 @@
 # llama3pure
 
-Three Llama 3 inference engines: pure C for native apps, and pure JavaScript for both Node.js and the Web. Supports both Llama and Gemma architectures.
+Three inference engines for Llama 3: pure C for native applications, pure JavaScript for Node.js, and pure JavaScript for Web environments. Supports both Llama and Gemma architectures.
 
 ![demo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
 
