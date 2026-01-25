@@ -9,15 +9,15 @@ Three inference engines for Llama 3: pure C for native applications, pure JavaSc
 ```bash
 # build the engine
 
-make llama3pure
+make llama3pure-c-engine
 
 # pass a prompt
 
-./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
+./llama3pure-c-engine -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 
 # pass a prompt along with additional parameters
 
-./llama3pure -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
+./llama3pure-c-engine -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
 ## How to run the Node.js engine:
