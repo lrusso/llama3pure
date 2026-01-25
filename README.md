@@ -2,12 +2,13 @@
 
 Inference Llama 3 in pure C, in pure JavaScript for Node.js, and in pure JavaScript for Web. Supports both Llama and Gemma architectures.
 
-![algo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
+![demo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
 
-## How to build and run the C project:
+## How to build and run the C engine:
 
 ```bash
-# build the project
+# build the engine
+
 make llama3pure
 
 # pass a prompt
@@ -18,6 +19,10 @@ make llama3pure
 
 ./llama3pure -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
+
+## How to run the Node.js engine:
+
+Check the sample code at [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
 ## Web build:
 
