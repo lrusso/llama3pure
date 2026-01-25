@@ -207,52 +207,37 @@
               inputContainer.style.display = "flex"
               inputTextbox.disabled = false
 
+              document.addEventListener("keydown", function (event) {
+                var KEY_CTRL = event.ctrlKey || event.metaKey
+                var KEY_1 = event.code === "Digit1"
+                var KEY_2 = event.code === "Digit2"
 
-  document.addEventListener("keydown", function (event) {
-    var KEY_CTRL = event.ctrlKey || event.metaKey
-    var KEY_1 = event.code === "Digit1"
-    var KEY_2 = event.code === "Digit2"
-    var KEY_3 = event.code === "Digit3"
+                if (KEY_CTRL && KEY_1) {
+                  event.preventDefault()
+                  try {
+                    document.getElementsByTagName("button")[0].click()
+                    setTimeout(function () {
+                      inputTextbox.blur()
+                      inputTextbox.focus()
+                    }, 25)
+                  } catch (err) {
+                    //
+                  }
+                }
 
-    if (KEY_CTRL && KEY_1) {
-      event.preventDefault()
-      try {
-        document.getElementsByTagName("button")[0].click()
-        setTimeout(function() {
-          inputTextbox.blur()
-          inputTextbox.focus()
-        }, 25)
-      } catch (err) {
-        //
-      }
-    }
-
-    if (KEY_CTRL && KEY_2) {
-      event.preventDefault()
-      try {
-        document.getElementsByTagName("button")[1].click()
-        setTimeout(function() {
-          inputTextbox.blur()
-          inputTextbox.focus()
-        }, 25)
-      } catch (err) {
-        //
-      }
-    }
-
-    if (KEY_CTRL && KEY_3) {
-      event.preventDefault()
-      try {
-        document.getElementsByTagName("button")[2].click()
-        setTimeout(function() {
-          inputTextbox.blur()
-          inputTextbox.focus()
-        }, 25)
-      } catch (err) {
-        //
-      }
-    }
-  })
+                if (KEY_CTRL && KEY_2) {
+                  event.preventDefault()
+                  try {
+                    document.getElementsByTagName("button")[1].click()
+                    setTimeout(function () {
+                      inputTextbox.blur()
+                      inputTextbox.focus()
+                    }, 25)
+                  } catch (err) {
+                    //
+                  }
+                }
+              })
 
               resizeInputText()
 
