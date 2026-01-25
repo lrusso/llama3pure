@@ -22,11 +22,11 @@ make llama3pure-c-engine
 
 ## How to run the Node.js engine:
 
-Check the sample code at [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
+Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
 ## How to run the Web engine:
 
-Try the Web engine at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
+Try the Web engine online at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
 
 Also, you can pass a custom values [llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
