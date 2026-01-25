@@ -1,6 +1,6 @@
 # llama3pure
 
-Inference Llama 3 in pure C, in pure JavaScript for Node.js, and in pure JavaScript for Web. Supports both Llama and Gemma architectures.
+Inference Llama 3 in pure C, in pure JavaScript for Node.js, and in pure JavaScript for Web. Three Inference Engines ready to be used. Supports both Llama and Gemma architectures.
 
 ![demo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
 
@@ -24,9 +24,9 @@ make llama3pure
 
 Check the sample code at [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
-## How to run the Web build:
+## How to run the Web engine:
 
-Try the Web build at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
+Try the Web engine at [llama3pure-web-demo.htm](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
 
 Also, you can pass a custom values [llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
