@@ -72,7 +72,7 @@
       </div>
       <input type="file" accept=".gguf">
     </div>
-    <script src="llama3pure.tts.js"></script>
+    <script src="llama3pure-web-tts.js"></script>
     <script>
       var APP_STRINGS = {
         en: {
@@ -214,7 +214,7 @@
           worker.terminate()
         }
 
-        worker = new Worker("llama3pure.js")
+        worker = new Worker("llama3pure-web-engine.js")
 
         worker.onmessage = function (e) {
           var data = e.data
