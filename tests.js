@@ -29,6 +29,13 @@ const models = [
   "Llama-3.2-3B-Instruct-Q6_K_L.gguf",
   "Llama-3.2-3B-Instruct-Q8_0.gguf",
   "Llama-3.2-3B-Instruct-f16.gguf",
+  "gemma-3-4b-it-Q2_K_L.gguf",
+  "gemma-3-4b-it-Q3_K_M.gguf",
+  "gemma-3-4b-it-Q4_K_M.gguf",
+  "gemma-3-4b-it-Q5_K_M.gguf",
+  "gemma-3-4b-it-Q6_K.gguf",
+  "gemma-3-4b-it-Q8_0.gguf",
+  "gemma-3-4b-it-BF16.gguf",
 ]
 
 const prompt = "Tell me in 1 line what is Microsoft."
