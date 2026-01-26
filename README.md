@@ -58,6 +58,13 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 | [Llama-3.2-3B-Instruct-Q6_K_L.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q6_K_L.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
 | [Llama-3.2-3B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
 | [Llama-3.2-3B-Instruct-f16.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-f16.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q2_K_L.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q2_K_L.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q3_K_M.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q3_K_M.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q4_K_M.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q5_K_M.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q5_K_M.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q6_K.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q6_K.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-Q8_0.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q8_0.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Gemma-3-4b-it-BF16.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-BF16.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
 
 ## Disclaimer
 
