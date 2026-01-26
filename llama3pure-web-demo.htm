@@ -90,7 +90,7 @@
           error_empty:
             "The AI model generated an empty response. The current maxTokens () and contextSize () values may be too low. Try increasing those values by adding them to the current URL, for example: ?maxTokens={number}&contextSize={number}",
           error_filesize:
-            "Error. This web port cannot handle files larger than 1 GB.",
+            "Error. This web port cannot handle files larger than 2 GB.",
           error_download: "Error. Something went wrong during the download process.",
         },
         es: {
@@ -109,7 +109,7 @@
           error_empty:
             "El modelo de AI gener\xF3 una respuesta vac\xEDa. Los valores de actuales de maxTokens () y contextSize () podr\xEDan ser bajos, prueba aumentar esos valores agreg\xE1ndolos a la URL actual, por ejemplo: ?maxTokens={n\xFAmero}&contextSize={n\xFAmero}",
           error_filesize:
-            "Error. Este port web no puede procesar archivos de m\xE1s de 1 GB.",
+            "Error. Este port web no puede procesar archivos de m\xE1s de 2 GB.",
           error_download:
             "Error. Ha ocurrido un problema durante el proceso de descarga.",
         },
@@ -319,7 +319,7 @@
         }
         content.appendChild(loadingMessage)
 
-        if (files[0].size >= 1073741824) {
+        if (files[0].size >= 2147483648) {
           loadingMessage.innerText = t("error_filesize")
           return
         }
