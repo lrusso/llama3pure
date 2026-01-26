@@ -36,6 +36,13 @@ const models = [
   "gemma-3-4b-it-Q6_K.gguf",
   "gemma-3-4b-it-Q8_0.gguf",
   "gemma-3-4b-it-BF16.gguf",
+  "Meta-Llama-3-8B-Instruct-Q2_K.gguf",
+  "Meta-Llama-3-8B-Instruct-Q3_K_M.gguf",
+  "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
+  "Meta-Llama-3-8B-Instruct-Q5_K_M.gguf",
+  "Meta-Llama-3-8B-Instruct-Q6_K.gguf",
+  "Meta-Llama-3-8B-Instruct-Q8_0.gguf",
+  "Meta-Llama-3-8B-Instruct-fp16.gguf",
 ]
 
 const prompt = "Tell me in 1 line what is Microsoft."
