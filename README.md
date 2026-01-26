@@ -52,6 +52,9 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 | [Llama-3.2-1B-Instruct-Q6_K_L.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K_L.gguf?download=true) |    ✅    |       ✅       |     ✅     |
 | [Llama-3.2-1B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf?download=true)     |    ✅    |       ✅       |     ✅     |
 | [Llama-3.2-1B-Instruct-F16.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+| [Llama-3.2-3B-Instruct-Q3_K_L.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q3_K_L.gguf?download=true)       |    ✅    |       ❌       |     ❌     |
+
+
 
 ## Disclaimer
 
