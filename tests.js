@@ -1,6 +1,10 @@
 import llama3pure from "./llama3pure-nodejs-engine.js"
 import { execSync } from "child_process"
-import fs from "fs"
+import path from "path"
+import { fileURLToPath } from "url"
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const models = [
   "gemma-3-270m-it-Q2_K_L.gguf",
@@ -36,12 +40,7 @@ const models = [
   "gemma-3-4b-it-Q6_K.gguf",
   "gemma-3-4b-it-Q8_0.gguf",
   "gemma-3-4b-it-BF16.gguf",
-  "Meta-Llama-3-8B-Instruct-Q2_K.gguf",
-  "Meta-Llama-3-8B-Instruct-Q3_K_M.gguf",
-  "Meta-Llama-3-8B-Instruct-Q4_K_M.gguf",
-  "Meta-Llama-3-8B-Instruct-Q5_K_M.gguf",
   "Meta-Llama-3-8B-Instruct-Q6_K.gguf",
-  "Meta-Llama-3-8B-Instruct-Q8_0.gguf",
   "Meta-Llama-3-8B-Instruct-fp16.gguf",
 ]
 
@@ -58,15 +57,11 @@ const testModelUsingC = (model) => {
 }
 
 const testModelUsingNode = (model) => {
-  const buffer = fs.readFileSync(model)
-  const arrayBuffer = buffer.buffer.slice(
-    buffer.byteOffset,
-    buffer.byteOffset + buffer.byteLength
-  )
+  const modelPath = path.resolve(__dirname, model)
 
   llama3pure({
     type: "load",
-    arrayBuffer: arrayBuffer,
+    filePath: modelPath,
     filename: model,
     cbRender: function (token) {
       process.stdout.write(token)

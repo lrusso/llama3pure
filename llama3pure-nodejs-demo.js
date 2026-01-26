@@ -1,16 +1,16 @@
 import llama3pure from "./llama3pure-nodejs-engine.js"
-import fs from "fs"
+import path from "path"
+import { fileURLToPath } from "url"
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 function myRenderFunction(token) {
   process.stdout.write(token)
 }
 
 function main() {
-  const buffer = fs.readFileSync("gemma-3-270m-it-Q8_0.gguf")
-  const arrayBuffer = buffer.buffer.slice(
-    buffer.byteOffset,
-    buffer.byteOffset + buffer.byteLength
-  )
+  const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
 
   llama3pure({
     systemPrompt: "You are a helpful assistant.",
@@ -18,7 +18,7 @@ function main() {
     maxTokens: 256,
     contextSize: 2048,
     type: "load",
-    arrayBuffer: arrayBuffer,
+    filePath: modelPath,
     filename: "gemma-3-270m-it-Q8_0.gguf",
     cbRender: myRenderFunction,
   })
