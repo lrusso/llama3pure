@@ -28,9 +28,9 @@ Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/l
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens` and `contextSize` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
-## Tested with the following models:
+## Tested with the following models and engines:
 
-| MODEL                                                                                                                                                             | C ENGINE | NODE.JS ENGINE | WEB ENGINE |
+| MODEL                                                                                                                                                             | C | NODE.JS | WEB |
 | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------: | :------------: | :--------: |
 | [Gemma-3-270M-it-Q2_K_L.gguf](https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q2_K_L.gguf?download=true)                         |    ✅    |       ✅       |     ✅     |
 | [Gemma-3-270M-it-Q3_K_M.gguf](https://huggingface.co/unsloth/gemma-3-270m-it-GGUF/resolve/main/gemma-3-270m-it-Q3_K_M.gguf?download=true)                         |    ✅    |       ✅       |     ✅     |
