@@ -293,10 +293,10 @@ void malloc_run_state(RunState* s, Config* p) {
     s->q = calloc(q_dim, sizeof(float));   // use q_dim for query
     s->k = calloc(kv_dim, sizeof(float));
     s->v = calloc(kv_dim, sizeof(float));
-    s->att = calloc(p->n_heads * p->seq_len, sizeof(float));
+    s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
-    s->key_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc(p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
 
     // Pre-compute RoPE frequencies to avoid powf in hot loop
     int rope_size = head_size / 2;
