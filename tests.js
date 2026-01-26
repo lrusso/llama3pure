@@ -1,4 +1,6 @@
+import llama3pure from "./llama3pure-nodejs-engine.js"
 import { execSync } from "child_process"
+import fs from "fs"
 
 const models = [
   "gemma-3-270m-it-Q2_K_L.gguf",
@@ -25,14 +27,45 @@ const models = [
 
 const prompt = "Tell me in 1 line what is Microsoft."
 
-models.forEach(function (model) {
-  console.log(model)
-
+const testModelUsingC = (model) => {
   try {
-    execSync(`./llama3pure -model "${model}" -prompt "${prompt}"`, {
+    execSync(`./llama3pure-c-engine -model "${model}" -prompt "${prompt}"`, {
       stdio: "inherit",
     })
   } catch (error) {
     console.error(error.message)
   }
+}
+
+const testModelUsingNode = (model) => {
+  const buffer = fs.readFileSync(model)
+  const arrayBuffer = buffer.buffer.slice(
+    buffer.byteOffset,
+    buffer.byteOffset + buffer.byteLength
+  )
+
+  llama3pure({
+    type: "load",
+    arrayBuffer: arrayBuffer,
+    filename: model,
+    cbRender: function (token) {
+      process.stdout.write(token)
+    },
+  })
+  llama3pure({ type: "generate", prompt: "Tell me in 1 line what is Microsoft." })
+  process.stdout.write("\n")
+}
+
+console.log("\x1b[1mRunning C tests...\x1b[0m")
+
+models.forEach(function (model) {
+  console.log("\x1b[1m" + model + "\x1b[0m")
+  testModelUsingC(model)
+})
+
+console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
+
+models.forEach(function (model) {
+  console.log("\x1b[1m" + model + "\x1b[0m")
+  testModelUsingNode(model)
 })
