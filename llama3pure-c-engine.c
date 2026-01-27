@@ -33,7 +33,6 @@ int debug_mode = 0;
 // GGUF file format definitions
 
 #define GGUF_MAGIC 0x46554747  // "GGUF" in little-endian
-#define GGUF_VERSION 3
 
 // GGUF value types
 enum gguf_type {
@@ -189,7 +188,6 @@ typedef struct {
     int vocab_size;    // vocabulary size
     int seq_len;       // max sequence length
     float rope_theta;  // RoPE theta base frequency (500000.0 for Llama 3, 1000000.0 for Gemma3)
-    int rope_dim;      // dimension for RoPE (usually head_dim)
     int head_dim;      // explicit head dimension (for Gemma3 where it differs from dim/n_heads)
     // Gemma3-specific parameters
     int is_gemma3;                    // flag to indicate Gemma3 architecture
@@ -2059,20 +2057,6 @@ void softmax(float* x, int size) {
     }
 }
 
-void matmul(float* xout, float* x, float* w, int n, int d) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    // Standard row-major access
-    int i;
-    #pragma omp parallel for private(i)
-    for (i = 0; i < d; i++) {
-        float val = 0.0f;
-        for (int j = 0; j < n; j++) {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-
 // Transformer forward pass with GQA support and Gemma3 extensions
 void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
     float *x = s->x;
@@ -2353,21 +2337,9 @@ typedef struct {
     int start_header_token;
     int end_header_token;
     int eot_token;
-    int* token_to_id;  // For fast lookup
-    char** merges;     // BPE merges
-    int n_merges;
 } Tokenizer;
 
 Tokenizer tokenizer;
-
-int str_lookup(char *str, char **vocab, int vocab_size) {
-    for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && strcmp(str, vocab[i]) == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
 
 // Decode token string to printable text
 // Handles both tiktoken (BPE) and SentencePiece formats:
@@ -3395,6 +3367,7 @@ int main(int argc, char *argv[]) {
     // Cleanup
     free_run_state(&state);
     free_tokenizer();
+    free(sorted_vocab);
 
     if (prompt_tokens) free(prompt_tokens);
 
