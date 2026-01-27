@@ -48,9 +48,12 @@ const prompt = "Tell me in 1 line what is Microsoft."
 
 const testModelUsingC = (model) => {
   try {
-    execSync(`./llama3pure-c-engine -model "${model}" -prompt "${prompt}"`, {
-      stdio: "inherit",
-    })
+    execSync(
+      `./llama3pure-c-engine -model "${model}" -prompt "${prompt}" -max_tokens 1024 -context_size 2048`,
+      {
+        stdio: "inherit",
+      }
+    )
   } catch (error) {
     console.error(error.message)
   }
@@ -63,6 +66,8 @@ const testModelUsingNode = (model) => {
     type: "load",
     filePath: modelPath,
     filename: model,
+    maxTokens: 1024,
+    contextSize: 2048,
     cbRender: function (token) {
       process.stdout.write(token)
     },
