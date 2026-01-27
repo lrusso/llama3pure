@@ -77,7 +77,7 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 
 There isn't a Python engine because a ported, pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
 
-## Disclaimer
+## Disclaimer:
 
 You are legally responsible for any damage that you could cause with this software.
 
