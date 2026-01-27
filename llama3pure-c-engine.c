@@ -1751,7 +1751,12 @@ void free_gguf_file(GGUFFile* gguf) {
 
 void track_allocation(float* ptr) {
     num_weight_allocations++;
-    weight_allocations = realloc(weight_allocations, num_weight_allocations * sizeof(float*));
+    float** new_allocations = realloc(weight_allocations, num_weight_allocations * sizeof(float*));
+    if (!new_allocations) {
+        fprintf(stderr, "Failed to allocate memory for weight tracking (allocation #%d)\n", num_weight_allocations);
+        exit(1);
+    }
+    weight_allocations = new_allocations;
     weight_allocations[num_weight_allocations - 1] = ptr;
 }
 
