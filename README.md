@@ -73,6 +73,10 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 | [Llama-3-8B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q8_0.gguf?download=true)     | ✅  |   ✅    | ❌  |
 | [Llama-3-8B-Instruct-fp16.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-fp16.gguf?download=true)     | ✅  |   ✅    | ❌  |
 
+## Author's note:
+
+There isn't a Python engine because a ported, pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
+
 ## Disclaimer
 
 You are legally responsible for any damage that you could cause with this software.
