@@ -11,11 +11,11 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 make llama3pure-c-engine
 
-# pass a prompt
+# run with a basic prompt
 
 ./llama3pure-c-engine -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 
-# pass a prompt along with additional parameters
+# run with custom parameters
 
 ./llama3pure-c-engine -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
