@@ -28,6 +28,8 @@ Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/l
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens` and `contextSize` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096).
 
+Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
+
 ## Tested with the following models and engines:
 
 | MODEL                                                                                                                                                             |  C  | NODE.JS | WEB |
