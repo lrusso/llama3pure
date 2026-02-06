@@ -30,7 +30,7 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
 
-## Suggested models:
+## Suggested models and engines:
 
 | MODEL                                                                                                                                                     |  C  | NODE.JS | WEB |
 | :-------------------------------------------------------------------------------------------------------------------------------------------------------- | :-: | :-----: | :-: |
