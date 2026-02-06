@@ -30,6 +30,15 @@ Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-dem
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
 
+## Suggested models:
+
+| MODEL                                                                                                                                                             |  C  | NODE.JS | WEB |
+| :---------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-: | :-----: | :-: |
+| [Gemma-3-1B-it-Q8_0.gguf](https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true)                                   | ✅  |   ✅    | ✅  |
+| [Llama-3.2-1B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q8_0.gguf?download=true)         | ✅  |   ✅    | ✅  |
+| [Llama-3.2-3B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf?download=true)         | ✅  |   ✅    | ❌  |
+| [Gemma-3-4b-it-Q8_0.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q8_0.gguf?download=true)                                   | ✅  |   ✅    | ❌  |
+
 ## Tested with the following models and engines:
 
 | MODEL                                                                                                                                                             |  C  | NODE.JS | WEB |
