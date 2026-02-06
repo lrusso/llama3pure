@@ -86,7 +86,7 @@ Due to universal browser memory constraints regarding ArrayBuffer size limits, t
 
 ## Author's notes:
 
-- Using quantizations below Q4 is generally discourage because the loss in logic and coherence makes them nearly unusable for most tasks.
+- Using quantizations below Q4 is generally discouraged because the loss in logic and coherence makes them nearly unusable for most tasks.
 
 - There isn't a Python engine because a ported and pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
 
