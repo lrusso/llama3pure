@@ -22,7 +22,18 @@ function main() {
     filename: "gemma-3-270m-it-Q8_0.gguf",
     cbRender: myRenderFunction,
   })
-  llama3pure({ type: "generate", prompt: "Tell me in 1 line what is Microsoft." })
+  llama3pure({
+    type: "generate",
+    chatHistory: [
+      { role: "user", content: "Tell me in 1 line what is Microsoft." },
+      {
+        role: "assistant",
+        content:
+          "Microsoft is a global technology leader known for its innovative products and services.",
+      },
+      { role: "user", content: "Tell me in 1 line the names of the founders." },
+    ],
+  })
   process.stdout.write("\n")
 }
 
