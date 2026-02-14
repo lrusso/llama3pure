@@ -1,0 +1,5 @@
+[
+  {"role": "user", "content": "Tell me in 1 line what is Microsoft."},
+  {"role": "assistant", "content": "Microsoft is a global technology leader."},
+  {"role": "user", "content": "Tell me in 1 line the names of the founders."}
+]

@@ -2828,6 +2828,245 @@ int find_special_token(const char* token_str) {
     return -1;
 }
 
+// ----------------------------------------------------------------------------
+// Chat history support
+
+typedef struct {
+    char* role;
+    char* content;
+} ChatMessage;
+
+// Parse a JSON-escaped string value starting after the opening quote.
+// Handles escape sequences: \", \\, \n, \t, \r, \/, \b, \f
+// Returns pointer to character after the closing quote, or NULL on error.
+static const char* parse_json_string(const char* p, char** out) {
+    int cap = (int)strlen(p) + 1;
+    char* buf = (char*)malloc(cap);
+    int len = 0;
+
+    while (*p && *p != '"') {
+        if (*p == '\\') {
+            p++;
+            switch (*p) {
+                case '"':  buf[len++] = '"'; break;
+                case '\\': buf[len++] = '\\'; break;
+                case 'n':  buf[len++] = '\n'; break;
+                case 't':  buf[len++] = '\t'; break;
+                case 'r':  buf[len++] = '\r'; break;
+                case '/':  buf[len++] = '/'; break;
+                case 'b':  buf[len++] = '\b'; break;
+                case 'f':  buf[len++] = '\f'; break;
+                default:   buf[len++] = *p; break;
+            }
+        } else {
+            buf[len++] = *p;
+        }
+        p++;
+    }
+    if (*p != '"') { free(buf); return NULL; }
+    buf[len] = '\0';
+    *out = buf;
+    return p + 1;
+}
+
+// Parse a JSON chat history string into an array of ChatMessage.
+// Expected format: [{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]
+int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
+    *messages = NULL;
+    *count = 0;
+
+    int capacity = 16;
+    ChatMessage* msgs = (ChatMessage*)malloc(capacity * sizeof(ChatMessage));
+    int n = 0;
+
+    const char* p = json;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') { free(msgs); return 0; }
+    p++;
+
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+        if (*p == ']') break;
+        if (*p == ',') { p++; continue; }
+        if (*p != '{') { free(msgs); return 0; }
+        p++;
+
+        char* role = NULL;
+        char* content = NULL;
+
+        for (;;) {
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p == '}') { p++; break; }
+            if (*p == ',') { p++; continue; }
+            if (*p != '"') { if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            p++;
+
+            char* key = NULL;
+            p = parse_json_string(p, &key);
+            if (!p) { if (role) free(role); if (content) free(content); free(msgs); return 0; }
+
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p != ':') { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            p++;
+
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            if (*p != '"') { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            p++;
+
+            char* value = NULL;
+            p = parse_json_string(p, &value);
+            if (!p) { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+
+            if (strcmp(key, "role") == 0) {
+                if (role) free(role);
+                role = value;
+            } else if (strcmp(key, "content") == 0) {
+                if (content) free(content);
+                content = value;
+            } else {
+                free(value);
+            }
+            free(key);
+        }
+
+        if (role && content) {
+            if (n >= capacity) {
+                capacity *= 2;
+                msgs = (ChatMessage*)realloc(msgs, capacity * sizeof(ChatMessage));
+            }
+            msgs[n].role = role;
+            msgs[n].content = content;
+            n++;
+        } else {
+            if (role) free(role);
+            if (content) free(content);
+        }
+    }
+
+    *messages = msgs;
+    *count = n;
+    return 1;
+}
+
+void free_chat_history(ChatMessage* messages, int count) {
+    for (int i = 0; i < count; i++) {
+        free(messages[i].role);
+        free(messages[i].content);
+    }
+    free(messages);
+}
+
+// Encode chat history with Llama3 instruct format
+void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char* sys_prompt, int* tokens, int* n_tokens) {
+    *n_tokens = 0;
+    int temp_tokens[8192];
+    int temp_n = 0;
+
+    int bos_token = find_special_token("<|begin_of_text|>");
+    if (bos_token < 0) bos_token = LLAMA3_BOS_TOKEN;
+    int start_header = find_special_token("<|start_header_id|>");
+    if (start_header < 0) start_header = LLAMA3_START_HEADER;
+    int end_header = find_special_token("<|end_header_id|>");
+    if (end_header < 0) end_header = LLAMA3_END_HEADER;
+    int eot_token = find_special_token("<|eot_id|>");
+    if (eot_token < 0) eot_token = LLAMA3_EOT;
+
+    tokens[(*n_tokens)++] = bos_token;
+
+    if (sys_prompt && strlen(sys_prompt) > 0) {
+        tokens[(*n_tokens)++] = start_header;
+        bpe_encode("system", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+        tokens[(*n_tokens)++] = end_header;
+
+        char* sys_text = malloc(strlen(sys_prompt) + 4);
+        sprintf(sys_text, "\n\n%s", sys_prompt);
+        bpe_encode(sys_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        free(sys_text);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+        tokens[(*n_tokens)++] = eot_token;
+    }
+
+    for (int m = 0; m < msg_count; m++) {
+        tokens[(*n_tokens)++] = start_header;
+        bpe_encode(messages[m].role, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+        tokens[(*n_tokens)++] = end_header;
+
+        char* msg_text = malloc(strlen(messages[m].content) + 4);
+        sprintf(msg_text, "\n\n%s", messages[m].content);
+        bpe_encode(msg_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        free(msg_text);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+        tokens[(*n_tokens)++] = eot_token;
+    }
+
+    tokens[(*n_tokens)++] = start_header;
+    bpe_encode("assistant", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+               tokenizer.max_token_length, temp_tokens, &temp_n);
+    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+    tokens[(*n_tokens)++] = end_header;
+
+    bpe_encode("\n\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+               tokenizer.max_token_length, temp_tokens, &temp_n);
+    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+}
+
+// Encode chat history with Gemma3 instruct format
+void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char* sys_prompt, int* tokens, int* n_tokens) {
+    *n_tokens = 0;
+    int temp_tokens[8192];
+    int temp_n = 0;
+
+    int bos_token = find_special_token("<bos>");
+    if (bos_token < 0) bos_token = GEMMA3_BOS_TOKEN;
+    int start_turn = find_special_token("<start_of_turn>");
+    if (start_turn < 0) start_turn = GEMMA3_START_TURN;
+    int end_turn = find_special_token("<end_of_turn>");
+    if (end_turn < 0) end_turn = GEMMA3_END_TURN;
+
+    tokens[(*n_tokens)++] = bos_token;
+
+    int system_used = 0;
+    for (int m = 0; m < msg_count; m++) {
+        const char* role = messages[m].role;
+        const char* content = messages[m].content;
+        const char* gemma_role = (strcmp(role, "assistant") == 0) ? "model" : role;
+
+        tokens[(*n_tokens)++] = start_turn;
+
+        char* role_text;
+        if (!system_used && strcmp(role, "user") == 0 && sys_prompt && strlen(sys_prompt) > 0) {
+            role_text = malloc(strlen(gemma_role) + strlen(sys_prompt) + strlen(content) + 8);
+            sprintf(role_text, "%s\n%s\n\n%s", gemma_role, sys_prompt, content);
+            system_used = 1;
+        } else {
+            role_text = malloc(strlen(gemma_role) + strlen(content) + 4);
+            sprintf(role_text, "%s\n%s", gemma_role, content);
+        }
+
+        bpe_encode(role_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        free(role_text);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+
+        tokens[(*n_tokens)++] = end_turn;
+
+        bpe_encode("\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+    }
+
+    tokens[(*n_tokens)++] = start_turn;
+    bpe_encode("model\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
+               tokenizer.max_token_length, temp_tokens, &temp_n);
+    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+}
+
 // Encode a prompt with Gemma3 instruct format
 // Format: <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
 void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* tokens, int* n_tokens) {
@@ -3118,6 +3357,7 @@ void generate_token(void) {
 int main(int argc, char *argv[]) {
     char *checkpoint = NULL;
     char *prompt = NULL;
+    char *chat_history_file = NULL;
 
     // Parse named arguments
     for (int i = 1; i < argc; i++) {
@@ -3131,6 +3371,8 @@ int main(int argc, char *argv[]) {
             context_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-prompt") == 0 && i + 1 < argc) {
             prompt = argv[++i];
+        } else if (strcmp(argv[i], "-chathistory") == 0 && i + 1 < argc) {
+            chat_history_file = argv[++i];
         } else if (strcmp(argv[i], "-system_prompt") == 0 && i + 1 < argc) {
             system_prompt = argv[++i];
         } else if (strcmp(argv[i], "-debug") == 0) {
@@ -3139,19 +3381,22 @@ int main(int argc, char *argv[]) {
     }
 
     // Check required arguments
-    if (checkpoint == NULL || prompt == NULL) {
+    if (checkpoint == NULL || (prompt == NULL && chat_history_file == NULL)) {
         printf("Usage: %s -model <model.gguf> -prompt <text> [options]\n", argv[0]);
+        printf("       %s -model <model.gguf> -chathistory <file.txt> [options]\n", argv[0]);
         printf("\nRequired arguments:\n");
         printf("  -model         path to GGUF model file\n");
         printf("  -prompt        input prompt text\n");
+        printf("  -chathistory   path to a .txt file with JSON chat history (alternative to -prompt)\n");
         printf("\nOptional arguments:\n");
         printf("  -system_prompt system prompt (default: \"You are a helpful assistant.\")\n");
         printf("  -temperature   sampling temperature (default: 0.9, use 0.0 for greedy)\n");
         printf("  -max_tokens    number of tokens to generate (default: 256)\n");
         printf("  -context_size  context size for the AI model (default: model's max)\n");
         printf("  -debug         show detailed model loading and performance logs\n");
-        printf("\nExample:\n");
+        printf("\nExamples:\n");
         printf("  %s -model Llama3.gguf -prompt \"tell me what is microsoft\"\n", argv[0]);
+        printf("  %s -model Llama3.gguf -chathistory history.txt\n", argv[0]);
         return 1;
     }
 
@@ -3316,9 +3561,41 @@ int main(int argc, char *argv[]) {
         if (gemma3_end_turn < 0) gemma3_end_turn = GEMMA3_END_TURN;
     }
 
-    if (prompt != NULL) {
-        prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
+    prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
 
+    if (chat_history_file != NULL) {
+        // Read chat history from file
+        FILE* f = fopen(chat_history_file, "rb");
+        if (!f) {
+            fprintf(stderr, "Failed to open chat history file: %s\n", chat_history_file);
+            return 1;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        char* json = (char*)malloc(fsize + 1);
+        fread(json, 1, fsize, f);
+        fclose(f);
+        json[fsize] = '\0';
+
+        ChatMessage* messages = NULL;
+        int msg_count = 0;
+        if (!parse_chat_history(json, &messages, &msg_count) || msg_count == 0) {
+            fprintf(stderr, "Failed to parse chat history from file: %s\n", chat_history_file);
+            free(json);
+            return 1;
+        }
+        free(json);
+
+        if (config.is_gemma3) {
+            encode_gemma3_chat_history(messages, msg_count, system_prompt, prompt_tokens, &num_prompt_tokens);
+        } else {
+            encode_llama3_chat_history(messages, msg_count, system_prompt, prompt_tokens, &num_prompt_tokens);
+        }
+        free_chat_history(messages, msg_count);
+
+        token = prompt_tokens[0];
+    } else if (prompt != NULL) {
         // Use chat template for instruct models
         if (use_chat_template) {
             if (config.is_gemma3) {
