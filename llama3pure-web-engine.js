@@ -2949,7 +2949,7 @@ function bpeEncode(text) {
   return tokens
 }
 
-function encodeLlama3Chat(prompt, sysPrompt) {
+function encodeLlama3Chat(chatHistory, sysPrompt) {
   var tokens = []
 
   // Find special tokens
@@ -2992,21 +2992,26 @@ function encodeLlama3Chat(prompt, sysPrompt) {
     tokens.push(eotToken)
   }
 
-  // User prompt
-  tokens.push(startHeader)
-  var userTokens = bpeEncode("user")
-  for (var i = 0; i < userTokens.length; i = i + 1) {
-    tokens.push(userTokens[i])
-  }
-  tokens.push(endHeader)
+  // Chat history messages
+  for (var m = 0; m < chatHistory.length; m = m + 1) {
+    var role = chatHistory[m].role
+    var content = chatHistory[m].content
 
-  var userTextTokens = bpeEncode("\n\n" + prompt)
-  for (var i = 0; i < userTextTokens.length; i = i + 1) {
-    tokens.push(userTextTokens[i])
-  }
-  tokens.push(eotToken)
+    tokens.push(startHeader)
+    var roleTokens = bpeEncode(role)
+    for (var i = 0; i < roleTokens.length; i = i + 1) {
+      tokens.push(roleTokens[i])
+    }
+    tokens.push(endHeader)
 
-  // Assistant header
+    var contentTokens = bpeEncode("\n\n" + content)
+    for (var i = 0; i < contentTokens.length; i = i + 1) {
+      tokens.push(contentTokens[i])
+    }
+    tokens.push(eotToken)
+  }
+
+  // Assistant header for generation
   tokens.push(startHeader)
   var assistantTokens = bpeEncode("assistant")
   for (var i = 0; i < assistantTokens.length; i = i + 1) {
@@ -3022,7 +3027,7 @@ function encodeLlama3Chat(prompt, sysPrompt) {
   return tokens
 }
 
-function encodeGemma3Chat(prompt, sysPrompt) {
+function encodeGemma3Chat(chatHistory, sysPrompt) {
   var tokens = []
 
   // Find special tokens
@@ -3047,34 +3052,40 @@ function encodeGemma3Chat(prompt, sysPrompt) {
   // <bos>
   tokens.push(bosToken)
 
-  // Prepare full prompt (optionally include system prompt)
-  var fullPrompt = prompt
-  if (sysPrompt && sysPrompt.length > 0) {
-    fullPrompt = sysPrompt + "\n\n" + prompt
+  // Chat history messages
+  var systemUsed = false
+  for (var m = 0; m < chatHistory.length; m = m + 1) {
+    var role = chatHistory[m].role
+    var content = chatHistory[m].content
+
+    // Gemma uses "model" instead of "assistant"
+    var gemmaRole = role === "assistant" ? "model" : role
+
+    tokens.push(startTurn)
+
+    var roleText = gemmaRole + "\n"
+    // Merge system prompt into first user message
+    if (!systemUsed && role === "user" && sysPrompt && sysPrompt.length > 0) {
+      roleText = gemmaRole + "\n" + sysPrompt + "\n\n"
+      systemUsed = true
+    }
+
+    var roleTokens = bpeEncode(roleText + content)
+    for (var i = 0; i < roleTokens.length; i = i + 1) {
+      tokens.push(roleTokens[i])
+    }
+
+    tokens.push(endTurn)
+
+    var newlineTokens = bpeEncode("\n")
+    for (var i = 0; i < newlineTokens.length; i = i + 1) {
+      tokens.push(newlineTokens[i])
+    }
   }
 
-  // <start_of_turn>
+  // Model header for generation
   tokens.push(startTurn)
 
-  // "user\n" + prompt
-  var userTokens = bpeEncode("user\n" + fullPrompt)
-  for (var i = 0; i < userTokens.length; i = i + 1) {
-    tokens.push(userTokens[i])
-  }
-
-  // <end_of_turn>
-  tokens.push(endTurn)
-
-  // "\n"
-  var newlineTokens = bpeEncode("\n")
-  for (var i = 0; i < newlineTokens.length; i = i + 1) {
-    tokens.push(newlineTokens[i])
-  }
-
-  // <start_of_turn>
-  tokens.push(startTurn)
-
-  // "model\n"
   var modelTokens = bpeEncode("model\n")
   for (var i = 0; i < modelTokens.length; i = i + 1) {
     tokens.push(modelTokens[i])
@@ -3086,12 +3097,12 @@ function encodeGemma3Chat(prompt, sysPrompt) {
 // ----------------------------------------------------------------------------
 // Generation
 
-function generate(prompt) {
+function generate(chatHistory) {
   var promptTokens
   if (config.isGemma) {
-    promptTokens = encodeGemma3Chat(prompt, systemPrompt)
+    promptTokens = encodeGemma3Chat(chatHistory, systemPrompt)
   } else {
-    promptTokens = encodeLlama3Chat(prompt, systemPrompt)
+    promptTokens = encodeLlama3Chat(chatHistory, systemPrompt)
   }
 
   if (promptTokens.length === 0) {
@@ -3221,7 +3232,7 @@ self.onmessage = function (e) {
         break
 
       case "generate":
-        generate(data.prompt)
+        generate(data.chatHistory)
         break
 
       case "setTemperature":

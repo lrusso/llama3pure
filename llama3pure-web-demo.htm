@@ -84,8 +84,7 @@
           download: "Download",
           downloading: "Downloading...",
           system_prompt: "You are a useful AI assistant.",
-          system_welcome:
-            "Hello, how can I help you today? *This demo has no session memory. Single-turn interactions only.*",
+          system_welcome: "Hello, how can I help you today?",
           error_empty:
             "The AI model generated an empty response. The current maxTokens () and contextSize () values may be too low. Try increasing those values by adding them to the current URL, for example: ?maxTokens={number}&contextSize={number}",
           error_filesize:
@@ -102,8 +101,7 @@
           download: "Descargar",
           downloading: "Descargando...",
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
-          system_welcome:
-            "Hola, \xBFc\xF3mo puedo ayudarte hoy? *Esta demostraci\xF3n no tiene memoria de sesi\xF3n. Solo interacciones de un solo turno.*",
+          system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
           error_empty:
             "El modelo de AI gener\xF3 una respuesta vac\xEDa. Los valores de actuales de maxTokens () y contextSize () podr\xEDan ser bajos, prueba aumentar esos valores agreg\xE1ndolos a la URL actual, por ejemplo: ?maxTokens={n\xFAmero}&contextSize={n\xFAmero}",
           error_filesize:
@@ -434,7 +432,7 @@
 
         worker.postMessage({
           type: "generate",
-          prompt: prompt,
+          chatHistory: chatHistory,
         })
       }
 
