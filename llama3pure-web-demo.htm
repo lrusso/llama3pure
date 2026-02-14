@@ -270,9 +270,11 @@
             case "token":
               document.title = t("title") + " - " + t("writing")
               responseInProgress = responseInProgress + data.token
-              lastReply.innerHTML =
+              patchDOM(
+                lastReply,
                 markdownToHTML(responseInProgress.replace(/\</g, "&#60;")) +
-                '<div class="pointer"></div>'
+                  '<div class="pointer"></div>'
+              )
               break
 
             case "complete":
@@ -366,6 +368,65 @@
         var message = createComponent("span", className, innerHTML)
         content.appendChild(message)
         return message
+      }
+
+      function patchDOM(target, newHTML) {
+        var temp = document.createElement("div")
+        temp.innerHTML = newHTML
+        reconcileChildren(target, temp)
+      }
+
+      function reconcileChildren(existing, updated) {
+        var existingChildren = Array.prototype.slice.call(existing.childNodes)
+        var updatedChildren = Array.prototype.slice.call(updated.childNodes)
+
+        for (var i = 0; i < updatedChildren.length; i++) {
+          if (i < existingChildren.length) {
+            reconcileNode(existing, existingChildren[i], updatedChildren[i])
+          } else {
+            existing.appendChild(updatedChildren[i].cloneNode(true))
+          }
+        }
+
+        for (var i = existingChildren.length - 1; i >= updatedChildren.length; i--) {
+          existing.removeChild(existingChildren[i])
+        }
+      }
+
+      function reconcileNode(parent, existingNode, newNode) {
+        if (
+          existingNode.nodeType !== newNode.nodeType ||
+          existingNode.nodeName !== newNode.nodeName
+        ) {
+          parent.replaceChild(newNode.cloneNode(true), existingNode)
+          return
+        }
+
+        if (existingNode.nodeType === Node.TEXT_NODE) {
+          if (existingNode.textContent !== newNode.textContent) {
+            existingNode.textContent = newNode.textContent
+          }
+          return
+        }
+
+        if (existingNode.nodeType === Node.ELEMENT_NODE) {
+          var existingAttrs = existingNode.attributes
+          var newAttrs = newNode.attributes
+
+          for (var i = existingAttrs.length - 1; i >= 0; i--) {
+            if (!newNode.hasAttribute(existingAttrs[i].name)) {
+              existingNode.removeAttribute(existingAttrs[i].name)
+            }
+          }
+
+          for (var i = 0; i < newAttrs.length; i++) {
+            if (existingNode.getAttribute(newAttrs[i].name) !== newAttrs[i].value) {
+              existingNode.setAttribute(newAttrs[i].name, newAttrs[i].value)
+            }
+          }
+
+          reconcileChildren(existingNode, newNode)
+        }
       }
 
       function ask(prompt, hidePrompt) {
