@@ -556,19 +556,12 @@
 
         content.appendChild(buttonsContainer)
 
-        scrollToBottom()
-
         var pointerElement = document.querySelector(".pointer")
         if (pointerElement) {
           pointerElement.remove()
         }
 
-        setTimeout(function () {
-          rendering = false
-          if (!isMobileDevice()) {
-            inputTextbox.focus()
-          }
-        }, 250)
+        rendering = false
       }
 
       function scrollToBottom() {
