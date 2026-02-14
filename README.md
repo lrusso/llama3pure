@@ -15,10 +15,16 @@ make llama3pure-c-engine
 
 ./llama3pure-c-engine -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 
+# run with a chat history
+
+./llama3pure-c-engine -model Llama3.gguf -chathistory chat.txt
+
 # run with custom parameters
 
 ./llama3pure-c-engine -model Llama3.gguf -temperature 0.9 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
+
+Check the sample chat in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt).
 
 ## How to run the Node.js engine:
 
