@@ -7,24 +7,19 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 ## How to build and run the C engine:
 
 ```bash
-# build the engine (MacOS/Linux)
-
+# Bild the engine (MacOS/Linux)
 make llama3pure
 
-# build the engine (Windows, using x64 Native Tools Command Prompt for VS)
-
+# Build the engine (Windows, using x64 Native Tools Command Prompt for VS)
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 
-# run with a basic prompt
-
+# Run with a basic prompt
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 
-# run with a chat history
-
+# Run with a chat history
 ./llama3pure -model Llama3.gguf -chathistory chat.txt
 
-# run with custom parameters
-
+# Run with custom parameters
 ./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
