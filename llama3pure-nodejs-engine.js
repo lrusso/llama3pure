@@ -1953,8 +1953,8 @@ function readGGUFValue(type) {
 // Model loading
 
 function loadModel(filePath) {
-  // Reset sorted vocab cache when loading a new model
-  sortedVocab = null
+  // Reset vocab cache when loading a new model
+  vocabTrie = null
   vocabMap = null
 
   var gguf = parseGGUF(filePath)
@@ -2212,6 +2212,17 @@ function createRunState(p) {
   var keyCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
   var valueCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
 
+  // Pre-compute head offset tables to avoid repeated multiplication in attention loop
+  var kvMul = p.nHeads / p.nKvHeads
+  var headQOffsets = new Int32Array(p.nHeads)
+  var headKvIdx = new Int32Array(p.nHeads)
+  var headAttOffsets = new Int32Array(p.nHeads)
+  for (var h = 0; h < p.nHeads; h = h + 1) {
+    headQOffsets[h] = h * headSize
+    headKvIdx[h] = (h / kvMul) | 0
+    headAttOffsets[h] = h * p.seqLen
+  }
+
   return {
     x: new Float32Array(p.dim),
     xb: new Float32Array(maxDim),
@@ -2267,6 +2278,10 @@ function createRunState(p) {
     // Pre-allocated buffers for top-k sampling
     topKIndices: new Int32Array(40),
     topKValues: new Float32Array(40),
+    // Pre-computed head offset tables
+    headQOffsets: headQOffsets,
+    headKvIdx: headKvIdx,
+    headAttOffsets: headAttOffsets,
   }
 }
 
@@ -2281,7 +2296,6 @@ function transformer(token, pos, computeLogits) {
   var headSize = s.headSize
   var kvDim = s.kvDim
   var qDim = s.qDim
-  var kvMul = s.kvMul
   var hiddenDim = s.hiddenDim
   var eps = s.rmsNormEps
   var nLayers = s.nLayers
@@ -2411,22 +2425,59 @@ function transformer(token, pos, computeLogits) {
         }
       }
     } else {
-      for (var i = 0; i < qDim; i = i + 2) {
+      // Apply RoPE to Q and K with 4-way unrolling (Llama path)
+      var kvDim4 = kvDim & ~3
+      for (var i = 0; i < kvDim4; i = i + 4) {
+        var fi0 = (i >> 1) % half
+        var fi1 = ((i + 2) >> 1) % half
+        var fcr0 = ropeCos[fi0]
+        var fci0 = ropeSin[fi0]
+        var fcr1 = ropeCos[fi1]
+        var fci1 = ropeSin[fi1]
+        // Process Q pair 0
+        var qv0 = qArr[i]
+        var qv1 = qArr[i + 1]
+        qArr[i] = qv0 * fcr0 - qv1 * fci0
+        qArr[i + 1] = qv0 * fci0 + qv1 * fcr0
+        // Process Q pair 1
+        var qv2 = qArr[i + 2]
+        var qv3 = qArr[i + 3]
+        qArr[i + 2] = qv2 * fcr1 - qv3 * fci1
+        qArr[i + 3] = qv2 * fci1 + qv3 * fcr1
+        // Process K pair 0
+        var kv0 = kArr[i]
+        var kv1 = kArr[i + 1]
+        kArr[i] = kv0 * fcr0 - kv1 * fci0
+        kArr[i + 1] = kv0 * fci0 + kv1 * fcr0
+        // Process K pair 1
+        var kv2 = kArr[i + 2]
+        var kv3 = kArr[i + 3]
+        kArr[i + 2] = kv2 * fcr1 - kv3 * fci1
+        kArr[i + 3] = kv2 * fci1 + kv3 * fcr1
+      }
+      // kvDim remainder (if kvDim not multiple of 4)
+      for (var i = kvDim4; i < kvDim; i = i + 2) {
         var freqIdx = (i >> 1) % half
         var fcr = ropeCos[freqIdx]
         var fci = ropeSin[freqIdx]
-
         var v0 = qArr[i]
         var v1 = qArr[i + 1]
         qArr[i] = v0 * fcr - v1 * fci
         qArr[i + 1] = v0 * fci + v1 * fcr
-
-        if (i < kvDim) {
-          v0 = kArr[i]
-          v1 = kArr[i + 1]
-          kArr[i] = v0 * fcr - v1 * fci
-          kArr[i + 1] = v0 * fci + v1 * fcr
-        }
+        v0 = kArr[i]
+        v1 = kArr[i + 1]
+        kArr[i] = v0 * fcr - v1 * fci
+        kArr[i + 1] = v0 * fci + v1 * fcr
+      }
+      // Q-only remainder (qDim > kvDim for GQA)
+      for (var i = kvDim; i < qDim; i = i + 2) {
+        var freqIdx = (i >> 1) % half
+        var fcr = ropeCos[freqIdx]
+        var fci = ropeSin[freqIdx]
+        var v0 = qArr[i]
+        var v1 = qArr[i + 1]
+        qArr[i] = v0 * fcr - v1 * fci
+        qArr[i + 1] = v0 * fci + v1 * fcr
       }
     }
 
@@ -2449,12 +2500,9 @@ function transformer(token, pos, computeLogits) {
 
     // Cache array references for JIT optimization
     var sAtt = s.att
-    var seqLen = s.seqLen
 
-    // Zero xb once for all heads - more efficient than per-head zeroing
-    for (var i = 0; i < qDim; i = i + 1) {
-      xbArr[i] = 0
-    }
+    // Zero xb once for all heads
+    xbArr.fill(0, 0, qDim)
 
     // Bytes per KV head = (headSize / 32) * 34
     var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
@@ -2465,11 +2513,15 @@ function transformer(token, pos, computeLogits) {
         ? Math.max(0, pos - config.swaWindow + 1)
         : 0
 
+    // Cache head offset tables
+    var headQOff = s.headQOffsets
+    var headKvI = s.headKvIdx
+    var headAttOff = s.headAttOffsets
+
     for (var h = 0; h < nHeads; h = h + 1) {
-      var qOffset = h * headSize
-      var attOffset = h * seqLen
-      // Use integer division via bitwise for kvMul (kvMul is always power of 2 or 1)
-      var kvHeadIdx = (h / kvMul) | 0
+      var qOffset = headQOff[h]
+      var attOffset = headAttOff[h]
+      var kvHeadIdx = headKvI[h]
       var kvHeadByteOff = kvHeadIdx * headBytesQ8
 
       // Compute attention scores using Q8_0 dot product
@@ -2547,6 +2599,10 @@ function transformer(token, pos, computeLogits) {
 
     // Apply activation (GELU for Gemma, SiLU for Llama)
     var hd4 = hiddenDim & ~3
+    // GELU constants: factor out 0.7978845608 * 0.044715 = 0.035677408137
+    var GELU_A = 0.7978845608
+    var GELU_B = 0.035677408137
+
     if (isGemma) {
       // GELU activation
       for (var i = 0; i < hd4; i = i + 4) {
@@ -2555,33 +2611,27 @@ function transformer(token, pos, computeLogits) {
         var x2 = hbArr[i + 2]
         var x3 = hbArr[i + 3]
         hbArr[i] =
-          0.5 *
-          x0 *
-          (1.0 + Math.tanh(0.7978845608 * x0 * (1.0 + 0.044715 * x0 * x0))) *
-          hb2Arr[i]
+          0.5 * x0 * (1.0 + Math.tanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
         hbArr[i + 1] =
           0.5 *
           x1 *
-          (1.0 + Math.tanh(0.7978845608 * x1 * (1.0 + 0.044715 * x1 * x1))) *
+          (1.0 + Math.tanh(x1 * (GELU_A + GELU_B * x1 * x1))) *
           hb2Arr[i + 1]
         hbArr[i + 2] =
           0.5 *
           x2 *
-          (1.0 + Math.tanh(0.7978845608 * x2 * (1.0 + 0.044715 * x2 * x2))) *
+          (1.0 + Math.tanh(x2 * (GELU_A + GELU_B * x2 * x2))) *
           hb2Arr[i + 2]
         hbArr[i + 3] =
           0.5 *
           x3 *
-          (1.0 + Math.tanh(0.7978845608 * x3 * (1.0 + 0.044715 * x3 * x3))) *
+          (1.0 + Math.tanh(x3 * (GELU_A + GELU_B * x3 * x3))) *
           hb2Arr[i + 3]
       }
       for (var i = hd4; i < hiddenDim; i = i + 1) {
         var x = hbArr[i]
         hbArr[i] =
-          0.5 *
-          x *
-          (1.0 + Math.tanh(0.7978845608 * x * (1.0 + 0.044715 * x * x))) *
-          hb2Arr[i]
+          0.5 * x * (1.0 + Math.tanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
       }
     } else {
       // SiLU activation
@@ -2724,29 +2774,35 @@ function sample(logits, temp) {
 // ----------------------------------------------------------------------------
 // Tokenizer
 
-var sortedVocab = null
 var vocabMap = null
+var vocabTrie = null
 
 function buildSortedVocab() {
-  if (sortedVocab) {
+  if (vocabTrie) {
     return
   }
 
-  sortedVocab = []
   vocabMap = {}
+  // Build trie for O(max_token_len) longest-match lookup
+  vocabTrie = {}
 
   for (var i = 0; i < tokenizer.vocab.length; i = i + 1) {
     var token = tokenizer.vocab[i]
     if (token && token.length > 0) {
-      sortedVocab.push({ id: i, len: token.length, token: token })
       vocabMap[token] = i
+      // Insert into trie
+      var node = vocabTrie
+      for (var j = 0; j < token.length; j = j + 1) {
+        var ch = token.charCodeAt(j)
+        if (!node[ch]) {
+          node[ch] = {}
+        }
+        node = node[ch]
+      }
+      node.id = i
+      node.len = token.length
     }
   }
-
-  // Sort by length descending (longest first)
-  sortedVocab.sort(function (a, b) {
-    return b.len - a.len
-  })
 }
 
 function findSpecialToken(tokenStr) {
@@ -2784,7 +2840,7 @@ function buildTiktokenByteToUnicodeMap() {
 function textToTiktoken(text) {
   buildTiktokenByteToUnicodeMap()
 
-  var result = ""
+  var parts = []
   for (var i = 0; i < text.length; i = i + 1) {
     var code = text.charCodeAt(i)
 
@@ -2799,38 +2855,32 @@ function textToTiktoken(text) {
 
     // Convert unicode to UTF-8 bytes, then map each byte to tiktoken unicode
     if (code < 0x80) {
-      result = result + String.fromCharCode(tiktokenByteToUnicode[code])
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[code]))
     } else if (code < 0x800) {
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0xc0 | (code >> 6)])
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0xc0 | (code >> 6)]))
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)]))
     } else if (code < 0x10000) {
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0xe0 | (code >> 12)])
-      result =
-        result +
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0xe0 | (code >> 12)]))
+      parts.push(
         String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)])
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+      )
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)]))
     } else {
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0xf0 | (code >> 18)])
-      result =
-        result +
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0xf0 | (code >> 18)]))
+      parts.push(
         String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 12) & 0x3f)])
-      result =
-        result +
+      )
+      parts.push(
         String.fromCharCode(tiktokenByteToUnicode[0x80 | ((code >> 6) & 0x3f)])
-      result =
-        result + String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)])
+      )
+      parts.push(String.fromCharCode(tiktokenByteToUnicode[0x80 | (code & 0x3f)]))
     }
   }
-  return result
+  return parts.join("")
 }
 
 function textToSentencePiece(text) {
-  var result = ""
+  var parts = []
   var needPrefix = true // Add ▁ before first alphanumeric char
 
   for (var i = 0; i < text.length; i = i + 1) {
@@ -2839,11 +2889,11 @@ function textToSentencePiece(text) {
 
     if (c === " ") {
       // Space -> ▁ (U+2581)
-      result = result + "\u2581"
+      parts.push("\u2581")
       needPrefix = false // ▁ already added for the space
     } else if (c === "\n" || c === "\t" || c === "\r") {
       // Control characters are kept as-is
-      result = result + c
+      parts.push(c)
       needPrefix = true // Next word needs prefix
     } else {
       // Regular character - add prefix if this is start of a word
@@ -2853,14 +2903,14 @@ function textToSentencePiece(text) {
           (code >= 97 && code <= 122) ||
           (code >= 48 && code <= 57))
       ) {
-        result = result + "\u2581"
+        parts.push("\u2581")
       }
-      result = result + c
+      parts.push(c)
       needPrefix = false
     }
   }
 
-  return result
+  return parts.join("")
 }
 
 // Streaming UTF-8 decoder for Llama tokens
@@ -2868,6 +2918,8 @@ var utf8Decoder = new TextDecoder("utf-8")
 
 // Build tiktoken unicode-to-byte mapping (inverse of bytes_to_unicode)
 var tiktokenUnicodeToByte = null
+// Pre-allocated buffer for tokenToBytes (max token length * 4 bytes per char)
+var tokenToBytesBuffer = new Uint8Array(256)
 
 function buildTiktokenMap() {
   if (tiktokenUnicodeToByte) {
@@ -2913,8 +2965,9 @@ function tokenToBytes(token) {
 
   buildTiktokenMap()
 
-  // Collect bytes from tiktoken encoding
-  var bytes = []
+  // Pre-allocated buffer: each char maps to at most 4 UTF-8 bytes
+  var buf = tokenToBytesBuffer
+  var len = 0
   for (var i = 0; i < piece.length; i = i + 1) {
     var code = piece.charCodeAt(i)
 
@@ -2929,28 +2982,33 @@ function tokenToBytes(token) {
 
     // Look up in tiktoken mapping
     if (tiktokenUnicodeToByte[code] !== undefined) {
-      bytes.push(tiktokenUnicodeToByte[code])
+      buf[len] = tiktokenUnicodeToByte[code]
+      len = len + 1
     } else {
       // Fallback: encode unknown unicode as UTF-8
       if (code < 0x80) {
-        bytes.push(code)
+        buf[len] = code
+        len = len + 1
       } else if (code < 0x800) {
-        bytes.push(0xc0 | (code >> 6))
-        bytes.push(0x80 | (code & 0x3f))
+        buf[len] = 0xc0 | (code >> 6)
+        buf[len + 1] = 0x80 | (code & 0x3f)
+        len = len + 2
       } else if (code < 0x10000) {
-        bytes.push(0xe0 | (code >> 12))
-        bytes.push(0x80 | ((code >> 6) & 0x3f))
-        bytes.push(0x80 | (code & 0x3f))
+        buf[len] = 0xe0 | (code >> 12)
+        buf[len + 1] = 0x80 | ((code >> 6) & 0x3f)
+        buf[len + 2] = 0x80 | (code & 0x3f)
+        len = len + 3
       } else {
-        bytes.push(0xf0 | (code >> 18))
-        bytes.push(0x80 | ((code >> 12) & 0x3f))
-        bytes.push(0x80 | ((code >> 6) & 0x3f))
-        bytes.push(0x80 | (code & 0x3f))
+        buf[len] = 0xf0 | (code >> 18)
+        buf[len + 1] = 0x80 | ((code >> 12) & 0x3f)
+        buf[len + 2] = 0x80 | ((code >> 6) & 0x3f)
+        buf[len + 3] = 0x80 | (code & 0x3f)
+        len = len + 4
       }
     }
   }
 
-  return new Uint8Array(bytes)
+  return buf.subarray(0, len)
 }
 
 function decodeToken(token) {
@@ -2997,30 +3055,22 @@ function bpeEncode(text) {
 
   var tokens = []
   var pos = 0
+  var textLen = encodedText.length
 
-  while (pos < encodedText.length) {
+  while (pos < textLen) {
+    // Walk trie for longest match at current position
+    var node = vocabTrie
     var bestId = -1
     var bestLen = 0
-
-    // Greedy longest-match
-    for (var i = 0; i < sortedVocab.length; i = i + 1) {
-      var entry = sortedVocab[i]
-
-      // Skip if token is longer than remaining text
-      if (entry.len > encodedText.length - pos) {
-        continue
-      }
-
-      // Skip if shorter than best match we already found (optimization)
-      if (bestLen > 0 && entry.len <= bestLen) {
+    for (var j = pos; j < textLen; j = j + 1) {
+      var ch = encodedText.charCodeAt(j)
+      node = node[ch]
+      if (!node) {
         break
       }
-
-      // Check if vocab entry matches
-      if (encodedText.substring(pos, pos + entry.len) === entry.token) {
-        bestId = entry.id
-        bestLen = entry.len
-        break
+      if (node.id !== undefined) {
+        bestId = node.id
+        bestLen = node.len
       }
     }
 
