@@ -11,6 +11,10 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 make llama3pure
 
+# build the engine (Windows, using x64 Native Tools Command Prompt for VS)
+
+cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
+
 # run with a basic prompt
 
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
