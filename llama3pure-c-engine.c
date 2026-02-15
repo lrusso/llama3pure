@@ -2258,6 +2258,17 @@ void track_allocation(float* ptr) {
     weight_allocations[num_weight_allocations - 1] = ptr;
 }
 
+void free_tracked_allocation(float* ptr) {
+    if (!ptr) return;
+    for (int i = num_weight_allocations - 1; i >= 0; i--) {
+        if (weight_allocations[i] == ptr) {
+            weight_allocations[i] = NULL;
+            break;
+        }
+    }
+    free(ptr);
+}
+
 // Load tensor as dequantized float (for small tensors like norms and embeddings)
 float* load_tensor_float(GGUFFile* gguf, const char* name, int expected_elements) {
     GGUFTensor* tensor = find_gguf_tensor(gguf, name);
@@ -2407,12 +2418,14 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
         float* attn_norm = load_layer_tensor_float(gguf, l, "attn_norm.weight", p->dim);
         if (attn_norm) {
             memcpy(w->rms_att_weight + l * p->dim, attn_norm, p->dim * sizeof(float));
+            free_tracked_allocation(attn_norm);
         }
 
         // FFN norm - small, dequantize
         float* ffn_norm = load_layer_tensor_float(gguf, l, "ffn_norm.weight", p->dim);
         if (ffn_norm) {
             memcpy(w->rms_ffn_weight + l * p->dim, ffn_norm, p->dim * sizeof(float));
+            free_tracked_allocation(ffn_norm);
         }
 
         // Q, K, V, O projections - KEEP QUANTIZED!
@@ -2434,19 +2447,23 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
 
             if (q_norm) {
                 memcpy(w->attn_q_norm + l * head_size, q_norm, head_size * sizeof(float));
+                free_tracked_allocation(q_norm);
             }
             if (k_norm) {
                 memcpy(w->attn_k_norm + l * head_size, k_norm, head_size * sizeof(float));
+                free_tracked_allocation(k_norm);
             }
 
             float* post_attn_norm = load_layer_tensor_float(gguf, l, "post_attention_norm.weight", p->dim);
             if (post_attn_norm) {
                 memcpy(w->attn_post_norm + l * p->dim, post_attn_norm, p->dim * sizeof(float));
+                free_tracked_allocation(post_attn_norm);
             }
 
             float* post_ffn_norm = load_layer_tensor_float(gguf, l, "post_ffw_norm.weight", p->dim);
             if (post_ffn_norm) {
                 memcpy(w->ffn_post_norm + l * p->dim, post_ffn_norm, p->dim * sizeof(float));
+                free_tracked_allocation(post_ffn_norm);
             }
         }
     }
@@ -3909,6 +3926,7 @@ void generate_token(void) {
 
 
 int main(int argc, char *argv[]) {
+    int exit_code = 0;
     char *checkpoint = NULL;
     char *prompt = NULL;
     char *chat_history_file = NULL;
@@ -3967,13 +3985,13 @@ int main(int argc, char *argv[]) {
     gguf_file = parse_gguf_file(checkpoint);
     if (!gguf_file) {
         fprintf(stderr, "Failed to parse GGUF file\n");
-        return 1;
+        exit_code = 1; goto cleanup;
     }
 
     // Load tokenizer vocabulary from GGUF (contains tokens and scores arrays)
     if (!load_gguf_tokenizer(gguf_file, checkpoint)) {
         fprintf(stderr, "Failed to load vocabulary from GGUF\n");
-        return 1;
+        exit_code = 1; goto cleanup;
     }
 
     // Extract config from GGUF metadata
@@ -4088,13 +4106,13 @@ int main(int argc, char *argv[]) {
     // Load weights (using updated vocab_size)
     if (!init_weights_from_gguf(gguf_file, &config, &weights)) {
         fprintf(stderr, "Failed to load weights from GGUF\n");
-        return 1;
+        exit_code = 1; goto cleanup;
     }
 
     // Initialize tokenizer
     if (!init_tokenizer_from_gguf(gguf_file, &config)) {
         fprintf(stderr, "Failed to initialize tokenizer\n");
-        return 1;
+        exit_code = 1; goto cleanup;
     }
 
     // Initial token will be set from prompt_tokens[0] if prompt provided
@@ -4137,7 +4155,7 @@ int main(int argc, char *argv[]) {
         FILE* f = fopen(chat_history_file, "rb");
         if (!f) {
             fprintf(stderr, "Failed to open chat history file: %s\n", chat_history_file);
-            return 1;
+            exit_code = 1; goto cleanup;
         }
         fseek(f, 0, SEEK_END);
         long fsize = ftell(f);
@@ -4152,7 +4170,7 @@ int main(int argc, char *argv[]) {
         if (!parse_chat_history(json, &messages, &msg_count) || msg_count == 0) {
             fprintf(stderr, "Failed to parse chat history from file: %s\n", chat_history_file);
             free(json);
-            return 1;
+            exit_code = 1; goto cleanup;
         }
         free(json);
 
@@ -4219,13 +4237,14 @@ int main(int argc, char *argv[]) {
         printf("\n");  // Ensure newline after response
     }
 
-    // Cleanup
+cleanup:
+    // Cleanup (safe to call on NULL - all globals are zero-initialized)
     free_run_state(&state);
     free(q8_buf);
     free_tokenizer();
     free(sorted_vocab);
 
-    if (prompt_tokens) free(prompt_tokens);
+    free(prompt_tokens);
 
     // Free float weight allocations (embeddings, norms, etc.)
     for (int i = 0; i < num_weight_allocations; i++) {
@@ -4260,5 +4279,5 @@ int main(int argc, char *argv[]) {
         free_gguf_file(gguf_file);
     }
 
-    return 0;
+    return exit_code;
 }
