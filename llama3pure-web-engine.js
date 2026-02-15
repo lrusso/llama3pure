@@ -323,10 +323,41 @@ function dotQ8_0Cache(x, xOffset, cache, cacheInt8, cacheOffset, count) {
     var d = fp16ToFp32(cache[bo] | (cache[bo + 1] << 8))
     var qOff = bo + 2
 
-    var blockSum = 0.0
-    for (var j = 0; j < 32; j = j + 1) {
-      blockSum = blockSum + x[xb + j] * cacheInt8[qOff + j]
-    }
+    // Unrolled inner loop for JIT optimization
+    var blockSum =
+      x[xb] * cacheInt8[qOff] +
+      x[xb + 1] * cacheInt8[qOff + 1] +
+      x[xb + 2] * cacheInt8[qOff + 2] +
+      x[xb + 3] * cacheInt8[qOff + 3] +
+      x[xb + 4] * cacheInt8[qOff + 4] +
+      x[xb + 5] * cacheInt8[qOff + 5] +
+      x[xb + 6] * cacheInt8[qOff + 6] +
+      x[xb + 7] * cacheInt8[qOff + 7] +
+      x[xb + 8] * cacheInt8[qOff + 8] +
+      x[xb + 9] * cacheInt8[qOff + 9] +
+      x[xb + 10] * cacheInt8[qOff + 10] +
+      x[xb + 11] * cacheInt8[qOff + 11] +
+      x[xb + 12] * cacheInt8[qOff + 12] +
+      x[xb + 13] * cacheInt8[qOff + 13] +
+      x[xb + 14] * cacheInt8[qOff + 14] +
+      x[xb + 15] * cacheInt8[qOff + 15] +
+      x[xb + 16] * cacheInt8[qOff + 16] +
+      x[xb + 17] * cacheInt8[qOff + 17] +
+      x[xb + 18] * cacheInt8[qOff + 18] +
+      x[xb + 19] * cacheInt8[qOff + 19] +
+      x[xb + 20] * cacheInt8[qOff + 20] +
+      x[xb + 21] * cacheInt8[qOff + 21] +
+      x[xb + 22] * cacheInt8[qOff + 22] +
+      x[xb + 23] * cacheInt8[qOff + 23] +
+      x[xb + 24] * cacheInt8[qOff + 24] +
+      x[xb + 25] * cacheInt8[qOff + 25] +
+      x[xb + 26] * cacheInt8[qOff + 26] +
+      x[xb + 27] * cacheInt8[qOff + 27] +
+      x[xb + 28] * cacheInt8[qOff + 28] +
+      x[xb + 29] * cacheInt8[qOff + 29] +
+      x[xb + 30] * cacheInt8[qOff + 30] +
+      x[xb + 31] * cacheInt8[qOff + 31]
+
     sum = sum + blockSum * d
     bo = bo + Q8_0_BLOCK_SIZE
     xb = xb + 32
@@ -358,9 +389,40 @@ function accumQ8_0Cache(
     var scale = d * weight
     var qOff = bo + 2
 
-    for (var j = 0; j < 32; j = j + 1) {
-      out[ob + j] = out[ob + j] + cacheInt8[qOff + j] * scale
-    }
+    // Unrolled inner loop for JIT optimization
+    out[ob] = out[ob] + cacheInt8[qOff] * scale
+    out[ob + 1] = out[ob + 1] + cacheInt8[qOff + 1] * scale
+    out[ob + 2] = out[ob + 2] + cacheInt8[qOff + 2] * scale
+    out[ob + 3] = out[ob + 3] + cacheInt8[qOff + 3] * scale
+    out[ob + 4] = out[ob + 4] + cacheInt8[qOff + 4] * scale
+    out[ob + 5] = out[ob + 5] + cacheInt8[qOff + 5] * scale
+    out[ob + 6] = out[ob + 6] + cacheInt8[qOff + 6] * scale
+    out[ob + 7] = out[ob + 7] + cacheInt8[qOff + 7] * scale
+    out[ob + 8] = out[ob + 8] + cacheInt8[qOff + 8] * scale
+    out[ob + 9] = out[ob + 9] + cacheInt8[qOff + 9] * scale
+    out[ob + 10] = out[ob + 10] + cacheInt8[qOff + 10] * scale
+    out[ob + 11] = out[ob + 11] + cacheInt8[qOff + 11] * scale
+    out[ob + 12] = out[ob + 12] + cacheInt8[qOff + 12] * scale
+    out[ob + 13] = out[ob + 13] + cacheInt8[qOff + 13] * scale
+    out[ob + 14] = out[ob + 14] + cacheInt8[qOff + 14] * scale
+    out[ob + 15] = out[ob + 15] + cacheInt8[qOff + 15] * scale
+    out[ob + 16] = out[ob + 16] + cacheInt8[qOff + 16] * scale
+    out[ob + 17] = out[ob + 17] + cacheInt8[qOff + 17] * scale
+    out[ob + 18] = out[ob + 18] + cacheInt8[qOff + 18] * scale
+    out[ob + 19] = out[ob + 19] + cacheInt8[qOff + 19] * scale
+    out[ob + 20] = out[ob + 20] + cacheInt8[qOff + 20] * scale
+    out[ob + 21] = out[ob + 21] + cacheInt8[qOff + 21] * scale
+    out[ob + 22] = out[ob + 22] + cacheInt8[qOff + 22] * scale
+    out[ob + 23] = out[ob + 23] + cacheInt8[qOff + 23] * scale
+    out[ob + 24] = out[ob + 24] + cacheInt8[qOff + 24] * scale
+    out[ob + 25] = out[ob + 25] + cacheInt8[qOff + 25] * scale
+    out[ob + 26] = out[ob + 26] + cacheInt8[qOff + 26] * scale
+    out[ob + 27] = out[ob + 27] + cacheInt8[qOff + 27] * scale
+    out[ob + 28] = out[ob + 28] + cacheInt8[qOff + 28] * scale
+    out[ob + 29] = out[ob + 29] + cacheInt8[qOff + 29] * scale
+    out[ob + 30] = out[ob + 30] + cacheInt8[qOff + 30] * scale
+    out[ob + 31] = out[ob + 31] + cacheInt8[qOff + 31] * scale
+
     bo = bo + Q8_0_BLOCK_SIZE
     ob = ob + 32
   }
@@ -2202,11 +2264,13 @@ function createRunState(p) {
     kvCacheBytesPerVec: kvCacheBytesPerVec,
     ropeFreqs: ropeFreqs,
     ropeFreqsSwa: ropeFreqsSwa, // SWA RoPE frequencies for Gemma3
-    // RoPE sin/cos cache (avoids recomputing sin/cos for each head)
+    // RoPE sin/cos cache - separate caches for SWA and dense layers
     ropeCos: new Float32Array(ropeSize),
     ropeSin: new Float32Array(ropeSize),
-    ropeCachePos: -1, // position for which ropeCos/ropeSin are valid
-    ropeCacheIsSwa: -1, // 0 = cache is for dense layers, 1 = cache is for SWA layers
+    ropeCosSwa: new Float32Array(ropeSize),
+    ropeSinSwa: new Float32Array(ropeSize),
+    ropeCachePos: -1,
+    ropeCachePosSwa: -1,
     // Cached constants to avoid recomputation in transformer
     headSize: headSize,
     kvDim: kvDim,
@@ -2237,7 +2301,7 @@ function createRunState(p) {
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
-function transformer(token, pos) {
+function transformer(token, pos, computeLogits) {
   var w = weights
   var s = state
   // Use cached values from state instead of config lookups
@@ -2268,7 +2332,15 @@ function transformer(token, pos) {
   // Gemma: Scale embeddings by sqrt(dim) - use pre-computed value
   if (isGemma) {
     var scale = s.embedScale
-    for (var i = 0; i < dim; i = i + 1) {
+    var dim4 = dim & ~3
+    var i = 0
+    for (; i < dim4; i = i + 4) {
+      xArr[i] *= scale
+      xArr[i + 1] *= scale
+      xArr[i + 2] *= scale
+      xArr[i + 3] *= scale
+    }
+    for (; i < dim; i = i + 1) {
       xArr[i] *= scale
     }
   }
@@ -2312,33 +2384,44 @@ function transformer(token, pos) {
 
     // Apply RoPE using pre-computed frequencies and cached sin/cos
     // For Gemma3 with SWA: different layers use different RoPE frequencies
-    // SWA layers (most layers): use ropeFreqsSwa (theta=10000)
-    // Dense layers (every swaPattern-th): use ropeFreqs (theta=1000000)
-    // Pattern 6: layers 0,1,2,3,4 are SWA, layer 5 is dense, etc.
     var swaPattern = s.swaPattern
     var isSwaLayer = swaPattern > 0 && l % swaPattern < swaPattern - 1
-    var ropeFreqs = isGemma && isSwaLayer ? s.ropeFreqsSwa : s.ropeFreqs
-    var ropeCos = s.ropeCos
-    var ropeSin = s.ropeSin
     var half = headSize >> 1
     // Cache q and k array references for RoPE
     var qArr = s.q
     var kArr = s.k
 
-    // Compute sin/cos for this position and layer type
-    // Cache is invalidated when position changes OR when switching between SWA/dense layer types
-    var currentIsSwa = isSwaLayer ? 1 : 0
-    if (s.ropeCachePos !== pos || s.ropeCacheIsSwa !== currentIsSwa) {
-      for (var i = 0; i < half; i = i + 1) {
-        var val = pos * ropeFreqs[i]
-        ropeCos[i] = Math.cos(val)
-        ropeSin[i] = Math.sin(val)
+    // Use separate sin/cos caches for SWA and dense layers to avoid thrashing
+    var ropeCos, ropeSin
+    if (isGemma && isSwaLayer) {
+      if (s.ropeCachePosSwa !== pos) {
+        var ropeFreqs = s.ropeFreqsSwa
+        for (var i = 0; i < half; i = i + 1) {
+          var val = pos * ropeFreqs[i]
+          s.ropeCosSwa[i] = Math.cos(val)
+          s.ropeSinSwa[i] = Math.sin(val)
+        }
+        s.ropeCachePosSwa = pos
       }
-      s.ropeCachePos = pos
-      s.ropeCacheIsSwa = currentIsSwa
+      ropeCos = s.ropeCosSwa
+      ropeSin = s.ropeSinSwa
+    } else {
+      if (s.ropeCachePos !== pos) {
+        var ropeFreqs = s.ropeFreqs
+        for (var i = 0; i < half; i = i + 1) {
+          var val = pos * ropeFreqs[i]
+          s.ropeCos[i] = Math.cos(val)
+          s.ropeSin[i] = Math.sin(val)
+        }
+        s.ropeCachePos = pos
+      }
+      ropeCos = s.ropeCos
+      ropeSin = s.ropeSin
     }
 
     if (isGemma) {
+      // Fused RoPE + Q attention scaling (avoids separate scaling pass)
+      var attnScale = s.attnScale
       for (var h = 0; h < nHeads; h = h + 1) {
         var idx = h * headSize
         for (var i = 0; i < half; i = i + 1) {
@@ -2346,8 +2429,8 @@ function transformer(token, pos) {
           var fci = ropeSin[i]
           var v0 = qArr[idx + i]
           var v1 = qArr[idx + i + half]
-          qArr[idx + i] = v0 * fcr - v1 * fci
-          qArr[idx + i + half] = v0 * fci + v1 * fcr
+          qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
+          qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
         }
       }
       for (var h = 0; h < nKvHeads; h = h + 1) {
@@ -2381,14 +2464,6 @@ function transformer(token, pos) {
       }
     }
 
-    // Gemma: Scale Q by attention_scale - use pre-computed value
-    if (isGemma) {
-      var attnScale = s.attnScale
-      for (var i = 0; i < qDim; i = i + 1) {
-        qArr[i] *= attnScale
-      }
-    }
-
     // Q8_0 KV cache: use byte offsets
     var kvBytesPerVec = s.kvCacheBytesPerVec
     var loff = l * s.kvCacheLayerSize // layer offset in bytes
@@ -2418,6 +2493,9 @@ function transformer(token, pos) {
     // Bytes per KV head = (headSize / 32) * 34
     var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
 
+    // SWA: limit attention to sliding window for SWA layers
+    var startT = isSwaLayer && config.swaWindow > 0 ? Math.max(0, pos - config.swaWindow + 1) : 0
+
     for (var h = 0; h < nHeads; h = h + 1) {
       var qOffset = h * headSize
       var attOffset = h * seqLen
@@ -2427,7 +2505,7 @@ function transformer(token, pos) {
 
       // Compute attention scores using Q8_0 dot product
       var kBase = loff + kvHeadByteOff
-      for (var t = 0; t <= pos; t = t + 1) {
+      for (var t = startT; t <= pos; t = t + 1) {
         var kByteOffset = kBase + t * kvBytesPerVec
         var score = dotQ8_0Cache(
           qArr,
@@ -2440,29 +2518,29 @@ function transformer(token, pos) {
         sAtt[attOffset + t] = score * attScale
       }
 
-      // Inline softmax to avoid subarray allocation
-      var softmaxSize = pos + 1
-      var maxVal = sAtt[attOffset]
-      for (var i = 1; i < softmaxSize; i = i + 1) {
-        if (sAtt[attOffset + i] > maxVal) {
-          maxVal = sAtt[attOffset + i]
+      // Inline softmax over sliding window range
+      var maxVal = sAtt[attOffset + startT]
+      var softmaxEnd = attOffset + pos
+      for (var i = attOffset + startT + 1; i <= softmaxEnd; i = i + 1) {
+        if (sAtt[i] > maxVal) {
+          maxVal = sAtt[i]
         }
       }
       var expSum = 0.0
-      for (var i = 0; i < softmaxSize; i = i + 1) {
-        var e = Math.exp(sAtt[attOffset + i] - maxVal)
-        sAtt[attOffset + i] = e
+      for (var i = attOffset + startT; i <= softmaxEnd; i = i + 1) {
+        var e = Math.exp(sAtt[i] - maxVal)
+        sAtt[i] = e
         expSum = expSum + e
       }
       var invSum = 1.0 / expSum
-      for (var i = 0; i < softmaxSize; i = i + 1) {
-        sAtt[attOffset + i] = sAtt[attOffset + i] * invSum
+      for (var i = attOffset + startT; i <= softmaxEnd; i = i + 1) {
+        sAtt[i] = sAtt[i] * invSum
       }
 
       // Accumulate weighted values using Q8_0 cache
       var xbOffset = h * headSize
       var vBase = loff + kvHeadByteOff
-      for (var t = 0; t <= pos; t = t + 1) {
+      for (var t = startT; t <= pos; t = t + 1) {
         var vByteOffset = vBase + t * kvBytesPerVec
         var a = sAtt[attOffset + t]
         accumQ8_0Cache(
@@ -2570,15 +2648,16 @@ function transformer(token, pos) {
     rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
   }
 
-  // Classifier into logits - use quantized matmul for both cases
-  // (tied embeddings are now kept quantized to save memory)
-  matmulQuantized(s.logits, xArr, w.wcls)
+  // Classifier into logits - skip during prompt prefill for speed
+  if (computeLogits !== false) {
+    matmulQuantized(s.logits, xArr, w.wcls)
 
-  if (isGemma && config.finalLogitSoftcapping > 0) {
-    var cap = config.finalLogitSoftcapping
-    var vocabSize = s.vocabSize
-    for (var i = 0; i < vocabSize; i = i + 1) {
-      s.logits[i] = cap * Math.tanh(s.logits[i] / cap)
+    if (isGemma && config.finalLogitSoftcapping > 0) {
+      var cap = config.finalLogitSoftcapping
+      var vocabSize = s.vocabSize
+      for (var i = 0; i < vocabSize; i = i + 1) {
+        s.logits[i] = cap * Math.tanh(s.logits[i] / cap)
+      }
     }
   }
 }
@@ -3109,9 +3188,6 @@ function generate(chatHistory) {
     promptTokens = [tokenizer.bosToken]
   }
 
-  state.keyCache.fill(0)
-  state.valueCache.fill(0)
-
   var token = promptTokens[0]
   var pos = 0
   var output = ""
@@ -3124,7 +3200,7 @@ function generate(chatHistory) {
     : new TextDecoder("utf-8", { fatal: false })
 
   for (var step = 0; step < maxTokens; step = step + 1) {
-    transformer(token, pos)
+    transformer(token, pos, pos >= numPromptTokens - 1)
 
     var next
     if (pos < numPromptTokens - 1) {
