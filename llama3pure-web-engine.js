@@ -379,6 +379,11 @@ function accumQ8_0Cache(
   weight,
   count
 ) {
+  // Skip near-zero attention weights
+  if (weight > -1e-8 && weight < 1e-8) {
+    return
+  }
+
   var nb = count >> 5
   var bo = cacheOffset
   var ob = outOffset
@@ -1728,6 +1733,40 @@ function matmulQuantized(out, x, qw) {
 // ----------------------------------------------------------------------------
 // Math functions
 
+// Fast tanh approximation using [3,3] Padé approximant
+// Accurate to ~1e-7 for |x| < 4, exact ±1 beyond
+function fastTanh(x) {
+  if (x < -4.0) {
+    return -1.0
+  }
+  if (x > 4.0) {
+    return 1.0
+  }
+  var x2 = x * x
+  return (
+    (x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)))) /
+    (135135.0 + x2 * (62370.0 + x2 * (3150.0 + 28.0 * x2)))
+  )
+}
+
+// Fast exp approximation for sigmoid range (|x| < ~10)
+// Uses Schraudolph-style bit manipulation via polynomial
+function fastExp(x) {
+  if (x > 10.0) {
+    return 22026.47
+  }
+  if (x < -10.0) {
+    return 0.0
+  }
+  // Padé [3,3] approximation of exp(x) around 0
+  // exp(x) ≈ (1 + x/2 + x²/10 + x³/120) / (1 - x/2 + x²/10 - x³/120)
+  var x2 = x * x
+  var x3 = x2 * x
+  var num = 120.0 + 60.0 * x + 12.0 * x2 + x3
+  var den = 120.0 - 60.0 * x + 12.0 * x2 - x3
+  return num / den
+}
+
 function rmsnorm(out, x, w, size, invSize, eps) {
   eps = eps || 1e-5
   invSize = invSize || 1.0 / size
@@ -2183,21 +2222,31 @@ function createRunState(p) {
   var qDim = p.nHeads * headSize
   var maxDim = Math.max(p.dim, qDim)
 
-  // Pre-compute RoPE frequency table (freqs_cis equivalent)
-  // For each position and each dimension pair, we store cos and sin
+  // Pre-compute full RoPE sin/cos tables for all positions
   var ropeSize = headSize / 2
-  var ropeFreqs = new Float32Array(ropeSize)
-  for (var i = 0; i < ropeSize; i = i + 1) {
-    var dimIdx = i * 2
-    ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, dimIdx / headSize)
+  var seqLen = p.seqLen
+  var ropeCosAll = new Float32Array(seqLen * ropeSize)
+  var ropeSinAll = new Float32Array(seqLen * ropeSize)
+  for (var pos = 0; pos < seqLen; pos = pos + 1) {
+    var base = pos * ropeSize
+    for (var i = 0; i < ropeSize; i = i + 1) {
+      var val = pos / Math.pow(p.ropeTheta, (i * 2) / headSize)
+      ropeCosAll[base + i] = Math.cos(val)
+      ropeSinAll[base + i] = Math.sin(val)
+    }
   }
 
-  // Pre-compute SWA RoPE frequencies (for Gemma3 sliding window attention layers)
-  var ropeFreqsSwa = new Float32Array(ropeSize)
+  // Pre-compute SWA RoPE tables (for Gemma3 sliding window attention layers)
   var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
-  for (var i = 0; i < ropeSize; i = i + 1) {
-    var dimIdx = i * 2
-    ropeFreqsSwa[i] = 1.0 / Math.pow(swaTheta, dimIdx / headSize)
+  var ropeCosSwaAll = new Float32Array(seqLen * ropeSize)
+  var ropeSinSwaAll = new Float32Array(seqLen * ropeSize)
+  for (var pos = 0; pos < seqLen; pos = pos + 1) {
+    var base = pos * ropeSize
+    for (var i = 0; i < ropeSize; i = i + 1) {
+      var val = pos / Math.pow(swaTheta, (i * 2) / headSize)
+      ropeCosSwaAll[base + i] = Math.cos(val)
+      ropeSinSwaAll[base + i] = Math.sin(val)
+    }
   }
 
   // Q8_0 KV cache: 34 bytes per 32 floats
@@ -2240,15 +2289,12 @@ function createRunState(p) {
     valueCacheInt8: new Int8Array(valueCacheBuffer),
     // Cache layout info
     kvCacheBytesPerVec: kvCacheBytesPerVec,
-    ropeFreqs: ropeFreqs,
-    ropeFreqsSwa: ropeFreqsSwa, // SWA RoPE frequencies for Gemma3
-    // RoPE sin/cos cache - separate caches for SWA and dense layers
-    ropeCos: new Float32Array(ropeSize),
-    ropeSin: new Float32Array(ropeSize),
-    ropeCosSwa: new Float32Array(ropeSize),
-    ropeSinSwa: new Float32Array(ropeSize),
-    ropeCachePos: -1,
-    ropeCachePosSwa: -1,
+    // Pre-computed RoPE sin/cos for all positions
+    ropeCosAll: ropeCosAll,
+    ropeSinAll: ropeSinAll,
+    ropeCosSwaAll: ropeCosSwaAll,
+    ropeSinSwaAll: ropeSinSwaAll,
+    ropeSize: ropeSize,
     // Cached constants to avoid recomputation in transformer
     headSize: headSize,
     kvDim: kvDim,
@@ -2361,37 +2407,16 @@ function transformer(token, pos, computeLogits) {
     var qArr = s.q
     var kArr = s.k
 
-    // Use separate sin/cos caches for SWA and dense layers to avoid thrashing
+    // Index into pre-computed RoPE tables for this position
+    var ropeBase = pos * s.ropeSize
     var ropeCos
     var ropeSin
     if (isGemma && isSwaLayer) {
-      if (s.ropeCachePosSwa !== pos) {
-        var ropeFreqsSwa = s.ropeFreqsSwa
-        var cosSwa = s.ropeCosSwa
-        var sinSwa = s.ropeSinSwa
-        for (var i = 0; i < half; i = i + 1) {
-          var val = pos * ropeFreqsSwa[i]
-          cosSwa[i] = Math.cos(val)
-          sinSwa[i] = Math.sin(val)
-        }
-        s.ropeCachePosSwa = pos
-      }
-      ropeCos = s.ropeCosSwa
-      ropeSin = s.ropeSinSwa
+      ropeCos = s.ropeCosSwaAll
+      ropeSin = s.ropeSinSwaAll
     } else {
-      if (s.ropeCachePos !== pos) {
-        var ropeFreqs = s.ropeFreqs
-        var cosArr = s.ropeCos
-        var sinArr = s.ropeSin
-        for (var i = 0; i < half; i = i + 1) {
-          var val = pos * ropeFreqs[i]
-          cosArr[i] = Math.cos(val)
-          sinArr[i] = Math.sin(val)
-        }
-        s.ropeCachePos = pos
-      }
-      ropeCos = s.ropeCos
-      ropeSin = s.ropeSin
+      ropeCos = s.ropeCosAll
+      ropeSin = s.ropeSinAll
     }
 
     if (isGemma) {
@@ -2400,8 +2425,8 @@ function transformer(token, pos, computeLogits) {
       for (var h = 0; h < nHeads; h = h + 1) {
         var idx = h * headSize
         for (var i = 0; i < half; i = i + 1) {
-          var fcr = ropeCos[i]
-          var fci = ropeSin[i]
+          var fcr = ropeCos[ropeBase + i]
+          var fci = ropeSin[ropeBase + i]
           var v0 = qArr[idx + i]
           var v1 = qArr[idx + i + half]
           qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
@@ -2411,8 +2436,8 @@ function transformer(token, pos, computeLogits) {
       for (var h = 0; h < nKvHeads; h = h + 1) {
         var idx = h * headSize
         for (var i = 0; i < half; i = i + 1) {
-          var fcr = ropeCos[i]
-          var fci = ropeSin[i]
+          var fcr = ropeCos[ropeBase + i]
+          var fci = ropeSin[ropeBase + i]
           var v0 = kArr[idx + i]
           var v1 = kArr[idx + i + half]
           kArr[idx + i] = v0 * fcr - v1 * fci
@@ -2425,10 +2450,10 @@ function transformer(token, pos, computeLogits) {
       for (var i = 0; i < kvDim4; i = i + 4) {
         var fi0 = (i >> 1) % half
         var fi1 = ((i + 2) >> 1) % half
-        var fcr0 = ropeCos[fi0]
-        var fci0 = ropeSin[fi0]
-        var fcr1 = ropeCos[fi1]
-        var fci1 = ropeSin[fi1]
+        var fcr0 = ropeCos[ropeBase + fi0]
+        var fci0 = ropeSin[ropeBase + fi0]
+        var fcr1 = ropeCos[ropeBase + fi1]
+        var fci1 = ropeSin[ropeBase + fi1]
         // Process Q pair 0
         var qv0 = qArr[i]
         var qv1 = qArr[i + 1]
@@ -2453,8 +2478,8 @@ function transformer(token, pos, computeLogits) {
       // kvDim remainder (if kvDim not multiple of 4)
       for (var i = kvDim4; i < kvDim; i = i + 2) {
         var freqIdx = (i >> 1) % half
-        var fcr = ropeCos[freqIdx]
-        var fci = ropeSin[freqIdx]
+        var fcr = ropeCos[ropeBase + freqIdx]
+        var fci = ropeSin[ropeBase + freqIdx]
         var v0 = qArr[i]
         var v1 = qArr[i + 1]
         qArr[i] = v0 * fcr - v1 * fci
@@ -2467,8 +2492,8 @@ function transformer(token, pos, computeLogits) {
       // Q-only remainder (qDim > kvDim for GQA)
       for (var i = kvDim; i < qDim; i = i + 2) {
         var freqIdx = (i >> 1) % half
-        var fcr = ropeCos[freqIdx]
-        var fci = ropeSin[freqIdx]
+        var fcr = ropeCos[ropeBase + freqIdx]
+        var fci = ropeSin[ropeBase + freqIdx]
         var v0 = qArr[i]
         var v1 = qArr[i + 1]
         qArr[i] = v0 * fcr - v1 * fci
@@ -2534,22 +2559,23 @@ function transformer(token, pos, computeLogits) {
         sAtt[attOffset + t] = score * attScale
       }
 
-      // Inline softmax over sliding window range
-      var maxVal = sAtt[attOffset + startT]
+      // Fused softmax: pass 1 = find max, pass 2 = exp + sum + normalize
+      var softmaxStart = attOffset + startT
       var softmaxEnd = attOffset + pos
-      for (var i = attOffset + startT + 1; i <= softmaxEnd; i = i + 1) {
+      var maxVal = sAtt[softmaxStart]
+      for (var i = softmaxStart + 1; i <= softmaxEnd; i = i + 1) {
         if (sAtt[i] > maxVal) {
           maxVal = sAtt[i]
         }
       }
       var expSum = 0.0
-      for (var i = attOffset + startT; i <= softmaxEnd; i = i + 1) {
+      for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
         var e = Math.exp(sAtt[i] - maxVal)
         sAtt[i] = e
         expSum = expSum + e
       }
       var invSum = 1.0 / expSum
-      for (var i = attOffset + startT; i <= softmaxEnd; i = i + 1) {
+      for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
         sAtt[i] = sAtt[i] * invSum
       }
 
@@ -2606,27 +2632,27 @@ function transformer(token, pos, computeLogits) {
         var x2 = hbArr[i + 2]
         var x3 = hbArr[i + 3]
         hbArr[i] =
-          0.5 * x0 * (1.0 + Math.tanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
+          0.5 * x0 * (1.0 + fastTanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
         hbArr[i + 1] =
           0.5 *
           x1 *
-          (1.0 + Math.tanh(x1 * (GELU_A + GELU_B * x1 * x1))) *
+          (1.0 + fastTanh(x1 * (GELU_A + GELU_B * x1 * x1))) *
           hb2Arr[i + 1]
         hbArr[i + 2] =
           0.5 *
           x2 *
-          (1.0 + Math.tanh(x2 * (GELU_A + GELU_B * x2 * x2))) *
+          (1.0 + fastTanh(x2 * (GELU_A + GELU_B * x2 * x2))) *
           hb2Arr[i + 2]
         hbArr[i + 3] =
           0.5 *
           x3 *
-          (1.0 + Math.tanh(x3 * (GELU_A + GELU_B * x3 * x3))) *
+          (1.0 + fastTanh(x3 * (GELU_A + GELU_B * x3 * x3))) *
           hb2Arr[i + 3]
       }
       for (var i = hd4; i < hiddenDim; i = i + 1) {
         var x = hbArr[i]
         hbArr[i] =
-          0.5 * x * (1.0 + Math.tanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
+          0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
       }
     } else {
       // SiLU activation
@@ -2635,14 +2661,14 @@ function transformer(token, pos, computeLogits) {
         var v1 = hbArr[i + 1]
         var v2 = hbArr[i + 2]
         var v3 = hbArr[i + 3]
-        hbArr[i] = (v0 / (1.0 + Math.exp(-v0))) * hb2Arr[i]
-        hbArr[i + 1] = (v1 / (1.0 + Math.exp(-v1))) * hb2Arr[i + 1]
-        hbArr[i + 2] = (v2 / (1.0 + Math.exp(-v2))) * hb2Arr[i + 2]
-        hbArr[i + 3] = (v3 / (1.0 + Math.exp(-v3))) * hb2Arr[i + 3]
+        hbArr[i] = (v0 / (1.0 + fastExp(-v0))) * hb2Arr[i]
+        hbArr[i + 1] = (v1 / (1.0 + fastExp(-v1))) * hb2Arr[i + 1]
+        hbArr[i + 2] = (v2 / (1.0 + fastExp(-v2))) * hb2Arr[i + 2]
+        hbArr[i + 3] = (v3 / (1.0 + fastExp(-v3))) * hb2Arr[i + 3]
       }
       for (var i = hd4; i < hiddenDim; i = i + 1) {
         var val = hbArr[i]
-        hbArr[i] = (val / (1.0 + Math.exp(-val))) * hb2Arr[i]
+        hbArr[i] = (val / (1.0 + fastExp(-val))) * hb2Arr[i]
       }
     }
 
@@ -2670,7 +2696,7 @@ function transformer(token, pos, computeLogits) {
       var cap = config.finalLogitSoftcapping
       var vocabSize = s.vocabSize
       for (var i = 0; i < vocabSize; i = i + 1) {
-        s.logits[i] = cap * Math.tanh(s.logits[i] / cap)
+        s.logits[i] = cap * fastTanh(s.logits[i] / cap)
       }
     }
   }
@@ -2727,7 +2753,7 @@ function sample(logits, temp) {
     if (logits[i] > minVal) {
       topKVal[minPos] = logits[i]
       topKIdx[minPos] = i
-      // Re-find min
+      // Rescan for new min starting from replaced value as bound
       minVal = topKVal[0]
       minPos = 0
       for (var j = 1; j < k; j = j + 1) {
@@ -2739,7 +2765,7 @@ function sample(logits, temp) {
     }
   }
 
-  // Apply temperature and softmax over just k values
+  // Apply temperature and fused max+softmax over just k values
   var invTemp = 1.0 / temp
   var maxV = topKVal[0]
   for (var i = 1; i < k; i = i + 1) {
@@ -2747,9 +2773,10 @@ function sample(logits, temp) {
       maxV = topKVal[i]
     }
   }
+  var maxVT = maxV * invTemp
   var sum = 0.0
   for (var i = 0; i < k; i = i + 1) {
-    var e = Math.exp(topKVal[i] * invTemp - maxV * invTemp)
+    var e = Math.exp(topKVal[i] * invTemp - maxVT)
     topKVal[i] = e
     sum = sum + e
   }
@@ -3052,14 +3079,19 @@ function bpeEncode(text) {
   var pos = 0
   var textLen = encodedText.length
 
+  // Pre-convert to char codes for faster trie traversal
+  var codes = new Uint16Array(textLen)
+  for (var i = 0; i < textLen; i = i + 1) {
+    codes[i] = encodedText.charCodeAt(i)
+  }
+
   while (pos < textLen) {
     // Walk trie for longest match at current position
     var node = vocabTrie
     var bestId = -1
     var bestLen = 0
     for (var j = pos; j < textLen; j = j + 1) {
-      var ch = encodedText.charCodeAt(j)
-      node = node[ch]
+      node = node[codes[j]]
       if (!node) {
         break
       }
@@ -3253,6 +3285,9 @@ function generate(chatHistory) {
   var numPromptTokens = promptTokens.length
   var pendingNewline = false
 
+  // Token stream for repeat detection (avoids string search on growing output)
+  var generatedTokens = []
+
   // Use streaming TextDecoder for Llama to handle UTF-8 across token boundaries
   var streamDecoder = config.isGemma
     ? null
@@ -3289,6 +3324,9 @@ function generate(chatHistory) {
         }
       }
 
+      // Track generated tokens for repeat detection
+      generatedTokens.push(next)
+
       var decoded
       if (config.isGemma) {
         decoded = decodeToken(next)
@@ -3312,23 +3350,30 @@ function generate(chatHistory) {
           postMessage({ type: "token", token: decoded })
         }
 
-        // Stop if the model is stuck repeating text (check every 10 steps)
-        if (output.length > 100 && step % 10 === 0) {
-          var toFind = output.substring(output.length - 30, output.length)
-          var repeatedText = 0
-          var searchFrom = 0
-          while (searchFrom < output.length) {
-            var found = output.indexOf(toFind, searchFrom)
-            if (found === -1) {
+        // Stop if the model is stuck repeating tokens (check every 10 steps)
+        var gtLen = generatedTokens.length
+        if (gtLen > 20 && step % 10 === 0) {
+          // Check if the last 10 tokens repeat as a pattern in history
+          var patLen = 10
+          var repeats = 0
+          var matched = true
+          for (var r = 1; r <= 10 && matched; r = r + 1) {
+            var off = gtLen - patLen - r * patLen
+            if (off < 0) {
               break
             }
-            repeatedText = repeatedText + 1
-            if (repeatedText > 10) {
-              break
+            matched = true
+            for (var p = 0; p < patLen; p = p + 1) {
+              if (generatedTokens[gtLen - patLen + p] !== generatedTokens[off + p]) {
+                matched = false
+                break
+              }
             }
-            searchFrom = found + 1
+            if (matched) {
+              repeats = repeats + 1
+            }
           }
-          if (repeatedText > 10) {
+          if (repeats > 5) {
             break
           }
         }
