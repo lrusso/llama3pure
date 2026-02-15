@@ -417,6 +417,18 @@ static inline float fp16_to_fp32(uint16_t h) {
     return fp16_table[h];
 }
 
+// FP32 to FP16 conversion (for Q8_0 input quantization)
+static inline uint16_t fp32_to_fp16(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int exp = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = x & 0x7FFFFF;
+    if (exp <= 0) return sign;
+    if (exp >= 31) return sign | 0x7C00;
+    return sign | (exp << 10) | (mant >> 13);
+}
+
 // BF16 (bfloat16) to FP32 conversion
 // BF16 is simply the upper 16 bits of a float32
 static inline float bf16_to_fp32(uint16_t h) {
@@ -1260,6 +1272,449 @@ static inline float vec_dot_f32(const float* x, const void* w, int n) {
     return sum;
 }
 
+// ----------------------------------------------------------------------------
+// Quantized input (Q8_0) dot products - integer arithmetic for faster matmul
+// Quantize input x to Q8_0 once, then use int8*int dot products per row
+
+// Global Q8_0 buffer for quantized input (allocated once, reused per matmul)
+static block_q8_0* q8_buf = NULL;
+static int q8_buf_size = 0;  // number of blocks allocated
+
+// Quantize a float vector to Q8_0 format
+static void quantize_row_q8_0(const float* x, block_q8_0* y, int n) {
+    int nb = n / QK8_0;
+    for (int i = 0; i < nb; i++) {
+        const float* xb = x + i * QK8_0;
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; j++) {
+            float v = xb[j] < 0 ? -xb[j] : xb[j];
+            if (v > amax) amax = v;
+        }
+        float d = amax / 127.0f;
+        float id = d > 0.0f ? 127.0f / amax : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        for (int j = 0; j < QK8_0; j++) {
+            float v = xb[j] * id;
+            int q = (int)roundf(v);
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            y[i].qs[j] = (int8_t)q;
+        }
+    }
+}
+
+// Q8_0 input dot product for Q4_0 weights
+static inline float vec_dot_q4_0_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q4_0* y = (const block_q4_0*)vy;
+    int nb = n / QK4_0;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float dx = fp16_to_fp32(xq[i].d);
+        const uint8_t* qs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0;
+        for (int j = 0; j < 16; j++) {
+            uint8_t qByte = qs[j];
+            isum += xqs[j] * ((qByte & 0x0F) - 8)
+                  + xqs[j + 16] * ((qByte >> 4) - 8);
+        }
+        sum += dw * dx * (float)isum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q4_1 weights
+static inline float vec_dot_q4_1_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q4_1* y = (const block_q4_1*)vy;
+    int nb = n / QK4_1;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float mw = fp16_to_fp32(y[i].m);
+        float dx = fp16_to_fp32(xq[i].d);
+        const uint8_t* qs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0, xsum = 0;
+        for (int j = 0; j < 16; j++) {
+            uint8_t qByte = qs[j];
+            isum += xqs[j] * (qByte & 0x0F) + xqs[j + 16] * (qByte >> 4);
+            xsum += xqs[j] + xqs[j + 16];
+        }
+        sum += dw * dx * (float)isum + mw * dx * (float)xsum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q5_0 weights
+static inline float vec_dot_q5_0_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q5_0* y = (const block_q5_0*)vy;
+    int nb = n / QK5_0;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float dx = fp16_to_fp32(xq[i].d);
+        uint32_t qh = y[i].qh[0] | ((uint32_t)y[i].qh[1] << 8)
+                     | ((uint32_t)y[i].qh[2] << 16) | ((uint32_t)y[i].qh[3] << 24);
+        const uint8_t* qs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0;
+        for (int j = 0; j < 16; j++) {
+            int xh_0 = ((qh >> j) & 1) << 4;
+            int xh_1 = ((qh >> (j + 16)) & 1) << 4;
+            uint8_t qByte = qs[j];
+            isum += xqs[j] * (((qByte & 0x0F) | xh_0) - 16)
+                  + xqs[j + 16] * (((qByte >> 4) | xh_1) - 16);
+        }
+        sum += dw * dx * (float)isum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q5_1 weights
+static inline float vec_dot_q5_1_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q5_1* y = (const block_q5_1*)vy;
+    int nb = n / QK5_1;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float mw = fp16_to_fp32(y[i].m);
+        float dx = fp16_to_fp32(xq[i].d);
+        uint32_t qh = y[i].qh[0] | ((uint32_t)y[i].qh[1] << 8)
+                     | ((uint32_t)y[i].qh[2] << 16) | ((uint32_t)y[i].qh[3] << 24);
+        const uint8_t* qs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0, xsum = 0;
+        for (int j = 0; j < 16; j++) {
+            int xh_0 = ((qh >> j) & 1) << 4;
+            int xh_1 = ((qh >> (j + 16)) & 1) << 4;
+            uint8_t qByte = qs[j];
+            isum += xqs[j] * ((qByte & 0x0F) | xh_0)
+                  + xqs[j + 16] * ((qByte >> 4) | xh_1);
+            xsum += xqs[j] + xqs[j + 16];
+        }
+        sum += dw * dx * (float)isum + mw * dx * (float)xsum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q8_0 weights (int8 * int8)
+static inline float vec_dot_q8_0_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q8_0* y = (const block_q8_0*)vy;
+    int nb = n / QK8_0;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float dx = fp16_to_fp32(xq[i].d);
+        const int8_t* wqs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0;
+        for (int j = 0; j < 32; j++) {
+            isum += xqs[j] * wqs[j];
+        }
+        sum += dw * dx * (float)isum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q2_K weights
+static inline float vec_dot_q2_K_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q2_K* y = (const block_q2_K*)vy;
+    int nb = n / QK_K;
+    float sum = 0.0f;
+    int xq_idx = 0;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(y[i].d);
+        float dmin = fp16_to_fp32(y[i].dmin);
+        const uint8_t* q = y[i].qs;
+        int is = 0;
+        int q_idx = 0;
+        float blockSum = 0.0f;
+        for (int nOuter = 0; nOuter < 256; nOuter += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dx = fp16_to_fp32(xq[xq_idx].d);
+                const int8_t* xqs = xq[xq_idx].qs;
+                uint8_t sc = y[i].scales[is++];
+                float dl = d * (sc & 0xF);
+                float ml = dmin * (sc >> 4);
+                int isum1 = 0, xsum1 = 0;
+                for (int l = 0; l < 16; l++) {
+                    isum1 += xqs[l] * ((q[q_idx + l] >> shift) & 3);
+                    xsum1 += xqs[l];
+                }
+                sc = y[i].scales[is++];
+                float dl2 = d * (sc & 0xF);
+                float ml2 = dmin * (sc >> 4);
+                int isum2 = 0, xsum2 = 0;
+                for (int l = 0; l < 16; l++) {
+                    isum2 += xqs[16 + l] * ((q[q_idx + 16 + l] >> shift) & 3);
+                    xsum2 += xqs[16 + l];
+                }
+                blockSum += dx * (dl * isum1 - ml * xsum1 + dl2 * isum2 - ml2 * xsum2);
+                shift += 2;
+                xq_idx++;
+            }
+            q_idx += 32;
+        }
+        sum += blockSum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q3_K weights
+static inline float vec_dot_q3_K_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q3_K* y = (const block_q3_K*)vy;
+    int nb = n / QK_K;
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    float sum = 0.0f;
+    int xq_idx = 0;
+    for (int i = 0; i < nb; i++) {
+        float d_all = fp16_to_fp32(y[i].d);
+        const uint8_t* q = y[i].qs;
+        const uint8_t* hm = y[i].hmask;
+
+        uint32_t aux[4];
+        const int8_t* scales = (const int8_t*)aux;
+        memcpy(aux, y[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+        int is = 0;
+        uint8_t m = 1;
+        int q_idx = 0;
+        float blockSum = 0.0f;
+        for (int nOuter = 0; nOuter < 256; nOuter += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                float dx = fp16_to_fp32(xq[xq_idx].d);
+                const int8_t* xqs = xq[xq_idx].qs;
+                float dl = d_all * (scales[is++] - 32);
+                int isum1 = 0;
+                for (int l = 0; l < 16; l++) {
+                    int qv = ((q[q_idx + l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4);
+                    isum1 += xqs[l] * qv;
+                }
+                float dl2 = d_all * (scales[is++] - 32);
+                int isum2 = 0;
+                for (int l = 0; l < 16; l++) {
+                    int qv = ((q[q_idx + l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4);
+                    isum2 += xqs[16 + l] * qv;
+                }
+                blockSum += dx * (dl * isum1 + dl2 * isum2);
+                shift += 2;
+                m <<= 1;
+                xq_idx++;
+            }
+            q_idx += 32;
+        }
+        sum += blockSum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q4_K weights
+static inline float vec_dot_q4_K_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q4_K* y = (const block_q4_K*)vy;
+    int nb = n / QK_K;
+    float sum = 0.0f;
+    int xq_idx = 0;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(y[i].d);
+        float dmin = fp16_to_fp32(y[i].dmin);
+        const uint8_t* q = y[i].qs;
+        int is = 0;
+        float blockSum = 0.0f;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m_val;
+            get_scale_min_k4(is + 0, y[i].scales, &sc, &m_val);
+            float d1 = d * sc;
+            float dm1 = dmin * m_val;
+            get_scale_min_k4(is + 1, y[i].scales, &sc, &m_val);
+            float d2 = d * sc;
+            float dm2 = dmin * m_val;
+
+            float dx0 = fp16_to_fp32(xq[xq_idx].d);
+            const int8_t* xqs0 = xq[xq_idx].qs;
+            float dx1 = fp16_to_fp32(xq[xq_idx + 1].d);
+            const int8_t* xqs1 = xq[xq_idx + 1].qs;
+            int isum0 = 0, xsum0 = 0, isum1 = 0, xsum1 = 0;
+            for (int l = 0; l < 32; l++) {
+                uint8_t qByte = q[l];
+                isum0 += xqs0[l] * (qByte & 0xF);
+                xsum0 += xqs0[l];
+                isum1 += xqs1[l] * (qByte >> 4);
+                xsum1 += xqs1[l];
+            }
+            blockSum += d1 * dx0 * isum0 - dm1 * dx0 * xsum0
+                      + d2 * dx1 * isum1 - dm2 * dx1 * xsum1;
+            q += 32;
+            is += 2;
+            xq_idx += 2;
+        }
+        sum += blockSum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q5_K weights
+static inline float vec_dot_q5_K_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q5_K* y = (const block_q5_K*)vy;
+    int nb = n / QK_K;
+    float sum = 0.0f;
+    int xq_idx = 0;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(y[i].d);
+        float dmin = fp16_to_fp32(y[i].dmin);
+        const uint8_t* ql = y[i].qs;
+        const uint8_t* qh = y[i].qh;
+        int is = 0;
+        uint8_t u1 = 1, u2 = 2;
+        int ql_idx = 0;
+        float blockSum = 0.0f;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m_val;
+            get_scale_min_k4(is + 0, y[i].scales, &sc, &m_val);
+            float d1 = d * sc;
+            float m1 = dmin * m_val;
+            get_scale_min_k4(is + 1, y[i].scales, &sc, &m_val);
+            float d2 = d * sc;
+            float m2 = dmin * m_val;
+
+            float dx0 = fp16_to_fp32(xq[xq_idx].d);
+            const int8_t* xqs0 = xq[xq_idx].qs;
+            float dx1 = fp16_to_fp32(xq[xq_idx + 1].d);
+            const int8_t* xqs1 = xq[xq_idx + 1].qs;
+            int isum0 = 0, xsum0 = 0, isum1 = 0, xsum1 = 0;
+            for (int l = 0; l < 32; l++) {
+                int qw_lo = (ql[ql_idx + l] & 0xF) + ((qh[l] & u1) ? 16 : 0);
+                int qw_hi = (ql[ql_idx + l] >> 4) + ((qh[l] & u2) ? 16 : 0);
+                isum0 += xqs0[l] * qw_lo;
+                xsum0 += xqs0[l];
+                isum1 += xqs1[l] * qw_hi;
+                xsum1 += xqs1[l];
+            }
+            blockSum += d1 * dx0 * isum0 - m1 * dx0 * xsum0
+                      + d2 * dx1 * isum1 - m2 * dx1 * xsum1;
+            ql_idx += 32;
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+            xq_idx += 2;
+        }
+        sum += blockSum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for Q6_K weights
+static inline float vec_dot_q6_K_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_q6_K* y = (const block_q6_K*)vy;
+    int nb = n / QK_K;
+    float sum = 0.0f;
+    int xq_idx = 0;
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(y[i].d);
+        const uint8_t* ql = y[i].ql;
+        const uint8_t* qh = y[i].qh;
+        const int8_t* sc = y[i].scales;
+        float blockSum = 0.0f;
+        for (int nOuter = 0; nOuter < 256; nOuter += 128) {
+            int sc_base = (nOuter >> 7) * 8;
+            int ql_base = nOuter >> 1;
+            int qh_base = nOuter >> 2;
+            float dx0 = fp16_to_fp32(xq[xq_idx].d);
+            const int8_t* xqs0 = xq[xq_idx].qs;
+            float dx1 = fp16_to_fp32(xq[xq_idx + 1].d);
+            const int8_t* xqs1 = xq[xq_idx + 1].qs;
+            float dx2 = fp16_to_fp32(xq[xq_idx + 2].d);
+            const int8_t* xqs2 = xq[xq_idx + 2].qs;
+            float dx3 = fp16_to_fp32(xq[xq_idx + 3].d);
+            const int8_t* xqs3 = xq[xq_idx + 3].qs;
+            float ds0 = d * sc[sc_base + 0], ds1 = d * sc[sc_base + 1];
+            float ds2 = d * sc[sc_base + 2], ds3 = d * sc[sc_base + 3];
+            float ds4 = d * sc[sc_base + 4], ds5 = d * sc[sc_base + 5];
+            float ds6 = d * sc[sc_base + 6], ds7 = d * sc[sc_base + 7];
+            int isum0a = 0, isum1a = 0, isum2a = 0, isum3a = 0;
+            for (int l = 0; l < 16; l++) {
+                int q1 = ((ql[ql_base + l] & 0xF) | (((qh[qh_base + l] >> 0) & 3) << 4)) - 32;
+                int q2 = ((ql[ql_base + l + 32] & 0xF) | (((qh[qh_base + l] >> 2) & 3) << 4)) - 32;
+                int q3 = ((ql[ql_base + l] >> 4) | (((qh[qh_base + l] >> 4) & 3) << 4)) - 32;
+                int q4 = ((ql[ql_base + l + 32] >> 4) | (((qh[qh_base + l] >> 6) & 3) << 4)) - 32;
+                isum0a += xqs0[l] * q1;
+                isum1a += xqs1[l] * q2;
+                isum2a += xqs2[l] * q3;
+                isum3a += xqs3[l] * q4;
+            }
+            int isum0b = 0, isum1b = 0, isum2b = 0, isum3b = 0;
+            for (int l = 16; l < 32; l++) {
+                int q1 = ((ql[ql_base + l] & 0xF) | (((qh[qh_base + l] >> 0) & 3) << 4)) - 32;
+                int q2 = ((ql[ql_base + l + 32] & 0xF) | (((qh[qh_base + l] >> 2) & 3) << 4)) - 32;
+                int q3 = ((ql[ql_base + l] >> 4) | (((qh[qh_base + l] >> 4) & 3) << 4)) - 32;
+                int q4 = ((ql[ql_base + l + 32] >> 4) | (((qh[qh_base + l] >> 6) & 3) << 4)) - 32;
+                isum0b += xqs0[l] * q1;
+                isum1b += xqs1[l] * q2;
+                isum2b += xqs2[l] * q3;
+                isum3b += xqs3[l] * q4;
+            }
+            blockSum += dx0 * (ds0 * isum0a + ds1 * isum0b)
+                      + dx1 * (ds2 * isum1a + ds3 * isum1b)
+                      + dx2 * (ds4 * isum2a + ds5 * isum2b)
+                      + dx3 * (ds6 * isum3a + ds7 * isum3b);
+            xq_idx += 4;
+        }
+        sum += blockSum;
+    }
+    return sum;
+}
+
+// Q8_0 input dot product for IQ4_NL weights
+static inline float vec_dot_iq4_nl_q8_0(const block_q8_0* xq, const void* vy, int n) {
+    const block_iq4_nl* y = (const block_iq4_nl*)vy;
+    int nb = n / QK4_NL;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dw = fp16_to_fp32(y[i].d);
+        float dx = fp16_to_fp32(xq[i].d);
+        const uint8_t* qs = y[i].qs;
+        const int8_t* xqs = xq[i].qs;
+        int isum = 0;
+        for (int j = 0; j < 16; j++) {
+            uint8_t qByte = qs[j];
+            isum += xqs[j] * kvalues_iq4nl[qByte & 0xF]
+                  + xqs[j + 16] * kvalues_iq4nl[qByte >> 4];
+        }
+        sum += dw * dx * (float)isum;
+    }
+    return sum;
+}
+
+// Function pointer type for Q8_0 input dot products
+typedef float (*vec_dot_q8_func)(const block_q8_0*, const void*, int);
+
+// Get the appropriate Q8_0 input dot function for a quantization type
+// Returns NULL for types that don't benefit from Q8_0 input (F16, BF16, F32)
+static inline vec_dot_q8_func get_vec_dot_q8_func(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:  return vec_dot_q4_0_q8_0;
+        case GGML_TYPE_Q4_1:  return vec_dot_q4_1_q8_0;
+        case GGML_TYPE_Q5_0:  return vec_dot_q5_0_q8_0;
+        case GGML_TYPE_Q5_1:  return vec_dot_q5_1_q8_0;
+        case GGML_TYPE_Q8_0:  return vec_dot_q8_0_q8_0;
+        case GGML_TYPE_Q2_K:  return vec_dot_q2_K_q8_0;
+        case GGML_TYPE_Q3_K:  return vec_dot_q3_K_q8_0;
+        case GGML_TYPE_Q4_K:  return vec_dot_q4_K_q8_0;
+        case GGML_TYPE_Q5_K:  return vec_dot_q5_K_q8_0;
+        case GGML_TYPE_Q6_K:  return vec_dot_q6_K_q8_0;
+        case GGML_TYPE_IQ4_NL: return vec_dot_iq4_nl_q8_0;
+        default:              return NULL;
+    }
+}
+
 // Function pointer type for vec_dot functions
 typedef float (*vec_dot_func)(const float*, const void*, int);
 
@@ -1295,20 +1750,35 @@ static inline size_t get_row_size(int n_cols, enum ggml_type type) {
 // Fused quantized matrix-vector multiplication
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
+// Uses Q8_0 quantized input path when available for integer dot products
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     int d = qw->rows;
     int n = qw->cols;
     enum ggml_type type = qw->type;
     size_t row_size = get_row_size(n, type);
+    const char* data = (const char*)qw->data;
 
-    // Get function pointer once before the loop (avoids switch in hot path)
+    // Try Q8_0 quantized input path (integer dot products - faster)
+    vec_dot_q8_func q8_func = get_vec_dot_q8_func(type);
+    if (q8_func && q8_buf) {
+        // Quantize x to Q8_0 once before the parallel loop
+        quantize_row_q8_0(x, q8_buf, n);
+
+        int i;
+        #pragma omp parallel for private(i)
+        for (i = 0; i < d; i++) {
+            const void* row = data + i * row_size;
+            xout[i] = q8_func(q8_buf, row, n);
+        }
+        return;
+    }
+
+    // Fallback: float dot products (for F16, BF16, F32 weights)
     vec_dot_func dot_func = get_vec_dot_func(type);
     if (!dot_func) {
         fprintf(stderr, "Unsupported quantization type in matmul: %d\n", type);
         exit(1);
     }
-
-    const char* data = (const char*)qw->data;
 
     int i;
     #pragma omp parallel for private(i)
@@ -3641,6 +4111,18 @@ int main(int argc, char *argv[]) {
 
     malloc_run_state(&state, &config);
 
+    // Allocate Q8_0 buffer for quantized input matmul optimization
+    // Size: max input dimension (max of dim, q_dim, hidden_dim) in Q8_0 blocks
+    {
+        int head_size = config.head_dim > 0 ? config.head_dim : config.dim / config.n_heads;
+        int q_dim = config.n_heads * head_size;
+        int max_input = config.dim;
+        if (q_dim > max_input) max_input = q_dim;
+        if (config.hidden_dim > max_input) max_input = config.hidden_dim;
+        q8_buf_size = (max_input + QK8_0 - 1) / QK8_0;
+        q8_buf = (block_q8_0*)calloc(q8_buf_size, sizeof(block_q8_0));
+    }
+
     // Determine Gemma3-specific stop tokens
     int gemma3_end_turn = -1;
     if (config.is_gemma3) {
@@ -3739,6 +4221,7 @@ int main(int argc, char *argv[]) {
 
     // Cleanup
     free_run_state(&state);
+    free(q8_buf);
     free_tokenizer();
     free(sorted_vocab);
 
