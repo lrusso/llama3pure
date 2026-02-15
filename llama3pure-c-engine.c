@@ -10,6 +10,10 @@ Supports GGUF file format with various quantization types.
 ----------------------------------------------------------------------------
 */
 
+#if defined _WIN32
+    #define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -19,7 +23,35 @@ Supports GGUF file format with various quantization types.
 #include <string.h>
 #include <fcntl.h>
 #if defined _WIN32
-    #include "win.h"
+    #include <windows.h>
+    #include <io.h>
+    #include <malloc.h>
+
+    #define open    _open
+    #define close   _close
+    #define lseek   _lseeki64
+    #define strdup  _strdup
+    typedef __int64 off_t;
+
+    #define PROT_READ     0x1
+    #define MAP_PRIVATE   0x02
+    #define MAP_FAILED    ((void*)-1)
+
+    static void* mmap(void* addr, size_t length, int prot, int flags, int fd, off_t offset) {
+        (void)addr; (void)prot; (void)flags; (void)offset;
+        HANDLE hFile = (HANDLE)_get_osfhandle(fd);
+        if (hFile == INVALID_HANDLE_VALUE) return MAP_FAILED;
+        HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (!hMapping) return MAP_FAILED;
+        void* ptr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(hMapping);
+        return ptr ? ptr : MAP_FAILED;
+    }
+
+    static int munmap(void* addr, size_t length) {
+        (void)length;
+        return UnmapViewOfFile(addr) ? 0 : -1;
+    }
 #else
     #include <unistd.h>
     #include <sys/mman.h>
@@ -2079,7 +2111,11 @@ GGUFFile* parse_gguf_file(const char* filename) {
     fclose(f);
 
     // Memory map the file for tensor data access
+#if defined _WIN32
+    int fd = open(filename, O_RDONLY | _O_BINARY);
+#else
     int fd = open(filename, O_RDONLY);
+#endif
     if (fd == -1) {
         fprintf(stderr, "Failed to open file for mmap\n");
         return NULL;
@@ -3304,9 +3340,16 @@ void free_tokenizer(void) {
 // utilities
 
 long time_in_ms() {
+#if defined _WIN32
+    LARGE_INTEGER freq, counter;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&counter);
+    return (long)(counter.QuadPart * 1000 / freq.QuadPart);
+#else
     struct timespec time;
     clock_gettime(CLOCK_REALTIME, &time);
     return time.tv_sec * 1000 + time.tv_nsec / 1000000;
+#endif
 }
 
 unsigned long long rng_seed;
@@ -3856,8 +3899,13 @@ void generate_token(void) {
         } else {
             int k = top_k;
             if (k > config.vocab_size) k = config.vocab_size;
+#if defined _WIN32
+            int* top_k_idx = (int*)_alloca(k * sizeof(int));
+            float* top_k_val = (float*)_alloca(k * sizeof(float));
+#else
             int top_k_idx[k];
             float top_k_val[k];
+#endif
 
             // Initialize with first k logits
             for (int i = 0; i < k; i++) {
