@@ -6,7 +6,7 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 ## How to build and run the C engine:
 
-| Platform | Command | Execution Command |
+| Platform | Description | Command |
 | :--- | :--- | :--- |
 | MacOS/Linux | Build the engine | `make llama3pure` |
 | MacOS/Linux | Pass prompt | `./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."` |
