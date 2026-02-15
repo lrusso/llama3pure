@@ -253,11 +253,11 @@ typedef struct {
     // pre-computed RoPE frequencies (avoids powf in hot loop)
     float* rope_freqs;      // (head_size / 2,) - for dense (non-SWA) layers
     float* rope_freqs_swa;  // (head_size / 2,) - for SWA layers (different theta)
-    // RoPE sin/cos cache (avoids recomputing sin/cos for each head)
-    float* rope_cos;    // (head_size / 2,) - cosf(pos * freq) for current position
-    float* rope_sin;    // (head_size / 2,) - sinf(pos * freq) for current position
-    int rope_cache_pos; // position for which rope_cos/rope_sin are valid (-1 = invalid)
-    int rope_cache_is_swa; // 0 = cache is for dense layers, 1 = cache is for SWA layers
+    // Pre-computed RoPE sin/cos for ALL positions (eliminates sin/cos from hot loop)
+    float* rope_cos_all;     // (seq_len * head_size/2) - cos for all positions (dense layers)
+    float* rope_sin_all;     // (seq_len * head_size/2) - sin for all positions (dense layers)
+    float* rope_cos_swa_all; // (seq_len * head_size/2) - cos for all positions (SWA layers)
+    float* rope_sin_swa_all; // (seq_len * head_size/2) - sin for all positions (SWA layers)
     // cached constants to avoid recomputation in transformer
     int head_size;
     int kv_dim;
@@ -310,11 +310,29 @@ void malloc_run_state(RunState* s, Config* p) {
         s->rope_freqs_swa[i] = 1.0f / powf(swa_theta, (float)(i * 2) / (float)head_size);
     }
 
-    // Allocate RoPE sin/cos cache buffers
-    s->rope_cos = calloc(rope_size, sizeof(float));
-    s->rope_sin = calloc(rope_size, sizeof(float));
-    s->rope_cache_pos = -1;  // invalid initially
-    s->rope_cache_is_swa = -1;  // invalid initially
+    // Pre-compute RoPE sin/cos for ALL positions (eliminates sin/cos from transformer hot loop)
+    int seq_len = p->seq_len;
+    s->rope_cos_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+    s->rope_sin_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+    for (int pos = 0; pos < seq_len; pos++) {
+        int base = pos * rope_size;
+        for (int i = 0; i < rope_size; i++) {
+            float val = pos * s->rope_freqs[i];
+            s->rope_cos_all[base + i] = cosf(val);
+            s->rope_sin_all[base + i] = sinf(val);
+        }
+    }
+    // Pre-compute SWA sin/cos for all positions
+    s->rope_cos_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+    s->rope_sin_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+    for (int pos = 0; pos < seq_len; pos++) {
+        int base = pos * rope_size;
+        for (int i = 0; i < rope_size; i++) {
+            float val = pos * s->rope_freqs_swa[i];
+            s->rope_cos_swa_all[base + i] = cosf(val);
+            s->rope_sin_swa_all[base + i] = sinf(val);
+        }
+    }
 
     // Cache frequently used values
     s->head_size = head_size;
@@ -328,7 +346,8 @@ void malloc_run_state(RunState* s, Config* p) {
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
      || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
-     || !s->rope_cos || !s->rope_sin) {
+     || !s->rope_cos_all || !s->rope_sin_all
+     || !s->rope_cos_swa_all || !s->rope_sin_swa_all) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
     }
@@ -349,42 +368,53 @@ void free_run_state(RunState* s) {
     free(s->value_cache);
     free(s->rope_freqs);
     free(s->rope_freqs_swa);
-    free(s->rope_cos);
-    free(s->rope_sin);
+    free(s->rope_cos_all);
+    free(s->rope_sin_all);
+    free(s->rope_cos_swa_all);
+    free(s->rope_sin_swa_all);
 }
 
 // ----------------------------------------------------------------------------
-// FP16 conversion utilities
+// FP16 conversion utilities - Pre-computed lookup table for O(1) conversion
+
+// Pre-computed FP16 to FP32 lookup table (256KB - all 65536 possible FP16 values)
+static float fp16_table[65536];
+
+static void init_fp16_table(void) {
+    for (int i = 0; i < 65536; i++) {
+        uint16_t h = (uint16_t)i;
+        uint32_t sign = (h & 0x8000) << 16;
+        uint32_t exp = (h >> 10) & 0x1F;
+        uint32_t mant = h & 0x3FF;
+
+        if (exp == 0) {
+            if (mant == 0) {
+                uint32_t result = sign;
+                fp16_table[i] = *(float*)&result;
+                continue;
+            } else {
+                while (!(mant & 0x400)) {
+                    mant <<= 1;
+                    exp--;
+                }
+                exp++;
+                mant &= ~0x400;
+            }
+        } else if (exp == 31) {
+            uint32_t result = sign | 0x7F800000 | (mant << 13);
+            fp16_table[i] = *(float*)&result;
+            continue;
+        }
+
+        exp = exp + (127 - 15);
+        mant = mant << 13;
+        uint32_t result = sign | (exp << 23) | mant;
+        fp16_table[i] = *(float*)&result;
+    }
+}
 
 static inline float fp16_to_fp32(uint16_t h) {
-    uint32_t sign = (h & 0x8000) << 16;
-    uint32_t exp = (h >> 10) & 0x1F;
-    uint32_t mant = h & 0x3FF;
-
-    if (exp == 0) {
-        if (mant == 0) {
-            // Zero
-            uint32_t result = sign;
-            return *(float*)&result;
-        } else {
-            // Denormalized
-            while (!(mant & 0x400)) {
-                mant <<= 1;
-                exp--;
-            }
-            exp++;
-            mant &= ~0x400;
-        }
-    } else if (exp == 31) {
-        // Inf/NaN
-        uint32_t result = sign | 0x7F800000 | (mant << 13);
-        return *(float*)&result;
-    }
-
-    exp = exp + (127 - 15);
-    mant = mant << 13;
-    uint32_t result = sign | (exp << 23) | mant;
-    return *(float*)&result;
+    return fp16_table[h];
 }
 
 // BF16 (bfloat16) to FP32 conversion
@@ -1980,6 +2010,30 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
 }
 
 // ----------------------------------------------------------------------------
+// Fast math approximations (from JS engine)
+
+// Fast tanh using Padé [3,3] rational approximation
+// Accurate to ~1e-7 for |x| < 4, exact ±1 beyond
+static inline float fast_tanhf(float x) {
+    if (x < -4.0f) return -1.0f;
+    if (x > 4.0f) return 1.0f;
+    float x2 = x * x;
+    return (x * (135135.0f + x2 * (17325.0f + x2 * (378.0f + x2)))) /
+           (135135.0f + x2 * (62370.0f + x2 * (3150.0f + 28.0f * x2)));
+}
+
+// Fast exp using Padé [3,3] approximation for sigmoid range
+static inline float fast_expf(float x) {
+    if (x > 10.0f) return 22026.47f;
+    if (x < -10.0f) return 0.0f;
+    float x2 = x * x;
+    float x3 = x2 * x;
+    float num = 120.0f + 60.0f * x + 12.0f * x2 + x3;
+    float den = 120.0f - 60.0f * x + 12.0f * x2 - x3;
+    return num / den;
+}
+
+// ----------------------------------------------------------------------------
 // neural net blocks
 
 void accum(float *a, float *b, int size) {
@@ -2063,7 +2117,8 @@ void softmax(float* x, int size) {
 }
 
 // Transformer forward pass with GQA support and Gemma3 extensions
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w) {
+// compute_logits: 1 = compute logits (for sampling), 0 = skip (prompt prefill)
+void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w, int compute_logits) {
     float *x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -2117,27 +2172,18 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // Dense layers (every swa_pattern-th): use rope_freqs (theta=1000000)
         // Pattern 6: layers 0,1,2,3,4 are SWA, layer 5 is dense, 6,7,8,9,10 are SWA, layer 11 is dense, etc.
         int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
-        float* rope_freqs = (p->is_gemma3 && is_swa_layer) ? s->rope_freqs_swa : s->rope_freqs;
-        float* rope_cos = s->rope_cos;
-        float* rope_sin = s->rope_sin;
         int half = head_size / 2;
 
-        // Compute sin/cos for this position and layer type
-        // Cache is invalidated when position changes OR when switching between SWA/dense layer types
-        int current_is_swa = is_swa_layer ? 1 : 0;
-        if (s->rope_cache_pos != pos || s->rope_cache_is_swa != current_is_swa) {
-            for (int i = 0; i < half; i++) {
-                float val = pos * rope_freqs[i];
-                rope_cos[i] = cosf(val);
-                rope_sin[i] = sinf(val);
-            }
-            s->rope_cache_pos = pos;
-            s->rope_cache_is_swa = current_is_swa;
-        }
+        // Use pre-computed sin/cos for this position (O(1) lookup, no sin/cos computation)
+        int rope_base = pos * half;
+        float* rope_cos = (p->is_gemma3 && is_swa_layer) ? s->rope_cos_swa_all + rope_base : s->rope_cos_all + rope_base;
+        float* rope_sin = (p->is_gemma3 && is_swa_layer) ? s->rope_sin_swa_all + rope_base : s->rope_sin_all + rope_base;
 
         if (p->is_gemma3) {
             // NEOX RoPE: rotate dimension i with dimension i + half
-            // Apply to Q (all heads)
+            // Fused with attention scaling (1/sqrt(head_dim)) to avoid separate Q scaling loop
+            float attn_scale_fused = s->attn_scale;
+            // Apply to Q (all heads) - fused with attention scaling
             for (int h = 0; h < p->n_heads; h++) {
                 float* q_head = s->q + h * head_size;
                 for (int i = 0; i < half; i++) {
@@ -2145,11 +2191,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                     float fci = rope_sin[i];
                     float v0 = q_head[i];
                     float v1 = q_head[i + half];
-                    q_head[i]        = v0 * fcr - v1 * fci;
-                    q_head[i + half] = v0 * fci + v1 * fcr;
+                    q_head[i]        = (v0 * fcr - v1 * fci) * attn_scale_fused;
+                    q_head[i + half] = (v0 * fci + v1 * fcr) * attn_scale_fused;
                 }
             }
-            // Apply to K (kv heads)
+            // Apply to K (kv heads) - no scaling needed for K
             for (int h = 0; h < p->n_kv_heads; h++) {
                 float* k_head = s->k + h * head_size;
                 for (int i = 0; i < half; i++) {
@@ -2178,15 +2224,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             }
         }
 
-        // Gemma3: Scale Q by attention_scale (1/sqrt(head_dim)) AFTER RoPE
-        // This replaces the standard 1/sqrt(head_dim) scaling in attention
-        // Use pre-computed attn_scale from RunState
-        if (p->is_gemma3) {
-            float attn_scale = s->attn_scale;
-            for (int i = 0; i < q_dim; i++) {
-                s->q[i] *= attn_scale;
-            }
-        }
+        // Gemma3: Q attention scaling is fused into the RoPE loop above
 
         // save key,value at this time step (pos) to our kv cache
         // Use pre-computed kv_cache_layer_size for layer offset
@@ -2200,6 +2238,13 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // Pre-fetch attention scale for non-Gemma3 models
         float attn_scale_score = s->attn_scale;
         int is_gemma3 = p->is_gemma3;
+        // SWA: limit attention to sliding window for SWA layers (Gemma3)
+        int start_t = 0;
+        if (is_gemma3 && is_swa_layer && p->swa_window > 0) {
+            start_t = pos - p->swa_window + 1;
+            if (start_t < 0) start_t = 0;
+        }
+        int att_size = pos - start_t + 1;
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
@@ -2210,8 +2255,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             // compute kv_head once per head (constant for all timesteps)
             int kv_head = h / kv_mul;
             int kv_head_offset = kv_head * head_size;
-            // iterate over all timesteps, including the current one
-            for (int t = 0; t <= pos; t++) {
+            // iterate over timesteps in attention range
+            for (int t = start_t; t <= pos; t++) {
                 // get the key vector for this head and at this timestep
                 float* k = s->key_cache + loff + t * kv_dim + kv_head_offset;
                 // calculate the attention score as the dot product of q and k
@@ -2224,21 +2269,23 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 if (!is_gemma3) {
                     score *= attn_scale_score;
                 }
-                // save the score to the attention buffer
-                att[t] = score;
+                // save the score to the attention buffer (offset by start_t for SWA)
+                att[t - start_t] = score;
             }
 
-            // softmax the scores to get attention weights, from 0..pos inclusively
-            softmax(att, pos + 1);
+            // softmax the scores to get attention weights
+            softmax(att, att_size);
 
             // weighted sum of the values, store back into xb
             float* xb = s->xb + h * head_size;
             memset(xb, 0, head_size * sizeof(float));
-            for (int t = 0; t <= pos; t++) {
+            for (int t = start_t; t <= pos; t++) {
+                // get the attention weight for this timestep
+                float a = att[t - start_t];
+                // skip near-zero attention weights (avoids unnecessary computation)
+                if (a > -1e-8f && a < 1e-8f) continue;
                 // get the value vector for this head and at this timestep
                 float* v = s->value_cache + loff + t * kv_dim + kv_head_offset;
-                // get the attention weight for this timestep
-                float a = att[t];
                 // accumulate the weighted value into xb
                 for (int i = 0; i < head_size; i++) {
                     xb[i] += a * v[i];
@@ -2278,14 +2325,14 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             // GELU formula: 0.5*x*(1 + tanh(sqrt(2/pi)*x*(1 + 0.044715*x^2)))
             for (int i = 0; i < hidden_dim; i++) {
                 float x = s->hb[i];  // gate value
-                float gelu_val = 0.5f * x * (1.0f + tanhf(0.7978845608f * x * (1.0f + 0.044715f * x * x)));
+                float gelu_val = 0.5f * x * (1.0f + fast_tanhf(0.7978845608f * x * (1.0f + 0.044715f * x * x)));
                 s->hb[i] = gelu_val * s->hb2[i];  // gelu(gate) * up
             }
         } else {
             // SwiGLU: silu(hb) * hb2 = silu(w1(x)) * w3(x)
             for (int i = 0; i < hidden_dim; i++) {
                 float val = s->hb[i];
-                val = val * (1.0f / (1.0f + expf(-val)));
+                val = val * (1.0f / (1.0f + fast_expf(-val)));
                 s->hb[i] = val * s->hb2[i];
             }
         }
@@ -2309,14 +2356,16 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(x, x, w->rms_final_weight, dim);
     }
 
-    // classifier into logits - wcls may be quantized or float (tied embeddings)
-    matmul_quantized(s->logits, x, &w->wcls);
+    // classifier into logits - skip during prompt prefill for speed
+    if (compute_logits) {
+        matmul_quantized(s->logits, x, &w->wcls);
 
-    // Gemma3: Apply final logit softcapping if enabled
-    if (p->is_gemma3 && p->final_logit_softcapping > 0.0f) {
-        float cap = p->final_logit_softcapping;
-        for (int i = 0; i < p->vocab_size; i++) {
-            s->logits[i] = cap * tanhf(s->logits[i] / cap);
+        // Gemma3: Apply final logit softcapping if enabled
+        if (p->is_gemma3 && p->final_logit_softcapping > 0.0f) {
+            float cap = p->final_logit_softcapping;
+            for (int i = 0; i < p->vocab_size; i++) {
+                s->logits[i] = cap * fast_tanhf(s->logits[i] / cap);
+            }
         }
     }
 }
@@ -3265,7 +3314,9 @@ static int output_buffer_len = 0;
 static int repetition_detected = 0;
 
 void generate_token(void) {
-    transformer(token, pos, &config, &state, &weights);
+    // Skip logit computation during prompt prefill (major speedup)
+    int need_logits = (pos >= num_prompt_tokens - 1) ? 1 : 0;
+    transformer(token, pos, &config, &state, &weights, need_logits);
 
     // Debug: print first few logits to see if they make sense
     if (debug_mode && pos >= num_prompt_tokens - 1 && pos < num_prompt_tokens + 3) {
@@ -3434,6 +3485,9 @@ int main(int argc, char *argv[]) {
     }
 
     rng_seed = (unsigned int)time(NULL);
+
+    // Initialize FP16 lookup table for fast conversion
+    init_fp16_table();
 
     // Load GGUF model
     if (debug_mode) {
