@@ -6,22 +6,16 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 ## How to build and run the C engine:
 
-```bash
-# Build the engine (MacOS/Linux)
-make llama3pure
-
-# Build the engine (Windows, using x64 Native Tools Command Prompt for VS)
-cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
-
-# Run with a basic prompt
-./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
-
-# Run with a chat history
-./llama3pure -model Llama3.gguf -chathistory chat.txt
-
-# Run with custom parameters
-./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
-```
+| Platform | Command | Execution Command |
+| :--- | :--- | :--- |
+| MacOS/Linux | Build the engine | `make llama3pure` |
+| MacOS/Linux | Pass prompt | `./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."` |
+| MacOS/Linux | Pass chat history | `./llama3pure -model Llama3.gguf -chathistory chat.txt` |
+| MacOS/Linux | Pass custom params | `./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."` |
+| Windows | Build the engine | `cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe` |
+| Windows | Pass prompt | `llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."` |
+| Windows | Pass chat history | `llama3pure.exe -model Llama3.gguf -chathistory chat.txt` |
+| Windows | Pass custom params | `llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."` |
 
 Check the sample chat in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt).
 
