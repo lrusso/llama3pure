@@ -53,8 +53,8 @@ const models = [
 const testModelUsingC = (model) => {
   try {
     execSync(
-      //`./llama3pure-c-engine -model "${model}" -prompt "Tell me in 1 line what is Microsoft." -max_tokens 1024 -context_size 2048`,
-      `./llama3pure-c-engine -model "${model}" -chathistory tests.txt -max_tokens 1024 -context_size 2048`,
+      //`./llama3pure -model "${model}" -prompt "Tell me in 1 line what is Microsoft." -max_tokens 1024 -context_size 2048`,
+      `./llama3pure -model "${model}" -chathistory tests.txt -max_tokens 1024 -context_size 2048`,
       {
         stdio: "inherit",
       }
