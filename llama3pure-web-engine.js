@@ -2392,7 +2392,8 @@ function transformer(token, pos, computeLogits) {
     var kArr = s.k
 
     // Use separate sin/cos caches for SWA and dense layers to avoid thrashing
-    var ropeCos, ropeSin
+    var ropeCos
+    var ropeSin
     if (isGemma && isSwaLayer) {
       if (s.ropeCachePosSwa !== pos) {
         var ropeFreqs = s.ropeFreqsSwa
@@ -2494,7 +2495,10 @@ function transformer(token, pos, computeLogits) {
     var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
 
     // SWA: limit attention to sliding window for SWA layers
-    var startT = isSwaLayer && config.swaWindow > 0 ? Math.max(0, pos - config.swaWindow + 1) : 0
+    var startT =
+      isSwaLayer && config.swaWindow > 0
+        ? Math.max(0, pos - config.swaWindow + 1)
+        : 0
 
     for (var h = 0; h < nHeads; h = h + 1) {
       var qOffset = h * headSize
