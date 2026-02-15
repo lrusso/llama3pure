@@ -96,10 +96,6 @@ Due to universal browser memory constraints regarding ArrayBuffer size limits, t
 
 - There isn't a Python engine because a ported and pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
 
-## Disclaimer:
-
-You are legally responsible for any damage that you could cause with this software.
-
 ## Based on the work of:
 
 https://github.com/karpathy/llama2.c
