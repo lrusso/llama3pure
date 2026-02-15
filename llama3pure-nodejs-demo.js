@@ -14,9 +14,11 @@ function main() {
 
   llama3pure({
     systemPrompt: "You are a helpful assistant.",
-    temperature: 0.9,
     maxTokens: 256,
     contextSize: 2048,
+    temperature: 0.9,
+    topP: 0.9,
+    topK: 40,
     type: "load",
     filePath: modelPath,
     filename: "gemma-3-270m-it-Q8_0.gguf",
