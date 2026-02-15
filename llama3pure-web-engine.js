@@ -2396,11 +2396,13 @@ function transformer(token, pos, computeLogits) {
     var ropeSin
     if (isGemma && isSwaLayer) {
       if (s.ropeCachePosSwa !== pos) {
-        var ropeFreqs = s.ropeFreqsSwa
+        var ropeFreqsSwa = s.ropeFreqsSwa
+        var cosSwa = s.ropeCosSwa
+        var sinSwa = s.ropeSinSwa
         for (var i = 0; i < half; i = i + 1) {
-          var val = pos * ropeFreqs[i]
-          s.ropeCosSwa[i] = Math.cos(val)
-          s.ropeSinSwa[i] = Math.sin(val)
+          var val = pos * ropeFreqsSwa[i]
+          cosSwa[i] = Math.cos(val)
+          sinSwa[i] = Math.sin(val)
         }
         s.ropeCachePosSwa = pos
       }
@@ -2409,10 +2411,12 @@ function transformer(token, pos, computeLogits) {
     } else {
       if (s.ropeCachePos !== pos) {
         var ropeFreqs = s.ropeFreqs
+        var cosArr = s.ropeCos
+        var sinArr = s.ropeSin
         for (var i = 0; i < half; i = i + 1) {
           var val = pos * ropeFreqs[i]
-          s.ropeCos[i] = Math.cos(val)
-          s.ropeSin[i] = Math.sin(val)
+          cosArr[i] = Math.cos(val)
+          sinArr[i] = Math.sin(val)
         }
         s.ropeCachePos = pos
       }
