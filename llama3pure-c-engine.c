@@ -3259,6 +3259,11 @@ static float repetition_penalty = 1.0f;  // Disabled: Penalty factor for repeate
 // Buffer newlines - only output if followed by non-end token
 static int pending_newline = 0;
 
+// Buffer for output text to detect repetition loops
+static char output_buffer[16384];
+static int output_buffer_len = 0;
+static int repetition_detected = 0;
+
 void generate_token(void) {
     transformer(token, pos, &config, &state, &weights);
 
@@ -3345,6 +3350,34 @@ void generate_token(void) {
                 printf("%s", decoded);
             }
             fflush(stdout);
+
+            // Accumulate text in output buffer for repetition detection
+            int decoded_len = strlen(decoded);
+            if (output_buffer_len + decoded_len >= (int)sizeof(output_buffer) - 1) {
+                // Buffer full: shift the second half to the front to keep detection working
+                int half = output_buffer_len / 2;
+                memmove(output_buffer, output_buffer + half, output_buffer_len - half);
+                output_buffer_len -= half;
+                output_buffer[output_buffer_len] = '\0';
+            }
+            memcpy(output_buffer + output_buffer_len, decoded, decoded_len);
+            output_buffer_len += decoded_len;
+            output_buffer[output_buffer_len] = '\0';
+
+            // Stop if the model is stuck repeating text
+            if (output_buffer_len > 100) {
+                char* to_find = output_buffer + output_buffer_len - 30;
+                int count = 0;
+                char* search = output_buffer;
+                while ((search = strstr(search, to_find)) != NULL) {
+                    count++;
+                    search += 30;
+                }
+                if (count > 10) {
+                    repetition_detected = 1;
+                }
+            }
+
             free(decoded);
         }
     }
@@ -3634,6 +3667,11 @@ int main(int argc, char *argv[]) {
             }
             // Stop on end_of_turn token (Gemma3)
             if (config.is_gemma3 && token == gemma3_end_turn) {
+                break;
+            }
+            // Stop if the model is stuck repeating text
+            if (repetition_detected) {
+                printf("corto");
                 break;
             }
         }
