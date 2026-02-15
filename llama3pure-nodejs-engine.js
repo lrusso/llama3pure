@@ -3176,6 +3176,15 @@ function generate(chatHistory) {
           output = output + decoded
           postMessage({ type: "token", token: decoded })
         }
+
+        // Stop if the model is stuck repeating text
+        if (output.length > 100) {
+          var toFind = output.substring(output.length - 30, output.length)
+          var repeatedText = output.split(toFind).length - 1
+          if (repeatedText > 10) {
+            break
+          }
+        }
       }
     }
 
