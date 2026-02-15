@@ -90,7 +90,6 @@ enum ggml_type {
 #define QK5_0 32
 #define QK5_1 32
 #define QK8_0 32
-#define QK8_1 32
 #define QK_K 256
 #define QK4_NL 32  // IQ4_NL block size
 
@@ -227,7 +226,7 @@ typedef struct {
     float* rms_final_weight; // (dim,)
     // (optional) classifier weights for the logits - QUANTIZED
     QuantizedTensor wcls;
-    int wcls_is_embed;  // flag if wcls points to embeddings (tied weights)
+
     // Gemma3-specific weights - small, kept as float
     float* attn_q_norm;     // (layer, head_dim) Q projection normalization
     float* attn_k_norm;     // (layer, head_dim) K projection normalization
@@ -1278,7 +1277,6 @@ static inline float vec_dot_f32(const float* x, const void* w, int n) {
 
 // Global Q8_0 buffer for quantized input (allocated once, reused per matmul)
 static block_q8_0* q8_buf = NULL;
-static int q8_buf_size = 0;  // number of blocks allocated
 
 // Quantize a float vector to Q8_0 format
 static void quantize_row_q8_0(const float* x, block_q8_0* y, int n) {
@@ -2461,7 +2459,8 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
     if (output_tensor) {
         // Load as quantized tensor
         load_tensor_quantized(gguf, "output.weight", &w->wcls, p->vocab_size, p->dim);
-        w->wcls_is_embed = 0;
+
+
     } else {
         // Use tied embeddings - create a "fake" quantized tensor pointing to embeddings
         // The wcls will be used with matmul_f32 instead of matmul_quantized
@@ -2473,7 +2472,8 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
         w->wcls.n_elements = p->vocab_size * p->dim;
         w->wcls.rows = p->vocab_size;
         w->wcls.cols = p->dim;
-        w->wcls_is_embed = 1;  // Mark as tied to embeddings
+
+
     }
 
     return 1;
@@ -4119,7 +4119,7 @@ int main(int argc, char *argv[]) {
         int max_input = config.dim;
         if (q_dim > max_input) max_input = q_dim;
         if (config.hidden_dim > max_input) max_input = config.hidden_dim;
-        q8_buf_size = (max_input + QK8_0 - 1) / QK8_0;
+        int q8_buf_size = (max_input + QK8_0 - 1) / QK8_0;
         q8_buf = (block_q8_0*)calloc(q8_buf_size, sizeof(block_q8_0));
     }
 
