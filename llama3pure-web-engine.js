@@ -85,6 +85,8 @@ var xQ8Buf = null
 var xQ8Int8Buf = null
 
 var temperature = 0.9
+var topP = 0.9
+var topK = 40
 var systemPrompt = "You are a helpful assistant."
 var maxTokens = 256
 var contextSize = 2048
@@ -3021,8 +3023,8 @@ function createRunState(p) {
     // SWA pattern for per-layer RoPE frequency selection
     swaPattern: p.swaPattern,
     // Pre-allocated buffers for top-k sampling
-    topKIndices: new Int32Array(40),
-    topKValues: new Float32Array(40),
+    topKIndices: new Int32Array(topK),
+    topKValues: new Float32Array(topK),
     // Pre-computed head offset tables
     headQOffsets: headQOffsets,
     headKvIdx: headKvIdx,
@@ -3429,7 +3431,7 @@ function sample(logits, temp) {
   }
 
   var vocabSize = config.vocabSize
-  var k = 40
+  var k = topK
   var topKIdx = state.topKIndices
   var topKVal = state.topKValues
 
@@ -3482,16 +3484,53 @@ function sample(logits, temp) {
     sum = sum + e
   }
 
-  // Sample from top-k distribution
+  // Apply top-P (nucleus) filtering: sort by probability descending,
+  // then keep only tokens whose cumulative probability reaches topP
+  var n = k
+  if (topP < 1.0) {
+    // Insertion sort by probability descending (k is small, ~40)
+    for (var i = 1; i < k; i = i + 1) {
+      var keyVal = topKVal[i]
+      var keyIdx = topKIdx[i]
+      var j = i - 1
+      while (j >= 0 && topKVal[j] < keyVal) {
+        topKVal[j + 1] = topKVal[j]
+        topKIdx[j + 1] = topKIdx[j]
+        j = j - 1
+      }
+      topKVal[j + 1] = keyVal
+      topKIdx[j + 1] = keyIdx
+    }
+
+    // Accumulate probabilities until we reach the topP threshold
+    var cumSum = 0.0
+    var threshold = topP * sum
+    n = k
+    for (var i = 0; i < k; i = i + 1) {
+      cumSum = cumSum + topKVal[i]
+      if (cumSum >= threshold) {
+        n = i + 1
+        break
+      }
+    }
+
+    // Recompute sum over the kept tokens
+    sum = 0.0
+    for (var i = 0; i < n; i = i + 1) {
+      sum = sum + topKVal[i]
+    }
+  }
+
+  // Sample from the filtered distribution
   var r = randomF32() * sum
   var cdf = 0.0
-  for (var i = 0; i < k; i = i + 1) {
+  for (var i = 0; i < n; i = i + 1) {
     cdf = cdf + topKVal[i]
     if (r < cdf) {
       return topKIdx[i]
     }
   }
-  return topKIdx[k - 1]
+  return topKIdx[n - 1]
 }
 
 // ----------------------------------------------------------------------------
@@ -4120,6 +4159,12 @@ self.onmessage = function (e) {
         if (data.temperature !== undefined) {
           temperature = data.temperature
         }
+        if (data.topP !== undefined) {
+          topP = data.topP
+        }
+        if (data.topK !== undefined) {
+          topK = data.topK
+        }
         if (data.filename !== undefined) {
           modelFilename = data.filename
         }
@@ -4130,6 +4175,8 @@ self.onmessage = function (e) {
           filename: modelFilename,
           maxTokens: maxTokens,
           contextSize: contextSize,
+          topP: topP,
+          topK: topK,
         })
         break
 
