@@ -80,6 +80,10 @@ var dataView = null
 var ggufTextDecoder = new TextDecoder("utf-8")
 var offset = 0
 
+// Q8_0 buffers for quantizing x vector in matmulQuantized
+var xQ8Buf = null
+var xQ8Int8Buf = null
+
 var temperature = 0.9
 var systemPrompt = "You are a helpful assistant."
 var maxTokens = 256
@@ -1716,17 +1720,705 @@ function getVecDotFunc(type) {
   }
 }
 
+// ----------------------------------------------------------------------------
+// Q8_0-input vec_dot functions (integer inner loops)
+// These take Q8_0-quantized x instead of float x for faster dot products.
+// Signature: (xQ8, xQ8i8, srcOffset, n) where xQ8 is Uint8Array, xQ8i8 is Int8Array view
+
+function vecDotQ4_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 2
+    var qx = xOff + 2
+    var isum = 0
+    for (var j = 0; j < 16; j = j + 1) {
+      var qByte = u8[qw + j]
+      isum =
+        isum +
+        xQ8i8[qx + j] * ((qByte & 0x0f) - 8) +
+        xQ8i8[qx + j + 16] * ((qByte >> 4) - 8)
+    }
+    sum = sum + dw * dx * isum
+    wOff = wOff + 18
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+function vecDotQ4_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 4
+    var qx = xOff + 2
+    var isum = 0
+    var xsum = 0
+    for (var j = 0; j < 16; j = j + 1) {
+      var qByte = u8[qw + j]
+      isum =
+        isum + xQ8i8[qx + j] * (qByte & 0x0f) + xQ8i8[qx + j + 16] * (qByte >> 4)
+      xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
+    }
+    sum = sum + dw * dx * isum + mw * dx * xsum
+    wOff = wOff + 20
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+function vecDotQ5_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var qh =
+      u8[wOff + 2] |
+      (u8[wOff + 3] << 8) |
+      (u8[wOff + 4] << 16) |
+      (u8[wOff + 5] << 24)
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 6
+    var qx = xOff + 2
+    var isum = 0
+    for (var j = 0; j < 16; j = j + 1) {
+      var xh_0 = ((qh >> j) & 1) << 4
+      var xh_1 = ((qh >> (j + 16)) & 1) << 4
+      var qByte = u8[qw + j]
+      isum =
+        isum +
+        xQ8i8[qx + j] * (((qByte & 0x0f) | xh_0) - 16) +
+        xQ8i8[qx + j + 16] * (((qByte >> 4) | xh_1) - 16)
+    }
+    sum = sum + dw * dx * isum
+    wOff = wOff + 22
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+function vecDotQ5_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var qh =
+      u8[wOff + 4] |
+      (u8[wOff + 5] << 8) |
+      (u8[wOff + 6] << 16) |
+      (u8[wOff + 7] << 24)
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 8
+    var qx = xOff + 2
+    var isum = 0
+    var xsum = 0
+    for (var j = 0; j < 16; j = j + 1) {
+      var xh_0 = ((qh >> j) & 1) << 4
+      var xh_1 = ((qh >> (j + 16)) & 1) << 4
+      var qByte = u8[qw + j]
+      isum =
+        isum +
+        xQ8i8[qx + j] * ((qByte & 0x0f) | xh_0) +
+        xQ8i8[qx + j + 16] * ((qByte >> 4) | xh_1)
+      xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
+    }
+    sum = sum + dw * dx * isum + mw * dx * xsum
+    wOff = wOff + 24
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+function vecDotQ8_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 2
+    var qx = xOff + 2
+    var isum =
+      xQ8i8[qx] * i8[qw] +
+      xQ8i8[qx + 1] * i8[qw + 1] +
+      xQ8i8[qx + 2] * i8[qw + 2] +
+      xQ8i8[qx + 3] * i8[qw + 3] +
+      xQ8i8[qx + 4] * i8[qw + 4] +
+      xQ8i8[qx + 5] * i8[qw + 5] +
+      xQ8i8[qx + 6] * i8[qw + 6] +
+      xQ8i8[qx + 7] * i8[qw + 7] +
+      xQ8i8[qx + 8] * i8[qw + 8] +
+      xQ8i8[qx + 9] * i8[qw + 9] +
+      xQ8i8[qx + 10] * i8[qw + 10] +
+      xQ8i8[qx + 11] * i8[qw + 11] +
+      xQ8i8[qx + 12] * i8[qw + 12] +
+      xQ8i8[qx + 13] * i8[qw + 13] +
+      xQ8i8[qx + 14] * i8[qw + 14] +
+      xQ8i8[qx + 15] * i8[qw + 15] +
+      xQ8i8[qx + 16] * i8[qw + 16] +
+      xQ8i8[qx + 17] * i8[qw + 17] +
+      xQ8i8[qx + 18] * i8[qw + 18] +
+      xQ8i8[qx + 19] * i8[qw + 19] +
+      xQ8i8[qx + 20] * i8[qw + 20] +
+      xQ8i8[qx + 21] * i8[qw + 21] +
+      xQ8i8[qx + 22] * i8[qw + 22] +
+      xQ8i8[qx + 23] * i8[qw + 23] +
+      xQ8i8[qx + 24] * i8[qw + 24] +
+      xQ8i8[qx + 25] * i8[qw + 25] +
+      xQ8i8[qx + 26] * i8[qw + 26] +
+      xQ8i8[qx + 27] * i8[qw + 27] +
+      xQ8i8[qx + 28] * i8[qw + 28] +
+      xQ8i8[qx + 29] * i8[qw + 29] +
+      xQ8i8[qx + 30] * i8[qw + 30] +
+      xQ8i8[qx + 31] * i8[qw + 31]
+    sum = sum + dw * dx * isum
+    wOff = wOff + 34
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+function vecDotQ2_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 8
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var scOff = wOff
+    var qsOff = wOff + 16
+    var dOff = wOff + 80
+    var d = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
+    var dmin = fp16ToFp32(u8[dOff + 2] | (u8[dOff + 3] << 8))
+    var is = 0
+    var qIdx = 0
+    var blockSum = 0.0
+    for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
+      var shift = 0
+      for (var j = 0; j < 4; j = j + 1) {
+        var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+        var qxBase = xOff + 2
+        var qBase = qsOff + qIdx
+        var sc = u8[scOff + is]
+        is = is + 1
+        var dl = d * (sc & 0xf)
+        var ml = dmin * (sc >> 4)
+        var isum1 = 0
+        var xsum1 = 0
+        for (var l = 0; l < 16; l = l + 1) {
+          var qx = xQ8i8[qxBase + l]
+          isum1 = isum1 + qx * ((u8[qBase + l] >> shift) & 3)
+          xsum1 = xsum1 + qx
+        }
+        sc = u8[scOff + is]
+        is = is + 1
+        var dl2 = d * (sc & 0xf)
+        var ml2 = dmin * (sc >> 4)
+        var isum2 = 0
+        var xsum2 = 0
+        for (var l = 0; l < 16; l = l + 1) {
+          var qx = xQ8i8[qxBase + 16 + l]
+          isum2 = isum2 + qx * ((u8[qBase + l + 16] >> shift) & 3)
+          xsum2 = xsum2 + qx
+        }
+        blockSum =
+          blockSum + dx * (dl * isum1 - ml * xsum1 + dl2 * isum2 - ml2 * xsum2)
+        shift = shift + 2
+        xOff = xOff + 34
+      }
+      qIdx = qIdx + 32
+    }
+    sum = sum + blockSum
+    wOff = wOff + 84
+  }
+  return sum
+}
+
+function vecDotQ3_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 8
+  var kmask1 = 0x03030303
+  var kmask2 = 0x0f0f0f0f
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var hmOff = wOff
+    var qsOff = wOff + 32
+    var scOff = wOff + 96
+    var dOff = wOff + 108
+    var dAll = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
+    var aux0 =
+      u8[scOff] |
+      (u8[scOff + 1] << 8) |
+      (u8[scOff + 2] << 16) |
+      (u8[scOff + 3] << 24)
+    var aux1 =
+      u8[scOff + 4] |
+      (u8[scOff + 5] << 8) |
+      (u8[scOff + 6] << 16) |
+      (u8[scOff + 7] << 24)
+    var aux2 =
+      u8[scOff + 8] |
+      (u8[scOff + 9] << 8) |
+      (u8[scOff + 10] << 16) |
+      (u8[scOff + 11] << 24)
+    var s0 = (aux0 & kmask2) | (((aux2 >> 0) & kmask1) << 4)
+    var s1 = (aux1 & kmask2) | (((aux2 >> 2) & kmask1) << 4)
+    var s2 = ((aux0 >> 4) & kmask2) | (((aux2 >> 4) & kmask1) << 4)
+    var s3 = ((aux1 >> 4) & kmask2) | (((aux2 >> 6) & kmask1) << 4)
+    q3kScales[0] = s0 & 0xff
+    q3kScales[1] = (s0 >> 8) & 0xff
+    q3kScales[2] = (s0 >> 16) & 0xff
+    q3kScales[3] = (s0 >> 24) & 0xff
+    q3kScales[4] = s1 & 0xff
+    q3kScales[5] = (s1 >> 8) & 0xff
+    q3kScales[6] = (s1 >> 16) & 0xff
+    q3kScales[7] = (s1 >> 24) & 0xff
+    q3kScales[8] = s2 & 0xff
+    q3kScales[9] = (s2 >> 8) & 0xff
+    q3kScales[10] = (s2 >> 16) & 0xff
+    q3kScales[11] = (s2 >> 24) & 0xff
+    q3kScales[12] = s3 & 0xff
+    q3kScales[13] = (s3 >> 8) & 0xff
+    q3kScales[14] = (s3 >> 16) & 0xff
+    q3kScales[15] = (s3 >> 24) & 0xff
+    for (var si = 0; si < 16; si = si + 1) {
+      if (q3kScales[si] > 127) {
+        q3kScales[si] = q3kScales[si] - 256
+      }
+    }
+    var is = 0
+    var m = 1
+    var qIdx = 0
+    var blockSum = 0.0
+    for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
+      var shift = 0
+      for (var j = 0; j < 4; j = j + 1) {
+        var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+        var qxBase = xOff + 2
+        var dl = dAll * (q3kScales[is] - 32)
+        is = is + 1
+        var isum1 = 0
+        for (var l = 0; l < 16; l = l + 1) {
+          var q = (u8[qsOff + qIdx + l] >> shift) & 3
+          var h = u8[hmOff + l] & m ? 0 : 4
+          isum1 = isum1 + xQ8i8[qxBase + l] * (q - h)
+        }
+        var dl2 = dAll * (q3kScales[is] - 32)
+        is = is + 1
+        var isum2 = 0
+        for (var l = 0; l < 16; l = l + 1) {
+          var q = (u8[qsOff + qIdx + l + 16] >> shift) & 3
+          var h = u8[hmOff + l + 16] & m ? 0 : 4
+          isum2 = isum2 + xQ8i8[qxBase + 16 + l] * (q - h)
+        }
+        blockSum = blockSum + dx * (dl * isum1 + dl2 * isum2)
+        shift = shift + 2
+        m = m << 1
+        xOff = xOff + 34
+      }
+      qIdx = qIdx + 32
+    }
+    sum = sum + blockSum
+    wOff = wOff + 110
+  }
+  return sum
+}
+
+function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 8
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var d = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dmin = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var scOff = wOff + 4
+    var qsOff = wOff + 16
+    var blockSum = 0.0
+
+    // Section 0 (is=0,1)
+    var sc0 = u8[scOff] & 63
+    var m0 = u8[scOff + 4] & 63
+    var sc1 = u8[scOff + 1] & 63
+    var m1 = u8[scOff + 5] & 63
+    var d1 = d * sc0
+    var dm1 = dmin * m0
+    var d2 = d * sc1
+    var dm2 = dmin * m1
+    var dx0 = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qx0 = xOff + 2
+    var dx1 = fp16ToFp32(xQ8[xOff + 34] | (xQ8[xOff + 35] << 8))
+    var qx1 = xOff + 36
+    var isum0 = 0
+    var xsum0 = 0
+    var isum1 = 0
+    var xsum1 = 0
+    for (var l = 0; l < 32; l = l + 1) {
+      var qByte = u8[qsOff + l]
+      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
+      xsum0 = xsum0 + xQ8i8[qx0 + l]
+      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
+      xsum1 = xsum1 + xQ8i8[qx1 + l]
+    }
+    blockSum =
+      blockSum +
+      d1 * dx0 * isum0 -
+      dm1 * dx0 * xsum0 +
+      d2 * dx1 * isum1 -
+      dm2 * dx1 * xsum1
+
+    // Section 1 (is=2,3)
+    sc0 = u8[scOff + 2] & 63
+    m0 = u8[scOff + 6] & 63
+    sc1 = u8[scOff + 3] & 63
+    m1 = u8[scOff + 7] & 63
+    d1 = d * sc0
+    dm1 = dmin * m0
+    d2 = d * sc1
+    dm2 = dmin * m1
+    dx0 = fp16ToFp32(xQ8[xOff + 68] | (xQ8[xOff + 69] << 8))
+    qx0 = xOff + 70
+    dx1 = fp16ToFp32(xQ8[xOff + 102] | (xQ8[xOff + 103] << 8))
+    qx1 = xOff + 104
+    isum0 = 0
+    xsum0 = 0
+    isum1 = 0
+    xsum1 = 0
+    for (var l = 0; l < 32; l = l + 1) {
+      var qByte = u8[qsOff + 32 + l]
+      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
+      xsum0 = xsum0 + xQ8i8[qx0 + l]
+      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
+      xsum1 = xsum1 + xQ8i8[qx1 + l]
+    }
+    blockSum =
+      blockSum +
+      d1 * dx0 * isum0 -
+      dm1 * dx0 * xsum0 +
+      d2 * dx1 * isum1 -
+      dm2 * dx1 * xsum1
+
+    // Section 2 (is=4,5)
+    sc0 = (u8[scOff + 8] & 0xf) | ((u8[scOff] >> 6) << 4)
+    m0 = (u8[scOff + 8] >> 4) | ((u8[scOff + 4] >> 6) << 4)
+    sc1 = (u8[scOff + 9] & 0xf) | ((u8[scOff + 1] >> 6) << 4)
+    m1 = (u8[scOff + 9] >> 4) | ((u8[scOff + 5] >> 6) << 4)
+    d1 = d * sc0
+    dm1 = dmin * m0
+    d2 = d * sc1
+    dm2 = dmin * m1
+    dx0 = fp16ToFp32(xQ8[xOff + 136] | (xQ8[xOff + 137] << 8))
+    qx0 = xOff + 138
+    dx1 = fp16ToFp32(xQ8[xOff + 170] | (xQ8[xOff + 171] << 8))
+    qx1 = xOff + 172
+    isum0 = 0
+    xsum0 = 0
+    isum1 = 0
+    xsum1 = 0
+    for (var l = 0; l < 32; l = l + 1) {
+      var qByte = u8[qsOff + 64 + l]
+      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
+      xsum0 = xsum0 + xQ8i8[qx0 + l]
+      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
+      xsum1 = xsum1 + xQ8i8[qx1 + l]
+    }
+    blockSum =
+      blockSum +
+      d1 * dx0 * isum0 -
+      dm1 * dx0 * xsum0 +
+      d2 * dx1 * isum1 -
+      dm2 * dx1 * xsum1
+
+    // Section 3 (is=6,7)
+    sc0 = (u8[scOff + 10] & 0xf) | ((u8[scOff + 2] >> 6) << 4)
+    m0 = (u8[scOff + 10] >> 4) | ((u8[scOff + 6] >> 6) << 4)
+    sc1 = (u8[scOff + 11] & 0xf) | ((u8[scOff + 3] >> 6) << 4)
+    m1 = (u8[scOff + 11] >> 4) | ((u8[scOff + 7] >> 6) << 4)
+    d1 = d * sc0
+    dm1 = dmin * m0
+    d2 = d * sc1
+    dm2 = dmin * m1
+    dx0 = fp16ToFp32(xQ8[xOff + 204] | (xQ8[xOff + 205] << 8))
+    qx0 = xOff + 206
+    dx1 = fp16ToFp32(xQ8[xOff + 238] | (xQ8[xOff + 239] << 8))
+    qx1 = xOff + 240
+    isum0 = 0
+    xsum0 = 0
+    isum1 = 0
+    xsum1 = 0
+    for (var l = 0; l < 32; l = l + 1) {
+      var qByte = u8[qsOff + 96 + l]
+      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
+      xsum0 = xsum0 + xQ8i8[qx0 + l]
+      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
+      xsum1 = xsum1 + xQ8i8[qx1 + l]
+    }
+    blockSum =
+      blockSum +
+      d1 * dx0 * isum0 -
+      dm1 * dx0 * xsum0 +
+      d2 * dx1 * isum1 -
+      dm2 * dx1 * xsum1
+
+    sum = sum + blockSum
+    wOff = wOff + 144
+    xOff = xOff + 272
+  }
+  return sum
+}
+
+function vecDotQ5_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 8
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var d = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dmin = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var scOff = wOff + 4
+    var qhOff = wOff + 16
+    var qlOff = wOff + 48
+    var is = 0
+    var u1 = 1
+    var u2 = 2
+    var qlIdx = 0
+    var blockSum = 0.0
+    for (var j = 0; j < 256; j = j + 64) {
+      var sc
+      var m
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d1 = d * sc
+      var m1 = dmin * m
+      is = is + 1
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d2 = d * sc
+      var m2 = dmin * m
+      is = is + 1
+      var dx0 = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+      var qx0 = xOff + 2
+      var dx1 = fp16ToFp32(xQ8[xOff + 34] | (xQ8[xOff + 35] << 8))
+      var qx1 = xOff + 36
+      var isum0 = 0
+      var xsum0 = 0
+      var isum1 = 0
+      var xsum1 = 0
+      for (var l = 0; l < 32; l = l + 1) {
+        var qw_lo = (u8[qlOff + qlIdx + l] & 0xf) + (u8[qhOff + l] & u1 ? 16 : 0)
+        var qw_hi = (u8[qlOff + qlIdx + l] >> 4) + (u8[qhOff + l] & u2 ? 16 : 0)
+        isum0 = isum0 + xQ8i8[qx0 + l] * qw_lo
+        xsum0 = xsum0 + xQ8i8[qx0 + l]
+        isum1 = isum1 + xQ8i8[qx1 + l] * qw_hi
+        xsum1 = xsum1 + xQ8i8[qx1 + l]
+      }
+      blockSum =
+        blockSum +
+        d1 * dx0 * isum0 -
+        m1 * dx0 * xsum0 +
+        d2 * dx1 * isum1 -
+        m2 * dx1 * xsum1
+      qlIdx = qlIdx + 32
+      u1 = u1 << 2
+      u2 = u2 << 2
+      xOff = xOff + 68
+    }
+    sum = sum + blockSum
+    wOff = wOff + 176
+  }
+  return sum
+}
+
+function vecDotQ6_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 8
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
+  for (var i = 0; i < nb; i = i + 1) {
+    var qlOff = wOff
+    var qhOff = wOff + 128
+    var scOff = wOff + 192
+    var dOff = wOff + 208
+    var d = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
+    var blockSum = 0.0
+    for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
+      var scBase = scOff + (nOuter >> 7) * 8
+      var qlBase = qlOff + (nOuter >> 1)
+      var qhBase = qhOff + (nOuter >> 2)
+      var dx0 = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+      var qx0 = xOff + 2
+      var dx1 = fp16ToFp32(xQ8[xOff + 34] | (xQ8[xOff + 35] << 8))
+      var qx1 = xOff + 36
+      var dx2 = fp16ToFp32(xQ8[xOff + 68] | (xQ8[xOff + 69] << 8))
+      var qx2 = xOff + 70
+      var dx3 = fp16ToFp32(xQ8[xOff + 102] | (xQ8[xOff + 103] << 8))
+      var qx3 = xOff + 104
+      var ds0 = d * i8[scBase]
+      var ds2 = d * i8[scBase + 2]
+      var ds4 = d * i8[scBase + 4]
+      var ds6 = d * i8[scBase + 6]
+      var ds1 = d * i8[scBase + 1]
+      var ds3 = d * i8[scBase + 3]
+      var ds5 = d * i8[scBase + 5]
+      var ds7 = d * i8[scBase + 7]
+      var isum0a = 0
+      var isum1a = 0
+      var isum2a = 0
+      var isum3a = 0
+      for (var l = 0; l < 16; l = l + 1) {
+        var q1 = ((u8[qlBase + l] & 0xf) | (((u8[qhBase + l] >> 0) & 3) << 4)) - 32
+        var q2 =
+          ((u8[qlBase + l + 32] & 0xf) | (((u8[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((u8[qlBase + l] >> 4) | (((u8[qhBase + l] >> 4) & 3) << 4)) - 32
+        var q4 =
+          ((u8[qlBase + l + 32] >> 4) | (((u8[qhBase + l] >> 6) & 3) << 4)) - 32
+        isum0a = isum0a + xQ8i8[qx0 + l] * q1
+        isum1a = isum1a + xQ8i8[qx1 + l] * q2
+        isum2a = isum2a + xQ8i8[qx2 + l] * q3
+        isum3a = isum3a + xQ8i8[qx3 + l] * q4
+      }
+      var isum0b = 0
+      var isum1b = 0
+      var isum2b = 0
+      var isum3b = 0
+      for (var l = 16; l < 32; l = l + 1) {
+        var q1 = ((u8[qlBase + l] & 0xf) | (((u8[qhBase + l] >> 0) & 3) << 4)) - 32
+        var q2 =
+          ((u8[qlBase + l + 32] & 0xf) | (((u8[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((u8[qlBase + l] >> 4) | (((u8[qhBase + l] >> 4) & 3) << 4)) - 32
+        var q4 =
+          ((u8[qlBase + l + 32] >> 4) | (((u8[qhBase + l] >> 6) & 3) << 4)) - 32
+        isum0b = isum0b + xQ8i8[qx0 + l] * q1
+        isum1b = isum1b + xQ8i8[qx1 + l] * q2
+        isum2b = isum2b + xQ8i8[qx2 + l] * q3
+        isum3b = isum3b + xQ8i8[qx3 + l] * q4
+      }
+      blockSum =
+        blockSum +
+        dx0 * (ds0 * isum0a + ds1 * isum0b) +
+        dx1 * (ds2 * isum1a + ds3 * isum1b) +
+        dx2 * (ds4 * isum2a + ds5 * isum2b) +
+        dx3 * (ds6 * isum3a + ds7 * isum3b)
+      xOff = xOff + 136
+    }
+    sum = sum + blockSum
+    wOff = wOff + 210
+  }
+  return sum
+}
+
+function vecDotIQ4_NL_Q8_0(xQ8, xQ8i8, srcOffset, n) {
+  var nb = n >> 5
+  var sum = 0.0
+  var wOff = srcOffset
+  var xOff = 0
+  var u8 = ggufUint8
+  for (var i = 0; i < nb; i = i + 1) {
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
+    var qw = wOff + 2
+    var qx = xOff + 2
+    var isum = 0
+    for (var j = 0; j < 16; j = j + 1) {
+      var qByte = u8[qw + j]
+      isum =
+        isum +
+        xQ8i8[qx + j] * kvalues_iq4nl[qByte & 0xf] +
+        xQ8i8[qx + j + 16] * kvalues_iq4nl[qByte >> 4]
+    }
+    sum = sum + dw * dx * isum
+    wOff = wOff + 18
+    xOff = xOff + 34
+  }
+  return sum
+}
+
+// Get Q8_0-input vec_dot function for a type (null for float types)
+function getVecDotQ8Func(type) {
+  switch (type) {
+    case GGML_TYPE.Q4_0:
+      return vecDotQ4_0_Q8_0
+    case GGML_TYPE.Q4_1:
+      return vecDotQ4_1_Q8_0
+    case GGML_TYPE.Q5_0:
+      return vecDotQ5_0_Q8_0
+    case GGML_TYPE.Q5_1:
+      return vecDotQ5_1_Q8_0
+    case GGML_TYPE.Q8_0:
+      return vecDotQ8_0_Q8_0
+    case GGML_TYPE.Q2_K:
+      return vecDotQ2_K_Q8_0
+    case GGML_TYPE.Q3_K:
+      return vecDotQ3_K_Q8_0
+    case GGML_TYPE.Q4_K:
+      return vecDotQ4_K_Q8_0
+    case GGML_TYPE.Q5_K:
+      return vecDotQ5_K_Q8_0
+    case GGML_TYPE.Q6_K:
+      return vecDotQ6_K_Q8_0
+    case GGML_TYPE.IQ4_NL:
+      return vecDotIQ4_NL_Q8_0
+    default:
+      return null
+  }
+}
+
 function matmulQuantized(out, x, qw) {
   var rows = qw.rows
   var cols = qw.cols
   var baseOffset = qw.dataOffset
   var rowSize = qw.rowSize
+  var dotQ8Func = qw.dotQ8Func
 
-  // Get function once before loop (avoids switch in hot path)
-  var dotFunc = qw.dotFunc
-
-  for (var i = 0; i < rows; i = i + 1) {
-    out[i] = dotFunc(x, baseOffset + i * rowSize, cols)
+  if (dotQ8Func) {
+    // Quantize x to Q8_0 once, then use integer dot products
+    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
+    for (var i = 0; i < rows; i = i + 1) {
+      out[i] = dotQ8Func(xQ8Buf, xQ8Int8Buf, baseOffset + i * rowSize, cols)
+    }
+  } else {
+    // Float weight types - use original float dot
+    var dotFunc = qw.dotFunc
+    for (var i = 0; i < rows; i = i + 1) {
+      out[i] = dotFunc(x, baseOffset + i * rowSize, cols)
+    }
   }
 }
 
@@ -2112,6 +2804,7 @@ function loadWeights(gguf) {
       cols: cols,
       rowSize: getRowSize(cols, t.type),
       dotFunc: getVecDotFunc(t.type),
+      dotQ8Func: getVecDotQ8Func(t.type),
     }
   }
 
@@ -2210,6 +2903,7 @@ function loadWeights(gguf) {
       cols: config.dim,
       rowSize: w.tokenEmbedding.rowSize,
       dotFunc: getVecDotFunc(w.tokenEmbedding.type),
+      dotQ8Func: getVecDotQ8Func(w.tokenEmbedding.type),
     }
   }
 
@@ -2258,6 +2952,13 @@ function createRunState(p) {
   // Create ArrayBuffer for KV caches with both Uint8 and Int8 views
   var keyCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
   var valueCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
+
+  // Allocate Q8_0 buffer for quantizing x in matmulQuantized
+  var maxCols = Math.max(p.dim, qDim, p.hiddenDim)
+  var xQ8Size = (maxCols >> 5) * 34
+  var xQ8Buffer = new ArrayBuffer(xQ8Size)
+  xQ8Buf = new Uint8Array(xQ8Buffer)
+  xQ8Int8Buf = new Int8Array(xQ8Buffer)
 
   // Pre-compute head offset tables to avoid repeated multiplication in attention loop
   var kvMul = p.nHeads / p.nKvHeads
