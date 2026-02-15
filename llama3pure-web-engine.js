@@ -3432,6 +3432,9 @@ function sample(logits, temp) {
 
   var vocabSize = config.vocabSize
   var k = topK
+  if (k > vocabSize) {
+    k = vocabSize
+  }
   var topKIdx = state.topKIndices
   var topKVal = state.topKValues
 

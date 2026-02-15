@@ -3773,6 +3773,8 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
 // Global state
 
 float temperature = 0.9f;
+float top_p = 0.9f;
+int top_k = 40;
 int max_tokens = 256;
 int context_size = 0;  // 0 means use model's default
 char *system_prompt = "You are a helpful assistant.";
@@ -3852,11 +3854,102 @@ void generate_token(void) {
         if (temperature == 0.0f) {
             next = argmax(state.logits, config.vocab_size);
         } else {
-            for (int q = 0; q < config.vocab_size; q++) {
-                state.logits[q] /= temperature;
+            int k = top_k;
+            if (k > config.vocab_size) k = config.vocab_size;
+            int top_k_idx[k];
+            float top_k_val[k];
+
+            // Initialize with first k logits
+            for (int i = 0; i < k; i++) {
+                top_k_idx[i] = i;
+                top_k_val[i] = state.logits[i];
             }
-            softmax(state.logits, config.vocab_size);
-            next = sample(state.logits, config.vocab_size);
+
+            // Find current min in top-k
+            int min_pos = 0;
+            float min_val = top_k_val[0];
+            for (int i = 1; i < k; i++) {
+                if (top_k_val[i] < min_val) {
+                    min_val = top_k_val[i];
+                    min_pos = i;
+                }
+            }
+
+            // Scan rest of vocab, replacing min when larger found
+            for (int i = k; i < config.vocab_size; i++) {
+                if (state.logits[i] > min_val) {
+                    top_k_val[min_pos] = state.logits[i];
+                    top_k_idx[min_pos] = i;
+                    // Re-find min
+                    min_val = top_k_val[0];
+                    min_pos = 0;
+                    for (int j = 1; j < k; j++) {
+                        if (top_k_val[j] < min_val) {
+                            min_val = top_k_val[j];
+                            min_pos = j;
+                        }
+                    }
+                }
+            }
+
+            // Apply temperature and fused max+softmax over just k values
+            float inv_temp = 1.0f / temperature;
+            float max_v = top_k_val[0];
+            for (int i = 1; i < k; i++) {
+                if (top_k_val[i] > max_v) max_v = top_k_val[i];
+            }
+            float max_vt = max_v * inv_temp;
+            float sum = 0.0f;
+            for (int i = 0; i < k; i++) {
+                float e = expf(top_k_val[i] * inv_temp - max_vt);
+                top_k_val[i] = e;
+                sum += e;
+            }
+
+            // Apply top-P (nucleus) filtering: sort by probability descending,
+            // then keep only tokens whose cumulative probability reaches top_p
+            int n = k;
+            if (top_p < 1.0f) {
+                // Insertion sort by probability descending (k is small, ~40)
+                for (int i = 1; i < k; i++) {
+                    float key_val = top_k_val[i];
+                    int key_idx = top_k_idx[i];
+                    int j = i - 1;
+                    while (j >= 0 && top_k_val[j] < key_val) {
+                        top_k_val[j + 1] = top_k_val[j];
+                        top_k_idx[j + 1] = top_k_idx[j];
+                        j--;
+                    }
+                    top_k_val[j + 1] = key_val;
+                    top_k_idx[j + 1] = key_idx;
+                }
+
+                // Accumulate probabilities until we reach the top_p threshold
+                float cum_sum = 0.0f;
+                float threshold = top_p * sum;
+                n = k;
+                for (int i = 0; i < k; i++) {
+                    cum_sum += top_k_val[i];
+                    if (cum_sum >= threshold) {
+                        n = i + 1;
+                        break;
+                    }
+                }
+
+                // Recompute sum over the kept tokens
+                sum = 0.0f;
+                for (int i = 0; i < n; i++) {
+                    sum += top_k_val[i];
+                }
+            }
+
+            // Normalize and sample from the filtered distribution
+            float inv_sum = 1.0f / sum;
+            for (int i = 0; i < n; i++) {
+                top_k_val[i] *= inv_sum;
+            }
+            int s = sample(top_k_val, n);
+            next = top_k_idx[s];
         }
 
         // Update recent tokens buffer (circular)
@@ -3947,6 +4040,10 @@ int main(int argc, char *argv[]) {
             chat_history_file = argv[++i];
         } else if (strcmp(argv[i], "-system_prompt") == 0 && i + 1 < argc) {
             system_prompt = argv[++i];
+        } else if (strcmp(argv[i], "-top_p") == 0 && i + 1 < argc) {
+            top_p = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-top_k") == 0 && i + 1 < argc) {
+            top_k = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-debug") == 0) {
             debug_mode = 1;
         }
@@ -3963,6 +4060,8 @@ int main(int argc, char *argv[]) {
         printf("\nOptional arguments:\n");
         printf("  -system_prompt system prompt (default: \"You are a helpful assistant.\")\n");
         printf("  -temperature   sampling temperature (default: 0.9, use 0.0 for greedy)\n");
+        printf("  -top_p         top-P nucleus sampling threshold (default: 0.9)\n");
+        printf("  -top_k         top-K sampling count (default: 40)\n");
         printf("  -max_tokens    number of tokens to generate (default: 256)\n");
         printf("  -context_size  context size for the AI model (default: model's max)\n");
         printf("  -debug         show detailed model loading and performance logs\n");
