@@ -3671,7 +3671,6 @@ int main(int argc, char *argv[]) {
             }
             // Stop if the model is stuck repeating text
             if (repetition_detected) {
-                printf("corto");
                 break;
             }
         }
