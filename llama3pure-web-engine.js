@@ -77,6 +77,7 @@ var state = null
 var tokenizer = null
 var ggufData = null
 var dataView = null
+var ggufTextDecoder = new TextDecoder("utf-8")
 var offset = 0
 
 var temperature = 0.9
@@ -151,9 +152,7 @@ function readString() {
   var len = readUint64()
   var bytes = new Uint8Array(ggufData, offset, len)
   offset = offset + len
-  // Decode UTF-8 properly
-  var decoder = new TextDecoder("utf-8")
-  return decoder.decode(bytes)
+  return ggufTextDecoder.decode(bytes)
 }
 
 // Cached full-buffer typed array views (initialized on model load)
@@ -453,7 +452,7 @@ function dequantizeF32(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ4_0(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK4_0)
+  var nb = count >> 5
   var blockSize = 2 + QK4_0 / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -474,7 +473,7 @@ function dequantizeQ4_0(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ4_1(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK4_1)
+  var nb = count >> 5
   var blockSize = 2 + 2 + QK4_1 / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -496,7 +495,7 @@ function dequantizeQ4_1(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ8_0(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK8_0)
+  var nb = count >> 5
   var blockSize = 2 + QK8_0
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -513,7 +512,7 @@ function dequantizeQ8_0(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ5_0(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK5_0)
+  var nb = count >> 5
   var blockSize = 2 + 4 + QK5_0 / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -542,7 +541,7 @@ function dequantizeQ5_0(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ5_1(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK5_1)
+  var nb = count >> 5
   var blockSize = 2 + 2 + 4 + QK5_1 / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -572,7 +571,7 @@ function dequantizeQ5_1(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ2_K(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK_K)
+  var nb = count >> 8
   var blockSize = QK_K / 16 + QK_K / 4 + 2 + 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -621,13 +620,14 @@ function dequantizeQ2_K(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK_K)
+  var nb = count >> 8
   var blockSize = QK_K / 8 + QK_K / 4 + 12 + 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
 
   var kmask1 = 0x03030303
   var kmask2 = 0x0f0f0f0f
+  var scales = new Int8Array(16)
 
   for (var i = 0; i < nb; i = i + 1) {
     var blockOffset = i * blockSize
@@ -657,7 +657,6 @@ function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
       (scalesRaw[11] << 24)
 
     var tmp = aux2
-    var scales = new Int8Array(16)
     var s0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4)
     var s1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4)
     var s2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
@@ -721,7 +720,7 @@ function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ5_K(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK_K)
+  var nb = count >> 8
   var blockSize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -784,7 +783,7 @@ function dequantizeQ5_K(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ4_K(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK_K)
+  var nb = count >> 8
   var blockSize = 2 + 2 + 12 + QK_K / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -835,7 +834,7 @@ function dequantizeQ4_K(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeQ6_K(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK_K)
+  var nb = count >> 8
   var blockSize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -853,8 +852,8 @@ function dequantizeQ6_K(srcOffset, dst, dstOffset, count) {
 
     for (var n = 0; n < QK_K; n = n + 128) {
       for (var l = 0; l < 32; l = l + 1) {
-        var is = Math.floor(l / 16)
-        var scBase = scalesOffset + Math.floor(n / 128) * 8
+        var is = l >> 4
+        var scBase = scalesOffset + (n >> 7) * 8
         var q1 = ((ql[n / 2 + l] & 0xf) | (((qh[n / 4 + l] >> 0) & 3) << 4)) - 32
         var q2 =
           ((ql[n / 2 + l + 32] & 0xf) | (((qh[n / 4 + l] >> 2) & 3) << 4)) - 32
@@ -871,7 +870,7 @@ function dequantizeQ6_K(srcOffset, dst, dstOffset, count) {
 }
 
 function dequantizeIQ4_NL(srcOffset, dst, dstOffset, count) {
-  var nb = Math.floor(count / QK4_NL)
+  var nb = count >> 5
   var blockSize = 2 + QK4_NL / 2
   var totalBytes = nb * blockSize
   var src = getUint8ArrayAt(srcOffset, totalBytes)
@@ -1026,7 +1025,7 @@ function getTypeSize(type) {
 function getRowSize(nCols, type) {
   var blockSize = getBlockSize(type)
   var typeSize = getTypeSize(type)
-  return Math.floor(nCols / blockSize) * typeSize
+  return ((nCols / blockSize) | 0) * typeSize
 }
 
 // Dequantize a single row from quantized tensor into destination array
@@ -1645,8 +1644,7 @@ function vecDotF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   for (var i = 0; i < n; i = i + 1) {
-    var h = ggufUint8[bo] | (ggufUint8[bo + 1] << 8)
-    sum = sum + x[i] * fp16ToFp32(h)
+    sum = sum + x[i] * fp16ToFp32(dataView.getUint16(bo, true))
     bo = bo + 2
   }
   return sum
@@ -1657,8 +1655,7 @@ function vecDotBF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   for (var i = 0; i < n; i = i + 1) {
-    var h = ggufUint8[bo] | (ggufUint8[bo + 1] << 8)
-    sum = sum + x[i] * bf16ToFp32(h)
+    sum = sum + x[i] * bf16ToFp32(dataView.getUint16(bo, true))
     bo = bo + 2
   }
   return sum
@@ -1669,13 +1666,7 @@ function vecDotF32(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   for (var i = 0; i < n; i = i + 1) {
-    // Read 4 bytes as little-endian float
-    convInt[0] =
-      ggufUint8[bo] |
-      (ggufUint8[bo + 1] << 8) |
-      (ggufUint8[bo + 2] << 16) |
-      (ggufUint8[bo + 3] << 24)
-    sum = sum + x[i] * convFloat[0]
+    sum = sum + x[i] * dataView.getFloat32(bo, true)
     bo = bo + 4
   }
   return sum
@@ -1797,59 +1788,35 @@ function rmsnormGemma(out, x, w, size, eps, invSize) {
   }
 }
 
-function softmax(x, size) {
-  var maxVal = x[0]
+// In-place RMS norm at an offset into arr (avoids subarray allocation)
+function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
+  var ss = 0.0
   var size4 = size & ~3
-  var i = 1
-  // Find max with unrolled loop
-  for (; i < size4; i = i + 4) {
-    if (x[i] > maxVal) {
-      maxVal = x[i]
-    }
-    if (x[i + 1] > maxVal) {
-      maxVal = x[i + 1]
-    }
-    if (x[i + 2] > maxVal) {
-      maxVal = x[i + 2]
-    }
-    if (x[i + 3] > maxVal) {
-      maxVal = x[i + 3]
-    }
+  var end4 = arrOffset + size4
+  var end = arrOffset + size
+  var i = arrOffset
+  var wi = 0
+  for (; i < end4; i = i + 4, wi = wi + 4) {
+    var x0 = arr[i]
+    var x1 = arr[i + 1]
+    var x2 = arr[i + 2]
+    var x3 = arr[i + 3]
+    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
   }
-  for (; i < size; i = i + 1) {
-    if (x[i] > maxVal) {
-      maxVal = x[i]
-    }
+  for (; i < end; i = i + 1) {
+    ss = ss + arr[i] * arr[i]
   }
-  // Exp and sum with unrolled loop
-  var sum = 0.0
-  i = 0
-  for (; i < size4; i = i + 4) {
-    var e0 = Math.exp(x[i] - maxVal)
-    var e1 = Math.exp(x[i + 1] - maxVal)
-    var e2 = Math.exp(x[i + 2] - maxVal)
-    var e3 = Math.exp(x[i + 3] - maxVal)
-    x[i] = e0
-    x[i + 1] = e1
-    x[i + 2] = e2
-    x[i + 3] = e3
-    sum = sum + e0 + e1 + e2 + e3
+  ss = 1.0 / Math.sqrt(ss * invSize + eps)
+  i = arrOffset
+  wi = 0
+  for (; i < end4; i = i + 4, wi = wi + 4) {
+    arr[i] = w[wi] * ss * arr[i]
+    arr[i + 1] = w[wi + 1] * ss * arr[i + 1]
+    arr[i + 2] = w[wi + 2] * ss * arr[i + 2]
+    arr[i + 3] = w[wi + 3] * ss * arr[i + 3]
   }
-  for (; i < size; i = i + 1) {
-    x[i] = Math.exp(x[i] - maxVal)
-    sum = sum + x[i]
-  }
-  // Normalize with reciprocal multiply
-  var invSum = 1.0 / sum
-  i = 0
-  for (; i < size4; i = i + 4) {
-    x[i] = x[i] * invSum
-    x[i + 1] = x[i + 1] * invSum
-    x[i + 2] = x[i + 2] * invSum
-    x[i + 3] = x[i + 3] * invSum
-  }
-  for (; i < size; i = i + 1) {
-    x[i] = x[i] * invSum
+  for (; i < end; i = i + 1, wi = wi + 1) {
+    arr[i] = w[wi] * ss * arr[i]
   }
 }
 
@@ -2047,7 +2014,7 @@ function loadModel(arrayBuffer) {
   }
 
   if (config.headDim === 0) {
-    config.headDim = Math.floor(config.dim / config.nHeads)
+    config.headDim = (config.dim / config.nHeads) | 0
   }
 
   var vocabTokens = meta["tokenizer.ggml.tokens"] || []
@@ -2295,6 +2262,9 @@ function createRunState(p) {
     invHeadSize: 1.0 / headSize,
     // SWA pattern for per-layer RoPE frequency selection
     swaPattern: p.swaPattern,
+    // Pre-allocated buffers for top-k sampling
+    topKIndices: new Int32Array(40),
+    topKValues: new Float32Array(40),
   }
 }
 
@@ -2361,24 +2331,10 @@ function transformer(token, pos, computeLogits) {
 
     if (isGemma && lw.attnQNorm && lw.attnKNorm) {
       for (var h = 0; h < nHeads; h = h + 1) {
-        rmsnormGemma(
-          s.q.subarray(h * headSize, (h + 1) * headSize),
-          s.q.subarray(h * headSize, (h + 1) * headSize),
-          lw.attnQNorm,
-          headSize,
-          eps,
-          invHeadSize
-        )
+        rmsnormGemmaAt(s.q, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
       }
       for (var h = 0; h < nKvHeads; h = h + 1) {
-        rmsnormGemma(
-          s.k.subarray(h * headSize, (h + 1) * headSize),
-          s.k.subarray(h * headSize, (h + 1) * headSize),
-          lw.attnKNorm,
-          headSize,
-          eps,
-          invHeadSize
-        )
+        rmsnormGemmaAt(s.k, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
       }
     }
 
@@ -2690,29 +2646,74 @@ function sampleArgmax(logits, n) {
   return maxI
 }
 
-function sampleMultinomial(probabilities, n) {
-  var r = randomF32()
-  var cdf = 0.0
-  for (var i = 0; i < n; i = i + 1) {
-    cdf = cdf + probabilities[i]
-    if (r < cdf) {
-      return i
-    }
-  }
-  return n - 1
-}
-
 function sample(logits, temp) {
   if (temp === 0.0) {
     return sampleArgmax(logits, config.vocabSize)
   }
 
-  for (var i = 0; i < config.vocabSize; i = i + 1) {
-    logits[i] = logits[i] / temp
+  var vocabSize = config.vocabSize
+  var k = 40
+  var topKIdx = state.topKIndices
+  var topKVal = state.topKValues
+
+  // Initialize with first k logits
+  for (var i = 0; i < k; i = i + 1) {
+    topKIdx[i] = i
+    topKVal[i] = logits[i]
   }
 
-  softmax(logits, config.vocabSize)
-  return sampleMultinomial(logits, config.vocabSize)
+  // Find current min in top-k
+  var minPos = 0
+  var minVal = topKVal[0]
+  for (var i = 1; i < k; i = i + 1) {
+    if (topKVal[i] < minVal) {
+      minVal = topKVal[i]
+      minPos = i
+    }
+  }
+
+  // Scan rest of vocab, replacing min when larger found
+  for (var i = k; i < vocabSize; i = i + 1) {
+    if (logits[i] > minVal) {
+      topKVal[minPos] = logits[i]
+      topKIdx[minPos] = i
+      // Re-find min
+      minVal = topKVal[0]
+      minPos = 0
+      for (var j = 1; j < k; j = j + 1) {
+        if (topKVal[j] < minVal) {
+          minVal = topKVal[j]
+          minPos = j
+        }
+      }
+    }
+  }
+
+  // Apply temperature and softmax over just k values
+  var invTemp = 1.0 / temp
+  var maxV = topKVal[0]
+  for (var i = 1; i < k; i = i + 1) {
+    if (topKVal[i] > maxV) {
+      maxV = topKVal[i]
+    }
+  }
+  var sum = 0.0
+  for (var i = 0; i < k; i = i + 1) {
+    var e = Math.exp(topKVal[i] * invTemp - maxV * invTemp)
+    topKVal[i] = e
+    sum = sum + e
+  }
+
+  // Sample from top-k distribution
+  var r = randomF32() * sum
+  var cdf = 0.0
+  for (var i = 0; i < k; i = i + 1) {
+    cdf = cdf + topKVal[i]
+    if (r < cdf) {
+      return topKIdx[i]
+    }
+  }
+  return topKIdx[k - 1]
 }
 
 // ----------------------------------------------------------------------------
@@ -3261,10 +3262,22 @@ function generate(chatHistory) {
           postMessage({ type: "token", token: decoded })
         }
 
-        // Stop if the model is stuck repeating text
-        if (output.length > 100) {
+        // Stop if the model is stuck repeating text (check every 10 steps)
+        if (output.length > 100 && step % 10 === 0) {
           var toFind = output.substring(output.length - 30, output.length)
-          var repeatedText = output.split(toFind).length - 1
+          var repeatedText = 0
+          var searchFrom = 0
+          while (searchFrom < output.length) {
+            var found = output.indexOf(toFind, searchFrom)
+            if (found === -1) {
+              break
+            }
+            repeatedText = repeatedText + 1
+            if (repeatedText > 10) {
+              break
+            }
+            searchFrom = found + 1
+          }
           if (repeatedText > 10) {
             break
           }
