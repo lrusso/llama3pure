@@ -36,6 +36,7 @@ const main = () => {
       { role: "user", content: "Tell me in 1 line the names of the founders." },
     ],
   })
+
   process.stdout.write("\n")
 }
 
