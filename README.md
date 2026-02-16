@@ -8,7 +8,7 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 - [Building the engine (macOS / Linux)](#building-the-engine-macos--linux)
 - [Building the engine (Windows)](#building-the-engine-windows)
-- [Running the engine (MacOS / Linux / Windows)](#running-the-engine-macos--linux--windows)
+- [Running the engine (macOS / Linux / Windows)](#running-the-engine-macos--linux--windows)
 - [Running in Node.js](#running-in-nodejs)
 - [Running in Web Environments](#running-in-web-environments)
 - [Suggested Models and Engines](#suggested-models-and-engines)
@@ -30,7 +30,7 @@ Use the x64 Native Tools Command Prompt for VS.
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ```
 
-## Running the engine (MacOS / Linux / Windows)
+## Running the engine (macOS / Linux / Windows)
 
 ```bash
 # On MacOS / Linux
