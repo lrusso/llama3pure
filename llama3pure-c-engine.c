@@ -3818,7 +3818,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
 float temperature = 0.9f;
 float top_p = 0.9f;
 int top_k = 40;
-int max_tokens = 256;
+int max_tokens = -1;
 int context_size = 0;  // 0 means use model's default
 char *system_prompt = "You are a helpful assistant.";
 Config config;

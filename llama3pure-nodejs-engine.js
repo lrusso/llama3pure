@@ -88,7 +88,7 @@ var temperature = 0.9
 var topP = 0.9
 var topK = 40
 var systemPrompt = "You are a helpful assistant."
-var maxTokens = 256
+var maxTokens = -1
 var contextSize = 0
 
 // QuantizedTensor structure: { dataOffset, type, rows, cols }
@@ -4042,7 +4042,12 @@ function generate(chatHistory) {
     ? null
     : new TextDecoder("utf-8", { fatal: false })
 
-  for (var step = 0; step < maxTokens; step = step + 1) {
+  var effectiveMaxTokens = maxTokens
+  if (effectiveMaxTokens <= 0 || effectiveMaxTokens > config.seqLen) {
+    effectiveMaxTokens = config.seqLen
+  }
+
+  for (var step = 0; step < effectiveMaxTokens; step = step + 1) {
     transformer(token, pos, pos >= numPromptTokens - 1)
 
     var next
