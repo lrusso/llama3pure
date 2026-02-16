@@ -1,17 +1,14 @@
 import llama3pure from "./llama3pure-nodejs-engine.js"
-import path from "path"
 import { fileURLToPath } from "url"
+import path from "path"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-function myRenderFunction(token) {
-  process.stdout.write(token)
-}
+const modelName = "gemma-3-270m-it-Q8_0.gguf"
+const modelPath = path.resolve(__dirname, modelName)
 
-function main() {
-  const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
-
+const main = () => {
   llama3pure({
     systemPrompt: "You are a helpful assistant.",
     maxTokens: 256,
@@ -21,9 +18,12 @@ function main() {
     topK: 40,
     type: "load",
     filePath: modelPath,
-    filename: "gemma-3-270m-it-Q8_0.gguf",
-    cbRender: myRenderFunction,
+    filename: modelName,
+    cbRender: (token) => {
+      process.stdout.write(token)
+    },
   })
+
   llama3pure({
     type: "generate",
     chatHistory: [
