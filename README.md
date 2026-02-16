@@ -42,18 +42,18 @@ llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 ```
 
-| Argument | Required	| Description | Default Value |
-| :----------- | :------: | :------ |  :------: |
-| -model | Yes | Path to a GGUF model file. | - |
-| -prompt | No | Input prompt text (single-turn, alternative to -chathistory). | - |
-| -chathistory | No | Path to a .txt file containing a JSON chat history (multi-turn, alternative to -prompt). | - |
-| -system_prompt | No |	System prompt prepended to every conversation. | `You are a helpful assistant.`	| 
-| -max_tokens | No | Maximum number of tokens to generate per response. | -1 (unlimited) |
-| -context_size | No | Context window size (capped by the model's own limit). | Model's max. |
-| -temperature | No | Sampling temperature. Higher values produce more varied output. | 0.9 | 
-| -top_p | No | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. | 0.9 | 
-| -top_k | No | Top-K sampling. Only the K most probable tokens are considered at each step. | 40 |
-| -debug | No | Show detailed model loading and performance logs (including tok/s). | disabled |
+| Argument       | Required | Description                                                                                             |         Default Value          |
+| :------------- | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
+| -model         |   Yes    | Path to a GGUF model file.                                                                              |               -                |
+| -prompt        |    No    | Input prompt text (single-turn, alternative to -chathistory).                                           |               -                |
+| -chathistory   |    No    | Path to a .txt file containing a JSON chat history (multi-turn, alternative to -prompt).                |               -                |
+| -system_prompt |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
+| -max_tokens    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| -context_size  |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
+| -temperature   |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
+| -top_p         |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
+| -top_k         |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
+| -debug         |    No    | Show detailed model loading and performance logs (including tok/s).                                     |            disabled            |
 
 Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt).
 
@@ -87,8 +87,8 @@ llama3pure({
 | model        |  string  |   Yes    | Absolute path to a GGUF model file.                                                                     |               -                |
 | cbRender     | function |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
 | systemPrompt |  string  |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |              -1 (unlimited)               |
-| contextSize  |  number  |    No    | Context window size (capped by the model's own limit).                                                  |              Model's max.              |
+| maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| contextSize  |  number  |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
 | temperature  |  number  |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
 | topP         |  number  |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
 | topK         |  number  |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
@@ -153,8 +153,8 @@ reader.readAsArrayBuffer(file)
 | type         |   string    |   Yes    | Must be `load`                                                                                          |               -                |
 | model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                           |               -                |
 | systemPrompt |   string    |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| maxTokens    |   number    |    No    | Maximum number of tokens to generate per response.                                                      |              -1 (unlimited)               |
-| contextSize  |   number    |    No    | Context window size (capped by the model's own limit).                                                  |              Model's max.              |
+| maxTokens    |   number    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| contextSize  |   number    |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
 | temperature  |   number    |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
 | topP         |   number    |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
 | topK         |   number    |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
