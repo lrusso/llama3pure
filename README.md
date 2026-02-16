@@ -72,7 +72,7 @@ const __dirname = path.dirname(__filename)
 const modelName = "gemma-3-270m-it-Q8_0.gguf"
 const modelPath = path.resolve(__dirname, modelName)
 
-function main() {
+const main = () => {
   llama3pure({
     systemPrompt: "You are a helpful assistant.",
     maxTokens: 256,
@@ -84,7 +84,7 @@ function main() {
     filePath: modelPath,
     filename: modelName,
     cbRender: (token) => {
-      process.stdout.write(token)  
+      process.stdout.write(token)
     },
   })
 
