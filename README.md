@@ -9,13 +9,13 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 - [Build and Run (macOS / Linux)](#build-and-run-macos--linux)
 - [Build and Run (Windows)](#build-and-run-windows)
 - [Running in Node.js](#running-in-nodejs)
-- [Running in Web Environments](#how-to-run-the-web-engine)
+- [Running in Web Environments](#running-in-web-environments)
 - [Suggested Models and Engines](#suggested-models-and-engines)
-- [Tested Models](#tested-with-the-following-models-and-engines)
+- [Tested Models](#tested-models)
 - [Author's Notes](#authors-notes)
 - [Credits](#based-on-the-work-of)
 
-## Build and Run (macOS / Linux):
+## Build and Run (macOS / Linux)
 
 - Build the engine
 ```
@@ -63,13 +63,13 @@ llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tok
 
 Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
-## How to run the Web engine:
+## Running in Web Environments
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
 
-## Suggested models and engines:
+## Suggested Models and Engines
 
 | MODEL                                                                                                                                                     |  C  | NODE.JS | WEB |
 | :-------------------------------------------------------------------------------------------------------------------------------------------------------- | :-: | :-----: | :-: |
@@ -78,7 +78,7 @@ Due to universal browser memory constraints regarding ArrayBuffer size limits, t
 | [Llama-3.2-3B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q8_0.gguf?download=true) | ✅  |   ✅    | ❌  |
 | [Gemma-3-4b-it-Q8_0.gguf](https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q8_0.gguf?download=true)                           | ✅  |   ✅    | ❌  |
 
-## Tested with the following models and engines:
+## Tested Models
 
 | MODEL                                                                                                                                                             |  C  | NODE.JS | WEB |
 | :---------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-: | :-----: | :-: |
@@ -123,12 +123,12 @@ Due to universal browser memory constraints regarding ArrayBuffer size limits, t
 | [Llama-3-8B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q8_0.gguf?download=true)     | ✅  |   ✅    | ❌  |
 | [Llama-3-8B-Instruct-fp16.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-fp16.gguf?download=true)     | ✅  |   ✅    | ❌  |
 
-## Author's notes:
+## Author's Notes
 
 - Using quantizations below Q4 is generally discouraged because the loss in logic and coherence makes them nearly unusable for most tasks.
 
 - There isn't a Python engine because a ported and pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
 
-## Based on the work of:
+## Based on the work of
 
 https://github.com/karpathy/llama2.c
