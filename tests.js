@@ -70,7 +70,6 @@ const testModelUsingNode = (model) => {
   llama3pure({
     type: "load",
     filePath: modelPath,
-    filename: model,
     maxTokens: 1024,
     contextSize: 2048,
     cbRender: function (token) {
