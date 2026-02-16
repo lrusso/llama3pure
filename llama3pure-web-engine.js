@@ -89,7 +89,7 @@ var topP = 0.9
 var topK = 40
 var systemPrompt = "You are a helpful assistant."
 var maxTokens = 256
-var contextSize = 2048
+var contextSize = 0
 
 // QuantizedTensor structure: { dataOffset, type, rows, cols }
 // Stores metadata to read quantized weights on-the-fly during matmul
@@ -2725,7 +2725,7 @@ function loadModel(arrayBuffer) {
       meta[keyPrefix + ".attention.head_count"] ||
       32,
     vocabSize: meta[keyPrefix + ".vocab_size"] || 32000,
-    seqLen: Math.min(modelSeqLen, contextSize),
+    seqLen: contextSize > 0 ? Math.min(modelSeqLen, contextSize) : modelSeqLen,
     ropeTheta:
       meta[keyPrefix + ".rope.freq_base"] || (isGemma ? 1000000.0 : 500000.0),
     headDim: meta[keyPrefix + ".attention.key_length"] || 0,
