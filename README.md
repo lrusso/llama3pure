@@ -105,6 +105,8 @@ const main = () => {
 main()
 ```
 
+Demo script in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
+
 ## Running in Web Environments
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
