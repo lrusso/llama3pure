@@ -74,7 +74,7 @@ const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
 const main = () => {
   llama3pure({
     type: "load",
-    filePath: modelPath,
+    model: modelPath,
     cbRender: (token) => {
       process.stdout.write(token)
     },
