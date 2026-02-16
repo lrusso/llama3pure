@@ -18,21 +18,25 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 ## Build and Run (macOS / Linux)
 
 - Build the engine
+
 ```
 make llama3pure
 ```
 
 - Run with basic prompt
+
 ```
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."`
 ```
 
 - Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
+
 ```
 ./llama3pure -model Llama3.gguf -chathistory chat.txt
 ```
 
 - Run with custom parameters
+
 ```
 ./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
@@ -40,28 +44,32 @@ make llama3pure
 ## Build and Run (Windows)
 
 - Build the engine (use the x64 Native Tools Command Prompt for VS)
+
 ```
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ```
 
 - Run with basic prompt
+
 ```
 llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 ```
 
 - Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
+
 ```
 llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 ```
 
 - Run with custom parameters
+
 ```
 llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
 ## Running in Node.js
 
-* Step 1: Load a model
+- Step 1: Load a model
 
 Call `llama3pure` with `type: "load"` to load a GGUF model file and configure the engine.
 
@@ -83,19 +91,19 @@ llama3pure({
 })
 ```
 
-| Parameter	| Type |	Required |	Description | Default value | 
-| :------------ |:---------------:| :-----:| :----- | :-----: |
-| type |	string |Yes | Must be `load`| - |
-| model |	string | Yes	|	Absolute path to a GGUF model file. | - | 
-| cbRender | function | Yes	|	Callback invoked with each generated token as a string. | - |
-| systemPrompt | string | No	| System prompt prepended to every conversation. | `You are a helpful assistant.` | 
-| maxTokens | number	| No	| Maximum number of tokens to generate per response. | 256 | 
-| contextSize | number | No	| Context window size (capped by the model's own limit). | 2048 |
-| temperature | number | No	| Sampling temperature. Higher values produce more varied output. | 0.9 |
-| topP | number | No | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. | 0.9 |
-| topK | number | No | Top-K sampling. Only the K most probable tokens are considered at each step. | 40 |
+| Parameter    |   Type   | Required | Description                                                                                             |         Default value          |
+| :----------- | :------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
+| type         |  string  |   Yes    | Must be `load`                                                                                          |               -                |
+| model        |  string  |   Yes    | Absolute path to a GGUF model file.                                                                     |               -                |
+| cbRender     | function |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
+| systemPrompt |  string  |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
+| maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |              256               |
+| contextSize  |  number  |    No    | Context window size (capped by the model's own limit).                                                  |              2048              |
+| temperature  |  number  |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
+| topP         |  number  |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
+| topK         |  number  |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
 
-* Step 2: Generate a response
+- Step 2: Generate a response
 
 Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `role: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations.
 
@@ -114,10 +122,10 @@ llama3pure({
 })
 ```
 
-| Parameter | Type	| Required	| Description |
-| :------------ |:---------------:| :-----:| :----- |
-| type	|string	|Yes	| Must be `generate`. |
-| chatHistory	| array	| Yes	| Array of message objects representing the conversation. |
+| Parameter   |  Type  | Required | Description                                             |
+| :---------- | :----: | :------: | :------------------------------------------------------ |
+| type        | string |   Yes    | Must be `generate`.                                     |
+| chatHistory | array  |   Yes    | Array of message objects representing the conversation. |
 
 Full example in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
