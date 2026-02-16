@@ -75,8 +75,8 @@ const modelPath = path.resolve(__dirname, modelName)
 const main = () => {
   llama3pure({
     type: "load",
-    filePath: modelPath,
     filename: modelName,
+    filePath: modelPath,
     cbRender: (token) => {
       process.stdout.write(token)
     },
