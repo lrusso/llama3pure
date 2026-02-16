@@ -4173,7 +4173,9 @@ self.onmessage = function (e) {
         break
 
       case "generate":
-        generate(data.chatHistory)
+        if (ggufUint8) {
+          generate(data.chatHistory)
+        }
         break
 
       default:
