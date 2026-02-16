@@ -18,7 +18,7 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 ## Building the engine (macOS / Linux)
 
-```
+```bash
 make llama3pure
 ```
 
@@ -26,13 +26,13 @@ make llama3pure
 
 Use the x64 Native Tools Command Prompt for VS.
 
-```
+```bash
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ```
 
 ## Running the engine (MacOS / Linux / Windows)
 
-```
+```bash
 # On MacOS / Linux
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 ./llama3pure -model Llama3.gguf -chathistory chat.txt
