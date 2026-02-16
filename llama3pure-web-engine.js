@@ -4178,6 +4178,6 @@ self.onmessage = function (e) {
         break
     }
   } catch (err) {
-    console.log(err)
+    console.error(err)
   }
 }

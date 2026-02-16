@@ -4181,11 +4181,11 @@ function llama3pure(data) {
           topK = data.topK
         }
         if (typeof data.cbRender !== "function") {
-          console.log("The cbRender parameter is mandatory and must be a function.")
+          console.error("The cbRender parameter is required and must be a Function.")
           return
         }
         if (typeof data.model !== "string") {
-          console.log("The model parameter is mandatory and must be a string.")
+          console.error("The model parameter is required and must be a String.")
           return
         }
         cbRender = data.cbRender
