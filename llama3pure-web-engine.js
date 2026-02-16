@@ -4161,7 +4161,9 @@ self.onmessage = function (e) {
           topK = data.topK
         }
         if (!(data.model instanceof ArrayBuffer)) {
-          console.error("Error. The model parameter is required and must be an ArrayBuffer.")
+          console.error(
+            "Error. The model parameter is required and must be an ArrayBuffer."
+          )
           return
         }
         loadModel(data.model)
