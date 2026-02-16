@@ -2708,13 +2708,6 @@ function loadModel(arrayBuffer) {
 
   postMessage({
     type: "progress",
-    message:
-      "Model architecture: " +
-      arch +
-      ", isGemma: " +
-      isGemma +
-      ", keyPrefix: " +
-      keyPrefix,
   })
 
   var vocabTokens = meta["tokenizer.ggml.tokens"] || []
