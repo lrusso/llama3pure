@@ -4,6 +4,17 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 ![demo](https://github.com/lrusso/llama3pure/blob/main/README.gif?raw=true)
 
+## Table of Contents
+
+- [Build and run the engine on MacOS/Linux](#how-to-build-and-run-the-c-engine-on-macoslinux)
+- [Build and run the engine on Windows](#how-to-build-and-run-the-c-engine-on-windows)
+- [Run the engine on a Node.js environment](#how-to-run-the-nodejs-engine)
+- [Run the engine on a Web environment](#how-to-run-the-web-engine)
+- [Suggested models and engines](#suggested-models-and-engines)
+- [Tested models](#tested-with-the-following-models-and-engines)
+- [Author's notes](#authors-notes)
+- [Credits](#based-on-the-work-of)
+
 ## How to build and run the C engine on MacOS/Linux:
 
 ### Build the engine
