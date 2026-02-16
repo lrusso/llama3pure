@@ -69,13 +69,11 @@ import path from "path"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
-const modelName = "gemma-3-270m-it-Q8_0.gguf"
-const modelPath = path.resolve(__dirname, modelName)
+const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
 
 const main = () => {
   llama3pure({
     type: "load",
-    filename: modelName,
     filePath: modelPath,
     cbRender: (token) => {
       process.stdout.write(token)
