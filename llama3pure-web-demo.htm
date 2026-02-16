@@ -153,7 +153,6 @@
       var replies = []
       var selectedReply = 0
 
-      var MAX_TOKENS = 1024
       var CONTEXT_SIZE = 2048
       var TEMPERATURE = 0.9
       var TOP_P = 0.9
@@ -319,7 +318,6 @@
               type: "load",
               model: arrayBuffer,
               systemPrompt: t("system_prompt"),
-              maxTokens: MAX_TOKENS,
               contextSize: CONTEXT_SIZE,
               temperature: TEMPERATURE,
               topP: TOP_P,
