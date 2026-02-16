@@ -97,7 +97,7 @@ llama3pure({
 
 * Step 2: Generate a response
 
-Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens.
+Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `role: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations.
 
 ```javascript
 llama3pure({
@@ -113,6 +113,11 @@ llama3pure({
   ],
 })
 ```
+
+| Parameter | Type	| Required	| Description |
+| :------------ |:---------------:| :-----:| :----- |
+| type	|string	|Yes	| Must be `generate`. |
+| chatHistory	| array	| Yes	| Array of message objects representing the conversation. |
 
 Demo script in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
