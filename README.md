@@ -158,6 +158,18 @@ reader.onload = (event) => {
 reader.readAsArrayBuffer(file)
 ```
 
+| Parameter    |   Type   | Required | Description                                                                                             |         Default value          |
+| :----------- | :------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
+| type         |  string  |   Yes    | Must be `load`                                                                                          |               -                |
+| model        |  ArrayBuffer  |   Yes    | The GGUF model file contents.                                                                     |               -                |
+| cbRender     | function |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
+| systemPrompt |  string  |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
+| maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |              256               |
+| contextSize  |  number  |    No    | Context window size (capped by the model's own limit).                                                  |              2048              |
+| temperature  |  number  |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
+| topP         |  number  |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
+| topK         |  number  |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
+
 
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
