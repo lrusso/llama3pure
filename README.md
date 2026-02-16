@@ -15,57 +15,46 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 - [Author's Notes](#authors-notes)
 - [Credits](#based-on-the-work-of)
 
-## Build and Run (macOS / Linux)
-
-- Build the engine
+## Build the engine (macOS / Linux)
 
 ```
 make llama3pure
 ```
 
-- Run with basic prompt
+## Build the engine (Windows)
 
-```
-./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."`
-```
-
-- Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
-
-```
-./llama3pure -model Llama3.gguf -chathistory chat.txt
-```
-
-- Run with custom parameters
-
-```
-./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
-```
-
-## Build and Run (Windows)
-
-- Build the engine (use the x64 Native Tools Command Prompt for VS)
+Use the x64 Native Tools Command Prompt for VS.
 
 ```
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ```
 
-- Run with basic prompt
+## Running on MacOS, Linux and Windows
 
 ```
-llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
+# On MacOS / Linux
+./llama3pure -model <model.gguf> -prompt <text> [options]
+./llama3pure -model <model.gguf> -chathistory <file.txt> [options]
+
+# On Windows
+llama3pure.exe -model <model.gguf> -prompt <text> [options]
+llama3pure.exe -model <model.gguf> -chathistory <file.txt> [options]
 ```
 
-- Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
+| Argument | Required	| Description | Default Value |
+| :----------- | :------: | :------ |  :------: |
+| -model | Yes | Path to a GGUF model file. | - |
+| -prompt | No | Input prompt text (single-turn, alternative to -chathistory). | - |
+| -chathistory | No | Path to a .txt file containing a JSON chat history (multi-turn, alternative to -prompt). | - |
+| -system_prompt | No |	System prompt prepended to every conversation. | `You are a helpful assistant.`	| 
+| -max_tokens | No | Maximum number of tokens to generate per response. | 256 |
+| -context_size | No | Context window size (capped by the model's own limit). | Model's max. |
+| -temperature | No | Sampling temperature. Higher values produce more varied output. | 0.9 | 
+| -top_p | No | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. | 0.9 | 
+| -top_k | No | Top-K sampling. Only the K most probable tokens are considered at each step. | 40 |
+| -debug | No | Show detailed model loading and performance logs (including tok/s). | disabled |
 
-```
-llama3pure.exe -model Llama3.gguf -chathistory chat.txt
-```
-
-- Run with custom parameters
-
-```
-llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
-```
+Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt).
 
 ## Running in Node.js
 
