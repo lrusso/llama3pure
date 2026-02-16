@@ -169,6 +169,55 @@ reader.readAsArrayBuffer(file)
 | topP         |  number  |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
 | topK         |  number  |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
 
+- Step 2: Generate a response
+
+```javascript
+worker.postMessage({
+  type: "generate",
+  chatHistory: [
+    { role: "user", content: "Tell me in 1 line what is Microsoft." },
+    {
+      role: "assistant",
+      content:
+        "Microsoft is a global technology leader known for its innovative products and services.",
+    },
+    { role: "user", content: "Tell me in 1 line the names of the founders." },
+  ],
+})
+```
+
+| Parameter   |  Type  | Required | Description                                             |
+| :---------- | :----: | :------: | :------------------------------------------------------ |
+| type        | string |   Yes    | Must be `generate`.                                     |
+| chatHistory | array  |   Yes    | Array of message objects representing the conversation. |
+
+- Step 3: Receiving messages from the Worker
+
+```javascript
+worker.onmessage = function (e) {
+  var data = e.data
+  switch (data.type) {
+    case "progress":
+      // Fired during model loading
+      break
+
+    case "loaded":
+      // Fired once the model is fully loaded and ready
+      break
+
+    case "token":
+      // Fired for each generated token during inference
+      console.log(data.token)
+      break
+
+    case "complete":
+      // Fired when generation is finished
+      console.log(data.output)
+      break
+  }
+}
+```
+
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
