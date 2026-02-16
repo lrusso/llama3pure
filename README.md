@@ -63,7 +63,7 @@ llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tok
 
 * Step 1: Load a model
 
-Call llama3pure with type: "load" to load a GGUF model file and configure the engine.
+Call `llama3pure` with `type: "load"` to load a GGUF model file and configure the engine.
 
 ```javascript
 import llama3pure from "./llama3pure-nodejs-engine.js"
@@ -95,46 +95,23 @@ llama3pure({
 | topP | number | No | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. | 0.9 |
 | topK | number | No | Top-K sampling. Only the K most probable tokens are considered at each step. | 40 |
 
+* Step 2: Generate a response
+
+Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens.
+
 ```javascript
-import llama3pure from "./llama3pure-nodejs-engine.js"
-import { fileURLToPath } from "url"
-import path from "path"
-
-const __filename = fileURLToPath(import.meta.url)
-const __dirname = path.dirname(__filename)
-
-const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
-
-const main = () => {
-  llama3pure({
-    type: "load",
-    model: modelPath,
-    cbRender: (token) => {
-      process.stdout.write(token)
+llama3pure({
+  type: "generate",
+  chatHistory: [
+    { role: "user", content: "Tell me in 1 line what is Microsoft." },
+    {
+      role: "assistant",
+      content:
+        "Microsoft is a global technology leader known for its innovative products and services.",
     },
-    systemPrompt: "You are a helpful assistant.",
-    maxTokens: 256,
-    contextSize: 2048,
-    temperature: 0.9,
-    topP: 0.9,
-    topK: 40,
-  })
-
-  llama3pure({
-    type: "generate",
-    chatHistory: [
-      { role: "user", content: "Tell me in 1 line what is Microsoft." },
-      {
-        role: "assistant",
-        content:
-          "Microsoft is a global technology leader known for its innovative products and services.",
-      },
-      { role: "user", content: "Tell me in 1 line the names of the founders." },
-    ],
-  })
-}
-
-main()
+    { role: "user", content: "Tell me in 1 line the names of the founders." },
+  ],
+})
 ```
 
 Demo script in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
