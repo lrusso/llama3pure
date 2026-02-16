@@ -4160,7 +4160,11 @@ self.onmessage = function (e) {
         if (data.topK !== undefined) {
           topK = data.topK
         }
-        loadModel(data.arrayBuffer)
+        if (!(data.model instanceof ArrayBuffer)) {
+          console.error("Error. The model parameter is required and must be an ArrayBuffer.")
+          return
+        }
+        loadModel(data.model)
         postMessage({
           type: "loaded",
         })
@@ -4170,21 +4174,10 @@ self.onmessage = function (e) {
         generate(data.chatHistory)
         break
 
-      case "setTemperature":
-        temperature = data.value
-        break
-
-      case "setSystemPrompt":
-        systemPrompt = data.value
-        break
-
       default:
-        postMessage({
-          type: "error",
-          message: "Unknown message type: " + data.type,
-        })
+        break
     }
   } catch (err) {
-    postMessage({ type: "error", message: err.message })
+    console.log(err)
   }
 }

@@ -317,7 +317,7 @@
           worker.postMessage(
             {
               type: "load",
-              arrayBuffer: arrayBuffer,
+              model: arrayBuffer,
               maxTokens: MAX_TOKENS,
               contextSize: CONTEXT_SIZE,
               systemPrompt: t("system_prompt"),
