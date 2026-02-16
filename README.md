@@ -81,7 +81,7 @@ llama3pure({
 })
 ```
 
-| Parameter    |   Type   | Required | Description                                                                                             |         Default value          |
+| Parameter    |   Type   | Required | Description                                                                                             |         Default Value          |
 | :----------- | :------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
 | type         |  string  |   Yes    | Must be `load`                                                                                          |               -                |
 | model        |  string  |   Yes    | Absolute path to a GGUF model file.                                                                     |               -                |
@@ -148,7 +148,7 @@ reader.onload = (event) => {
 reader.readAsArrayBuffer(file)
 ```
 
-| Parameter    |    Type     | Required | Description                                                                                             |         Default value          |
+| Parameter    |    Type     | Required | Description                                                                                             |         Default Value          |
 | :----------- | :---------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
 | type         |   string    |   Yes    | Must be `load`                                                                                          |               -                |
 | model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                           |               -                |
