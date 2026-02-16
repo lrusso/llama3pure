@@ -34,12 +34,12 @@ cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 
 ```
 # On MacOS / Linux
-./llama3pure -model <model.gguf> -prompt <text> [options]
-./llama3pure -model <model.gguf> -chathistory <file.txt> [options]
+./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
+./llama3pure -model Llama3.gguf -chathistory chat.txt
 
 # On Windows
-llama3pure.exe -model <model.gguf> -prompt <text> [options]
-llama3pure.exe -model <model.gguf> -chathistory <file.txt> [options]
+llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
+llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 ```
 
 | Argument | Required	| Description | Default Value |
