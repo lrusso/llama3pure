@@ -4168,6 +4168,9 @@ self.onmessage = function (e) {
           topK = data.topK
         }
         loadModel(data.arrayBuffer)
+        postMessage({
+          type: "loaded",
+        })
         break
 
       case "generate":
