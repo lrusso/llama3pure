@@ -4162,6 +4162,11 @@ function llama3pure(data) {
   try {
     switch (data.type) {
       case "load":
+        if (cbRender) {
+          console.log("A model is already loaded in the inference engine.")
+          return
+        }
+
         if (data.maxTokens !== undefined) {
           maxTokens = data.maxTokens
         }
@@ -4180,19 +4185,29 @@ function llama3pure(data) {
         if (data.topK !== undefined) {
           topK = data.topK
         }
+        if (typeof data.cbRender !== "function") {
+          console.log("The cbRender parameter is mandatory and must be a function.")
+          return
+        }
+        if (typeof data.model !== "string") {
+          console.log("The model parameter is mandatory and must be a string.")
+          return
+        }
         cbRender = data.cbRender
         loadModel(data.model)
         break
 
       case "generate":
-        generate(data.chatHistory)
+        if (cbRender) {
+          generate(data.chatHistory)
+        }
         break
 
       default:
         break
     }
   } catch (err) {
-    console.log(err)
+    console.error(err)
   }
 }
 
