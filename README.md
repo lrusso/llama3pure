@@ -6,64 +6,60 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 
 ## Table of Contents
 
-- [Build and Run (macOS / Linux)](#how-to-build-and-run-the-c-engine-on-macoslinux)
-- [Build and Run (Windows)](#how-to-build-and-run-the-c-engine-on-windows)
-- [Running in Node.js](#how-to-run-the-nodejs-engine)
+- [Build and Run (macOS / Linux)](#build-and-run-macos--linux)
+- [Build and Run (Windows)](#build-and-run-windows)
+- [Running in Node.js](#running-in-nodejs)
 - [Running in Web Environments](#how-to-run-the-web-engine)
 - [Suggested Models and Engines](#suggested-models-and-engines)
 - [Tested Models](#tested-with-the-following-models-and-engines)
 - [Author's Notes](#authors-notes)
 - [Credits](#based-on-the-work-of)
 
-## How to build and run the C engine on MacOS/Linux:
+## Build and Run (macOS / Linux):
 
-### Build the engine
+- Build the engine
 ```
 make llama3pure
 ```
 
-### Run with basic prompt
+- Run with basic prompt
 ```
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."`
 ```
 
-### Run with chat history
+- Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
 ```
 ./llama3pure -model Llama3.gguf -chathistory chat.txt
 ```
 
-Check the sample chat in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt)
-
-### Run with custom parameters
+- Run with custom parameters
 ```
 ./llama3pure -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
-## How to build and run the C engine on Windows:
+## Build and Run (Windows)
 
-### Build the engine (use the x64 Native Tools Command Prompt for VS)
+- Build the engine (use the x64 Native Tools Command Prompt for VS)
 ```
 cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ```
 
-### Run with basic prompt
+- Run with basic prompt
 ```
 llama3pure.exe -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 ```
 
-### Run with chat history
+- Run with chat history (sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt))
 ```
 llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 ```
 
-Check the sample chat in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt)
-
-### Run with custom parameters
+- Run with custom parameters
 ```
 llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tokens 256 -context_size 2048 -system_prompt "You are a helpful assistant." -prompt "Tell me in 1 line what is Microsoft."
 ```
 
-## How to run the Node.js engine:
+## Running in Node.js
 
 Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
