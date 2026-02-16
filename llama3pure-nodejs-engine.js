@@ -4180,38 +4180,19 @@ function llama3pure(data) {
         if (data.topK !== undefined) {
           topK = data.topK
         }
-        var result = loadModel(data.filePath)
         cbRender = data.cbRender
-        postMessage({
-          type: "loaded",
-          config: result.config,
-          maxTokens: maxTokens,
-          contextSize: contextSize,
-          topP: topP,
-          topK: topK,
-        })
+        loadModel(data.model)
         break
 
       case "generate":
         generate(data.chatHistory)
         break
 
-      case "setTemperature":
-        temperature = data.value
-        break
-
-      case "setSystemPrompt":
-        systemPrompt = data.value
-        break
-
       default:
-        postMessage({
-          type: "error",
-          message: "Unknown message type: " + data.type,
-        })
+        break
     }
   } catch (err) {
-    postMessage({ type: "error", message: err.message })
+    console.log(err)
   }
 }
 
