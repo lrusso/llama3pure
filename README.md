@@ -210,8 +210,8 @@ worker.onmessage = function (e) {
 
 | Event    |     Fields      | Description                                                                              |
 | :------- | :-------------: | :--------------------------------------------------------------------------------------- |
-| progress |        —        | Emitted during model loading to indicate progress.                                       |
-| loaded   |        —        | Emitted once when the model has been fully loaded and is ready for inference.            |
+| progress |        -        | Emitted during model loading to indicate progress.                                       |
+| loaded   |        -        | Emitted once when the model has been fully loaded and is ready for inference.            |
 | token    | token (string)  | Emitted for each token as it is generated, enabling real-time streaming of the response. |
 | complete | output (string) | Emitted when generation finishes. Contains the full generated text.                      |
 
