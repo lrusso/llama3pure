@@ -119,7 +119,7 @@ llama3pure({
 | type	|string	|Yes	| Must be `generate`. |
 | chatHistory	| array	| Yes	| Array of message objects representing the conversation. |
 
-Demo script in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
+Full example in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
 ## Running in Web Environments
 
