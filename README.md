@@ -61,6 +61,40 @@ llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tok
 
 ## Running in Node.js
 
+* Step 1: Load a model
+
+Call llama3pure with type: "load" to load a GGUF model file and configure the engine.
+
+```javascript
+import llama3pure from "./llama3pure-nodejs-engine.js"
+
+llama3pure({
+  type: "load",
+  model: "/path/to/your-model.gguf",
+  cbRender: (token) => {
+    process.stdout.write(token)
+  },
+  systemPrompt: "You are a helpful assistant.",
+  maxTokens: 256,
+  contextSize: 2048,
+  temperature: 0.9,
+  topP: 0.9,
+  topK: 40,
+})
+```
+
+| Parameter	| Type |	Required |	Description | Default value | 
+| :------------ |:---------------:| :-----:| :----- | :-----: |
+| type |	string |Yes | Must be `load`| - |
+| model |	string | Yes	|	Absolute path to a GGUF model file. | - | 
+| cbRender | function | Yes	|	Callback invoked with each generated token as a string. | - |
+| systemPrompt | string | No	| System prompt prepended to every conversation. | `You are a helpful assistant.` | 
+| maxTokens | number	| No	| Maximum number of tokens to generate per response. | 256 | 
+| contextSize | number | No	| Context window size (capped by the model's own limit). | 2048 |
+| temperature | number | No	| Sampling temperature. Higher values produce more varied output. | 0.9 |
+| topP | number | No | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. | 0.9 |
+| topK | number | No | Top-K sampling. Only the K most probable tokens are considered at each step. | 40 |
+
 ```javascript
 import llama3pure from "./llama3pure-nodejs-engine.js"
 import { fileURLToPath } from "url"
