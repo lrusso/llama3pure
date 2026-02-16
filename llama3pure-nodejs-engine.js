@@ -90,7 +90,6 @@ var topK = 40
 var systemPrompt = "You are a helpful assistant."
 var maxTokens = 256
 var contextSize = 2048
-var modelFilename = ""
 
 // QuantizedTensor structure: { dataOffset, type, rows, cols }
 // Stores metadata to read quantized weights on-the-fly during matmul
@@ -4181,15 +4180,11 @@ function llama3pure(data) {
         if (data.topK !== undefined) {
           topK = data.topK
         }
-        if (data.filename !== undefined) {
-          modelFilename = data.filename
-        }
         var result = loadModel(data.filePath)
         cbRender = data.cbRender
         postMessage({
           type: "loaded",
           config: result.config,
-          filename: modelFilename,
           maxTokens: maxTokens,
           contextSize: contextSize,
           topP: topP,
