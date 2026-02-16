@@ -33,7 +33,7 @@ cl /O2 llama3pure-c-engine.c /Fe:llama3pure.exe
 ## Running the engine (macOS / Linux / Windows)
 
 ```bash
-# On MacOS / Linux
+# On macOS / Linux
 ./llama3pure -model Llama3.gguf -prompt "Tell me in 1 line what is Microsoft."
 ./llama3pure -model Llama3.gguf -chathistory chat.txt
 
