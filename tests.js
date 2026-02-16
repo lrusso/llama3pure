@@ -69,13 +69,14 @@ const testModelUsingNode = (model) => {
 
   llama3pure({
     type: "load",
-    filePath: modelPath,
+    model: modelPath,
     maxTokens: 1024,
     contextSize: 2048,
     cbRender: function (token) {
       process.stdout.write(token)
     },
   })
+
   llama3pure({
     type: "generate",
     chatHistory: [
@@ -88,6 +89,7 @@ const testModelUsingNode = (model) => {
       { role: "user", content: "Tell me in 1 line the names of the founders." },
     ],
   })
+
   process.stdout.write("\n")
 }
 
