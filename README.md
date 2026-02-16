@@ -218,6 +218,13 @@ worker.onmessage = function (e) {
 }
 ```
 
+| Event	| Fields	| Description |
+| :---------- | :----: | :------ |
+| progress	| —|	Emitted during model loading to indicate progress.|
+| loaded	| —	|Emitted once when the model has been fully loaded and is ready for inference.|
+| token	| token (string)	|Emitted for each token as it is generated, enabling real-time streaming of the response.|
+| complete	|output (string)	| Emitted when generation finishes. Contains the full generated text.|
+
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
