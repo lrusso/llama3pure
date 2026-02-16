@@ -4162,11 +4162,6 @@ function llama3pure(data) {
   try {
     switch (data.type) {
       case "load":
-        if (cbRender) {
-          console.log("A model is already loaded in the inference engine.")
-          return
-        }
-
         if (data.maxTokens !== undefined) {
           maxTokens = data.maxTokens
         }
