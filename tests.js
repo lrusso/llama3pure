@@ -53,8 +53,8 @@ const models = [
 const testModelUsingC = (model) => {
   try {
     execSync(
-      //`./llama3pure -model "${model}" -prompt "Tell me in 1 line what is Microsoft." -max_tokens 1024 -context_size 2048`,
-      `./llama3pure -model "${model}" -chathistory tests.txt -max_tokens 1024 -context_size 2048`,
+      //`./llama3pure -model "${model}" -prompt "Tell me in 1 line what is Microsoft." -max_tokens -1 -context_size 2048`,
+      `./llama3pure -model "${model}" -chathistory tests.txt -max_tokens -1 -context_size 2048`,
       {
         stdio: "inherit",
       }
@@ -70,7 +70,7 @@ const testModelUsingNode = (model) => {
   llama3pure({
     type: "load",
     model: modelPath,
-    maxTokens: 1024,
+    maxTokens: -1,
     contextSize: 2048,
     cbRender: function (token) {
       process.stdout.write(token)
