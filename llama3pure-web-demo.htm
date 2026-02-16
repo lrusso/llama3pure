@@ -86,7 +86,7 @@
           system_prompt: "You are a useful AI assistant.",
           system_welcome: "Hello, how can I help you today?",
           error_empty:
-            "The AI model generated an empty response. The current maxTokens () and contextSize () values may be too low. Try increasing those values by adding them to the current URL, for example: ?maxTokens={number}&contextSize={number}",
+            "The AI model generated an empty response. The current contextSize might be too low. Try increasing it by adding it to the URL, for example: ?contextSize={number}",
           error_filesize:
             "Error. This web port cannot handle files larger than 2 GB.",
           error_download: "Error. Something went wrong during the download process.",
@@ -103,7 +103,7 @@
           system_prompt: "T\xFA eres un \xFAtil asistente AI.",
           system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
           error_empty:
-            "El modelo de AI gener\xF3 una respuesta vac\xEDa. Los valores de actuales de maxTokens () y contextSize () podr\xEDan ser bajos, prueba aumentar esos valores agreg\xE1ndolos a la URL actual, por ejemplo: ?maxTokens={n\xFAmero}&contextSize={n\xFAmero}",
+            "El modelo de AI gener\xF3 una respuesta vac\xEDa. El valor actual de contextSize () podr\xEDa ser bajo, prueba aumentar ese valor agreg\xE1ndolo a la URL actual, por ejemplo: ?contextSize={n\xFAmero}",
           error_filesize:
             "Error. Este port web no puede procesar archivos de m\xE1s de 2 GB.",
           error_download:
@@ -153,6 +153,7 @@
       var replies = []
       var selectedReply = 0
 
+      var MAX_TOKENS = -1
       var CONTEXT_SIZE = 2048
       var TEMPERATURE = 0.9
       var TOP_P = 0.9
@@ -269,7 +270,6 @@
                 lastReply.innerHTML =
                   markdownToHTML(
                     t("error_empty")
-                      .replace("()", "(" + MAX_TOKENS + ")")
                       .replace("()", "(" + CONTEXT_SIZE + ")")
                       .replace(/\</g, "&#60;")
                   ) + lastReply.innerHTML
@@ -318,6 +318,7 @@
               type: "load",
               model: arrayBuffer,
               systemPrompt: t("system_prompt"),
+              maxTokens: MAX_TOKENS,
               contextSize: CONTEXT_SIZE,
               temperature: TEMPERATURE,
               topP: TOP_P,
