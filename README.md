@@ -131,6 +131,35 @@ Full example in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure
 
 ## Running in Web Environments
 
+- Step 1: Load a model
+
+Read the GGUF file as an ArrayBuffer and send it to the worker with type: "load". The ArrayBuffer is transferred (not copied) for performance.
+
+```javascript
+const reader = new FileReader()
+
+reader.onload = (event) => {
+  const arrayBuffer = event.target.result
+  worker.postMessage(
+    {
+      type: "load",
+      model: arrayBuffer,
+      systemPrompt: "You are a helpful assistant.",
+      maxTokens: 256,
+      contextSize: 2048,
+      temperature: 0.9,
+      topP: 0.9,
+      topK: 40,
+    },
+    [arrayBuffer]
+  )
+}
+
+reader.readAsArrayBuffer(file)
+```
+
+
+
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
 
 Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
