@@ -61,7 +61,48 @@ llama3pure.exe -model Llama3.gguf -temperature 0.9 -top_p 0.9 -top_k 40 -max_tok
 
 ## Running in Node.js
 
-Check the sample code in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
+```javascript
+import llama3pure from "./llama3pure-nodejs-engine.js"
+import { fileURLToPath } from "url"
+import path from "path"
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
+function main() {
+  const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
+
+  llama3pure({
+    systemPrompt: "You are a helpful assistant.",
+    maxTokens: 256,
+    contextSize: 2048,
+    temperature: 0.9,
+    topP: 0.9,
+    topK: 40,
+    type: "load",
+    filePath: modelPath,
+    filename: "gemma-3-270m-it-Q8_0.gguf",
+    cbRender: (token) => {
+      process.stdout.write(token)  
+    },
+  })
+
+  llama3pure({
+    type: "generate",
+    chatHistory: [
+      { role: "user", content: "Tell me in 1 line what is Microsoft." },
+      {
+        role: "assistant",
+        content:
+          "Microsoft is a global technology leader known for its innovative products and services.",
+      },
+      { role: "user", content: "Tell me in 1 line the names of the founders." },
+    ],
+  })
+}
+
+main()
+```
 
 ## Running in Web Environments
 
