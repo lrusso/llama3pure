@@ -311,7 +311,7 @@
 
         var reader = new FileReader()
 
-        reader.onload = function (event) {
+        reader.addEventListener("load", function (event) {
           var arrayBuffer = event.target.result
           worker.postMessage(
             {
@@ -326,7 +326,7 @@
             },
             [arrayBuffer]
           )
-        }
+        })
 
         reader.readAsArrayBuffer(files[0])
       }
@@ -800,14 +800,14 @@
         xhr.open("GET", url, true)
         xhr.responseType = "blob"
 
-        xhr.onprogress = function (event) {
+        xhr.addEventListener("progress", function (event) {
           if (event.lengthComputable) {
             var percent = Math.round((event.loaded / event.total) * 100)
             downloadStatus.innerText = t("downloading") + " " + percent + "%"
           }
-        }
+        })
 
-        xhr.onload = function () {
+        xhr.addEventListener("load", function () {
           if (xhr.status === 200) {
             var blob = xhr.response
             var file = new File([blob], filename, {
@@ -817,11 +817,11 @@
           } else {
             downloadStatus.innerText = t("error_download")
           }
-        }
+        })
 
-        xhr.onerror = function () {
+        xhr.addEventListener("error", function () {
           downloadStatus.innerText = t("error_download")
-        }
+        })
 
         xhr.send()
       }
