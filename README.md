@@ -217,7 +217,7 @@ worker.onmessage = function (e) {
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
 
-Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
+A standalone version is available [here](https://lrusso.github.io/llama3pure/llama3pure-web-standalone.htm); it offers the same functionality as the standard version but uses a base64-embedded Worker, allowing you to run it as a local file without a web server.
 
 ## Suggested Models and Engines
 
@@ -276,6 +276,8 @@ Due to universal browser memory constraints regarding ArrayBuffer size limits, t
 ## Author's Notes
 
 - Using quantizations below Q4 is generally discouraged because the loss in logic and coherence makes them nearly unusable for most tasks.
+
+- Due to universal browser memory constraints regarding ArrayBuffer size limits, the Web engine can only read GGUF files up to 2 GB.
 
 - There isn't a Python engine because a ported and pure version would be very slow. Using NumPy wouldn't make sense because it uses C under the hood, and for that, there is already a C engine.
 
