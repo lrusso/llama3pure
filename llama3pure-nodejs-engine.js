@@ -77,7 +77,10 @@ var config = null
 var weights = null
 var state = null
 var tokenizer = null
-var fileBuffer = null
+var fileArrayBuffer = null
+var fileDataView = null
+var fileUint8 = null
+var fileInt8 = null
 var offset = 0n // BigInt for >2GB file support
 
 // Q8_0 buffers for quantizing x vector in matmulQuantized
@@ -97,94 +100,85 @@ var contextSize = 0
 // ----------------------------------------------------------------------------
 // Buffer reading helpers (supports >2GB files using BigInt offsets)
 
-function readBytesFromBuffer(position, length) {
-  var pos = Number(position)
-  return fileBuffer.subarray(pos, pos + length)
-}
-
 function readUint8() {
-  var buf = readBytesFromBuffer(offset, 1)
+  var value = fileDataView.getUint8(Number(offset))
   offset = offset + 1n
-  return buf.readUInt8(0)
+  return value
 }
 
 function readUint16() {
-  var buf = readBytesFromBuffer(offset, 2)
+  var value = fileDataView.getUint16(Number(offset), true)
   offset = offset + 2n
-  return buf.readUInt16LE(0)
+  return value
 }
 
 function readUint32() {
-  var buf = readBytesFromBuffer(offset, 4)
+  var value = fileDataView.getUint32(Number(offset), true)
   offset = offset + 4n
-  return buf.readUInt32LE(0)
+  return value
 }
 
 function readUint64() {
-  var buf = readBytesFromBuffer(offset, 8)
+  var pos = Number(offset)
+  var low = fileDataView.getUint32(pos, true)
+  var high = fileDataView.getUint32(pos + 4, true)
   offset = offset + 8n
-  var low = buf.readUInt32LE(0)
-  var high = buf.readUInt32LE(4)
   return low + high * 0x100000000
 }
 
 function readInt8() {
-  var buf = readBytesFromBuffer(offset, 1)
+  var value = fileDataView.getInt8(Number(offset))
   offset = offset + 1n
-  return buf.readInt8(0)
+  return value
 }
 
 function readInt32() {
-  var buf = readBytesFromBuffer(offset, 4)
+  var value = fileDataView.getInt32(Number(offset), true)
   offset = offset + 4n
-  return buf.readInt32LE(0)
+  return value
 }
 
 function readInt64() {
-  var buf = readBytesFromBuffer(offset, 8)
+  var pos = Number(offset)
+  var low = fileDataView.getUint32(pos, true)
+  var high = fileDataView.getInt32(pos + 4, true)
   offset = offset + 8n
-  var low = buf.readUInt32LE(0)
-  var high = buf.readInt32LE(4)
   return low + high * 0x100000000
 }
 
 function readFloat32() {
-  var buf = readBytesFromBuffer(offset, 4)
+  var value = fileDataView.getFloat32(Number(offset), true)
   offset = offset + 4n
-  return buf.readFloatLE(0)
+  return value
 }
 
 function readFloat64() {
-  var buf = readBytesFromBuffer(offset, 8)
+  var value = fileDataView.getFloat64(Number(offset), true)
   offset = offset + 8n
-  return buf.readDoubleLE(0)
+  return value
 }
 
 function readString() {
   var len = readUint64()
-  var buf = readBytesFromBuffer(offset, len)
+  var pos = Number(offset)
   offset = offset + BigInt(len)
-  return buf.toString("utf-8")
+  return new TextDecoder().decode(fileUint8.subarray(pos, pos + len))
 }
 
 function getUint8ArrayAt(srcOffset, length) {
-  var buf = readBytesFromBuffer(BigInt(srcOffset), length)
-  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+  return fileUint8.subarray(srcOffset, srcOffset + length)
 }
 
 function getInt8ArrayAt(srcOffset, length) {
-  var buf = readBytesFromBuffer(BigInt(srcOffset), length)
-  return new Int8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+  return fileInt8.subarray(srcOffset, srcOffset + length)
 }
 
 function getUint16ArrayAt(srcOffset, count) {
-  var buf = readBytesFromBuffer(BigInt(srcOffset), count * 2)
-  return new Uint16Array(buf.buffer, buf.byteOffset, count)
+  return new Uint16Array(fileArrayBuffer, srcOffset, count)
 }
 
 function getFloat32ArrayAt(srcOffset, count) {
-  var buf = readBytesFromBuffer(BigInt(srcOffset), count * 4)
-  return new Float32Array(buf.buffer, buf.byteOffset, count)
+  return new Float32Array(fileArrayBuffer, srcOffset, count)
 }
 
 // ----------------------------------------------------------------------------
@@ -2580,7 +2574,20 @@ function accum(a, b, size) {
 // GGUF parsing
 
 function parseGGUF(filePath) {
-  fileBuffer = fs.readFileSync(filePath)
+  var fd = fs.openSync(filePath, "r")
+  var fileSize = fs.fstatSync(fd).size
+  fileArrayBuffer = new ArrayBuffer(fileSize)
+  fileUint8 = new Uint8Array(fileArrayBuffer)
+  fileInt8 = new Int8Array(fileArrayBuffer)
+  fileDataView = new DataView(fileArrayBuffer)
+  var chunkSize = 256 * 1024 * 1024
+  var pos = 0
+  while (pos < fileSize) {
+    var toRead = Math.min(chunkSize, fileSize - pos)
+    fs.readSync(fd, fileUint8, pos, toRead, pos)
+    pos = pos + toRead
+  }
+  fs.closeSync(fd)
   offset = 0n
 
   var magic = readUint32()
@@ -2653,9 +2660,9 @@ function readGGUFValue(type) {
     case GGUF_TYPE.UINT16:
       return readUint16()
     case GGUF_TYPE.INT16:
-      var buf = readBytesFromBuffer(offset, 2)
+      var value = fileDataView.getInt16(Number(offset), true)
       offset = offset + 2n
-      return buf.readInt16LE(0)
+      return value
     case GGUF_TYPE.UINT32:
       return readUint32()
     case GGUF_TYPE.INT32:
