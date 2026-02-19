@@ -124,6 +124,7 @@ enum ggml_type {
 #define QK8_0 32
 #define QK_K 256
 #define QK4_NL 32  // IQ4_NL block size
+#define Q8_0_BLOCK_SIZE 34  // 2 bytes FP16 scale + 32 bytes int8 quants
 
 // Quantization block structures
 typedef struct {
@@ -240,8 +241,10 @@ typedef struct {
 } QuantizedTensor;
 
 typedef struct {
-    // token embedding table - kept as float for fast lookup
-    float* token_embedding_table;    // (vocab_size, dim)
+    // token embedding - kept quantized, dequantized on-demand per token
+    void* token_embedding_data;       // raw quantized data (points into mmap'd file)
+    enum ggml_type token_embedding_type;  // quantization type of embeddings
+    size_t token_embedding_row_size;  // bytes per embedding row
     // weights for rmsnorms - small, kept as float
     float* rms_att_weight; // (layer, dim) rmsnorm weights
     float* rms_ffn_weight; // (layer, dim)
@@ -278,9 +281,9 @@ typedef struct {
     float *v;      // value (n_kv_heads * head_size,)
     float *att;    // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
-    // kv cache - sized for GQA
-    float* key_cache;   // (layer, seq_len, n_kv_heads * head_size)
-    float* value_cache; // (layer, seq_len, n_kv_heads * head_size)
+    // kv cache - Q8_0 quantized for memory efficiency (34 bytes per 32 floats)
+    uint8_t* key_cache;    // Q8_0 quantized (layer, seq_len, kv_dim)
+    uint8_t* value_cache;  // Q8_0 quantized (layer, seq_len, kv_dim)
     // pre-computed RoPE frequencies (avoids powf in hot loop)
     float* rope_freqs;      // (head_size / 2,) - for dense (non-SWA) layers
     float* rope_freqs_swa;  // (head_size / 2,) - for SWA layers (different theta)
@@ -294,7 +297,8 @@ typedef struct {
     int kv_dim;
     int q_dim;
     int kv_mul;
-    int kv_cache_layer_size;  // seq_len * kv_dim (for layer offset calculation)
+    int kv_cache_bytes_per_vec;  // bytes per KV vector in Q8_0 format
+    int kv_cache_layer_size;  // seq_len * kv_cache_bytes_per_vec (for layer offset calculation)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
     float embed_scale;        // sqrt(dim) for Gemma3 embedding scaling
 } RunState;
@@ -324,8 +328,11 @@ void malloc_run_state(RunState* s, Config* p) {
     s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
-    s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
-    s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_dim, sizeof(float));
+    // Q8_0 KV cache: 34 bytes per 32 floats
+    int kv_blocks_per_vec = kv_dim / QK8_0;
+    int kv_bytes_per_vec = kv_blocks_per_vec * Q8_0_BLOCK_SIZE;
+    s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_bytes_per_vec, 1);
+    s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_bytes_per_vec, 1);
 
     // Pre-compute RoPE frequencies to avoid powf in hot loop
     int rope_size = head_size / 2;
@@ -370,7 +377,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->kv_dim = kv_dim;
     s->q_dim = q_dim;
     s->kv_mul = p->n_heads / p->n_kv_heads;
-    s->kv_cache_layer_size = p->seq_len * kv_dim;
+    s->kv_cache_bytes_per_vec = kv_bytes_per_vec;
+    s->kv_cache_layer_size = p->seq_len * kv_bytes_per_vec;
     s->attn_scale = 1.0f / sqrtf((float)head_size);
     s->embed_scale = sqrtf((float)p->dim);
 
@@ -856,6 +864,58 @@ float* dequantize_tensor(const void* src, int n_elements, enum ggml_type type) {
     return dst;
 }
 
+// Dequantize a single row from quantized data into a caller-provided float buffer
+void dequantize_row(float* dst, const void* src, int n_cols, enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            memcpy(dst, src, n_cols * sizeof(float));
+            break;
+        case GGML_TYPE_F16:
+            dequantize_row_f16(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q4_0:
+            dequantize_row_q4_0(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q4_1:
+            dequantize_row_q4_1(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q5_0:
+            dequantize_row_q5_0(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q5_1:
+            dequantize_row_q5_1(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q8_0:
+            dequantize_row_q8_0(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q2_K:
+            dequantize_row_q2_K(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q3_K:
+            dequantize_row_q3_K(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q4_K:
+            dequantize_row_q4_K(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q5_K:
+            dequantize_row_q5_K(src, dst, n_cols);
+            break;
+        case GGML_TYPE_Q6_K:
+            dequantize_row_q6_K(src, dst, n_cols);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            dequantize_row_iq4_nl(src, dst, n_cols);
+            break;
+        case GGML_TYPE_BF16:
+        case 30:  // Some GGUF files use type 30 for BF16
+            dequantize_row_bf16(src, dst, n_cols);
+            break;
+        default:
+            fprintf(stderr, "Unsupported quantization type in dequantize_row: %d\n", type);
+            exit(1);
+    }
+}
+
 // Get block size for quantization type
 int get_block_size(enum ggml_type type) {
     switch (type) {
@@ -1330,6 +1390,96 @@ static void quantize_row_q8_0(const float* x, block_q8_0* y, int n) {
             if (q < -128) q = -128;
             y[i].qs[j] = (int8_t)q;
         }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Q8_0 KV Cache functions
+// Q8_0 format: 2 bytes (FP16 scale) + 32 bytes (int8 quants) = 34 bytes per 32 floats
+
+// Quantize a float vector to Q8_0 format in cache buffer
+static void quantize_to_q8_0_cache(const float* src, uint8_t* dst, int count) {
+    int nb = count / QK8_0;
+    int bo = 0;
+
+    for (int i = 0; i < nb; i++) {
+        const float* block_src = src + i * QK8_0;
+
+        // Find max absolute value in block
+        float amax = 0.0f;
+        for (int j = 0; j < QK8_0; j++) {
+            float v = block_src[j] < 0 ? -block_src[j] : block_src[j];
+            if (v > amax) amax = v;
+        }
+
+        // Compute scale
+        float d = amax / 127.0f;
+        float id = d > 0.0f ? 127.0f / amax : 0.0f;
+
+        // Store scale as FP16 (little-endian)
+        uint16_t d_fp16 = fp32_to_fp16(d);
+        dst[bo] = d_fp16 & 0xff;
+        dst[bo + 1] = (d_fp16 >> 8) & 0xff;
+
+        // Quantize and store values
+        int8_t* qs = (int8_t*)(dst + bo + 2);
+        for (int j = 0; j < QK8_0; j++) {
+            float v = block_src[j] * id;
+            int q = (int)roundf(v);
+            if (q > 127) q = 127;
+            if (q < -128) q = -128;
+            qs[j] = (int8_t)q;
+        }
+
+        bo += Q8_0_BLOCK_SIZE;
+    }
+}
+
+// Dot product of float query vector with Q8_0 cached key
+static float dot_q8_0_cache(const float* x, const uint8_t* cache, int count) {
+    int nb = count / QK8_0;
+    float sum = 0.0f;
+    int bo = 0;
+    int xb = 0;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(cache[bo] | (cache[bo + 1] << 8));
+        const int8_t* qs = (const int8_t*)(cache + bo + 2);
+
+        float block_sum = 0.0f;
+        for (int j = 0; j < QK8_0; j++) {
+            block_sum += x[xb + j] * qs[j];
+        }
+
+        sum += block_sum * d;
+        bo += Q8_0_BLOCK_SIZE;
+        xb += QK8_0;
+    }
+    return sum;
+}
+
+// Weighted accumulation from Q8_0 cached value to float output
+static void accum_q8_0_cache(float* out, const uint8_t* cache, float weight, int count) {
+    // Skip near-zero attention weights
+    if (weight > -1e-8f && weight < 1e-8f) {
+        return;
+    }
+
+    int nb = count / QK8_0;
+    int bo = 0;
+    int ob = 0;
+
+    for (int i = 0; i < nb; i++) {
+        float d = fp16_to_fp32(cache[bo] | (cache[bo + 1] << 8));
+        float scale = d * weight;
+        const int8_t* qs = (const int8_t*)(cache + bo + 2);
+
+        for (int j = 0; j < QK8_0; j++) {
+            out[ob + j] += qs[j] * scale;
+        }
+
+        bo += Q8_0_BLOCK_SIZE;
+        ob += QK8_0;
     }
 }
 
@@ -2398,12 +2548,15 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
     int q_dim = p->n_heads * head_size;  // total Q dimension
     int n_layers = p->n_layers;
 
-    // Token embeddings - must be dequantized for fast lookup
-    w->token_embedding_table = load_tensor_float(gguf, "token_embd.weight", p->vocab_size * p->dim);
-    if (!w->token_embedding_table) {
+    // Token embeddings - keep quantized, dequantize on-demand per token
+    GGUFTensor* emb_tensor = find_gguf_tensor(gguf, "token_embd.weight");
+    if (!emb_tensor) {
         fprintf(stderr, "Failed to load token embeddings\n");
         return 0;
     }
+    w->token_embedding_data = emb_tensor->data;
+    w->token_embedding_type = emb_tensor->type;
+    w->token_embedding_row_size = get_row_size(p->dim, emb_tensor->type);
 
     // RMS norm weights - small, keep as float
     w->rms_att_weight = malloc(n_layers * p->dim * sizeof(float));
@@ -2515,13 +2668,12 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
 
 
     } else {
-        // Use tied embeddings - create a "fake" quantized tensor pointing to embeddings
-        // The wcls will be used with matmul_f32 instead of matmul_quantized
+        // Use tied embeddings - reference the same quantized embedding data
         if (debug_mode) {
             printf("Using tied embeddings for output projection\n");
         }
-        w->wcls.data = w->token_embedding_table;
-        w->wcls.type = GGML_TYPE_F32;
+        w->wcls.data = w->token_embedding_data;
+        w->wcls.type = w->token_embedding_type;
         w->wcls.n_elements = p->vocab_size * p->dim;
         w->wcls.rows = p->vocab_size;
         w->wcls.cols = p->dim;
@@ -2652,11 +2804,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int kv_mul = s->kv_mul;
     float eps = p->rms_norm_eps > 0 ? p->rms_norm_eps : 1e-5f;
 
-    // copy the token embedding into x
+    // dequantize the token embedding into x (on-demand, saves memory)
     // GGUF stores embeddings with ne=[dim, vocab_size], meaning shape (vocab_size, dim) in row-major
-    // Each token's embedding is contiguous: dim floats per token
-    float* content_row = &(w->token_embedding_table[token * dim]);
-    memcpy(x, content_row, dim * sizeof(*x));
+    // Each token's embedding is contiguous in quantized form
+    const char* emb_row = (const char*)w->token_embedding_data + token * w->token_embedding_row_size;
+    dequantize_row(x, emb_row, dim, w->token_embedding_type);
 
     // Gemma3: Scale embeddings by sqrt(dim) - use pre-computed value
     if (p->is_gemma3) {
@@ -2749,13 +2901,13 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Gemma3: Q attention scaling is fused into the RoPE loop above
 
-        // save key,value at this time step (pos) to our kv cache
+        // save key,value at this time step (pos) to our kv cache (Q8_0 quantized)
         // Use pre-computed kv_cache_layer_size for layer offset
+        int kv_bytes_per_vec = s->kv_cache_bytes_per_vec;
         int loff = l * s->kv_cache_layer_size;
-        float* key_cache_row = s->key_cache + loff + pos * kv_dim;
-        float* value_cache_row = s->value_cache + loff + pos * kv_dim;
-        memcpy(key_cache_row, s->k, kv_dim * sizeof(*key_cache_row));
-        memcpy(value_cache_row, s->v, kv_dim * sizeof(*value_cache_row));
+        int cache_offset = loff + pos * kv_bytes_per_vec;
+        quantize_to_q8_0_cache(s->k, s->key_cache + cache_offset, kv_dim);
+        quantize_to_q8_0_cache(s->v, s->value_cache + cache_offset, kv_dim);
 
         // multihead attention with GQA support
         // Pre-fetch attention scale for non-Gemma3 models
@@ -2768,6 +2920,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             if (start_t < 0) start_t = 0;
         }
         int att_size = pos - start_t + 1;
+        int head_q8_bytes = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
@@ -2777,16 +2930,13 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             float* att = s->att + h * p->seq_len;
             // compute kv_head once per head (constant for all timesteps)
             int kv_head = h / kv_mul;
-            int kv_head_offset = kv_head * head_size;
+            int kv_head_byte_offset = kv_head * head_q8_bytes;
             // iterate over timesteps in attention range
             for (int t = start_t; t <= pos; t++) {
-                // get the key vector for this head and at this timestep
-                float* k = s->key_cache + loff + t * kv_dim + kv_head_offset;
+                // get the key vector for this head and at this timestep (Q8_0 cache)
+                int k_offset = loff + t * kv_bytes_per_vec + kv_head_byte_offset;
                 // calculate the attention score as the dot product of q and k
-                float score = 0.0f;
-                for (int i = 0; i < head_size; i++) {
-                    score += q[i] * k[i];
-                }
+                float score = dot_q8_0_cache(q, s->key_cache + k_offset, head_size);
                 // For Gemma3, Q is already scaled by 1/sqrt(head_dim), so no scaling here
                 // For other models, scale by 1/sqrt(head_dim) using pre-computed value
                 if (!is_gemma3) {
@@ -2805,14 +2955,10 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             for (int t = start_t; t <= pos; t++) {
                 // get the attention weight for this timestep
                 float a = att[t - start_t];
-                // skip near-zero attention weights (avoids unnecessary computation)
-                if (a > -1e-8f && a < 1e-8f) continue;
-                // get the value vector for this head and at this timestep
-                float* v = s->value_cache + loff + t * kv_dim + kv_head_offset;
-                // accumulate the weighted value into xb
-                for (int i = 0; i < head_size; i++) {
-                    xb[i] += a * v[i];
-                }
+                // get the value vector for this head and at this timestep (Q8_0 cache)
+                int v_offset = loff + t * kv_bytes_per_vec + kv_head_byte_offset;
+                // accumulate the weighted value into xb (handles near-zero skip internally)
+                accum_q8_0_cache(xb, s->value_cache + v_offset, a, head_size);
             }
         }
 
@@ -4393,7 +4539,7 @@ cleanup:
 
     free(prompt_tokens);
 
-    // Free float weight allocations (embeddings, norms, etc.)
+    // Free float weight allocations (norms, etc. - embeddings point to mmap'd file)
     for (int i = 0; i < num_weight_allocations; i++) {
         free(weight_allocations[i]);
     }
