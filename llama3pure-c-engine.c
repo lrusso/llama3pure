@@ -450,10 +450,15 @@ static inline uint16_t fp32_to_fp16(float f) {
     memcpy(&x, &f, sizeof(x));
     uint32_t sign = (x >> 16) & 0x8000;
     int exp = ((x >> 23) & 0xFF) - 127 + 15;
-    uint32_t mant = x & 0x7FFFFF;
-    if (exp <= 0) return sign;
+    uint32_t mant = (x >> 13) & 0x3FF;
+    if (exp <= 0) {
+        // Denormalized or zero
+        if (exp < -10) return sign;  // Too small, return signed zero
+        mant = (mant | 0x400) >> (1 - exp);
+        return sign | mant;
+    }
     if (exp >= 31) return sign | 0x7C00;
-    return sign | (exp << 10) | (mant >> 13);
+    return sign | (exp << 10) | mant;
 }
 
 // BF16 (bfloat16) to FP32 conversion
@@ -3966,18 +3971,15 @@ int pos = 0;
 GGUFFile* gguf_file = NULL;
 int use_chat_template = 1;  // Enable chat template by default
 
-// Track recently generated tokens for repetition penalty
-static int recent_tokens[64];
-static int recent_count = 0;
-static float repetition_penalty = 1.0f;  // Disabled: Penalty factor for repeated tokens
-
 // Buffer newlines - only output if followed by non-end token
 static int pending_newline = 0;
 
-// Buffer for output text to detect repetition loops
-static char output_buffer[16384];
-static int output_buffer_len = 0;
+// Track generated tokens for repeat detection
+static int *generated_tokens = NULL;
+static int generated_tokens_len = 0;
+static int generated_tokens_cap = 0;
 static int repetition_detected = 0;
+static int step = 0;
 
 void generate_token(void) {
     // Skip logit computation during prompt prefill (major speedup)
@@ -4016,18 +4018,6 @@ void generate_token(void) {
     if (pos < num_prompt_tokens - 1) {
         next = prompt_tokens[pos + 1];
     } else {
-        // Apply repetition penalty to recently generated tokens
-        for (int i = 0; i < recent_count; i++) {
-            int tok = recent_tokens[i];
-            if (tok >= 0 && tok < config.vocab_size) {
-                if (state.logits[tok] > 0) {
-                    state.logits[tok] /= repetition_penalty;
-                } else {
-                    state.logits[tok] *= repetition_penalty;
-                }
-            }
-        }
-
         if (temperature == 0.0f) {
             next = argmax(state.logits, config.vocab_size);
         } else {
@@ -4134,16 +4124,12 @@ void generate_token(void) {
             next = top_k_idx[s];
         }
 
-        // Update recent tokens buffer (circular)
-        if (recent_count < 64) {
-            recent_tokens[recent_count++] = next;
-        } else {
-            // Shift left and add new token
-            for (int i = 0; i < 63; i++) {
-                recent_tokens[i] = recent_tokens[i + 1];
-            }
-            recent_tokens[63] = next;
+        // Track generated tokens for repeat detection
+        if (generated_tokens_len >= generated_tokens_cap) {
+            generated_tokens_cap = generated_tokens_cap == 0 ? 256 : generated_tokens_cap * 2;
+            generated_tokens = realloc(generated_tokens, generated_tokens_cap * sizeof(int));
         }
+        generated_tokens[generated_tokens_len++] = next;
     }
 
     // Only print generated tokens (not prompt tokens) during generation
@@ -4161,33 +4147,34 @@ void generate_token(void) {
                     pending_newline = 0;
                 }
                 printf("%s", decoded);
-            }
-            fflush(stdout);
+                fflush(stdout);
 
-            // Accumulate text in output buffer for repetition detection
-            int decoded_len = strlen(decoded);
-            if (output_buffer_len + decoded_len >= (int)sizeof(output_buffer) - 1) {
-                // Buffer full: shift the second half to the front to keep detection working
-                int half = output_buffer_len / 2;
-                memmove(output_buffer, output_buffer + half, output_buffer_len - half);
-                output_buffer_len -= half;
-                output_buffer[output_buffer_len] = '\0';
-            }
-            memcpy(output_buffer + output_buffer_len, decoded, decoded_len);
-            output_buffer_len += decoded_len;
-            output_buffer[output_buffer_len] = '\0';
-
-            // Stop if the model is stuck repeating text
-            if (output_buffer_len > 100) {
-                char* to_find = output_buffer + output_buffer_len - 30;
-                int count = 0;
-                char* search = output_buffer;
-                while ((search = strstr(search, to_find)) != NULL) {
-                    count++;
-                    search += 30;
-                }
-                if (count > 10) {
-                    repetition_detected = 1;
+                // Stop if the model is stuck repeating tokens (check every 10 steps)
+                int gtLen = generated_tokens_len;
+                if (gtLen > 20 && step % 10 == 0) {
+                    // Check if the last 10 tokens repeat as a pattern in history
+                    int patLen = 10;
+                    int repeats = 0;
+                    int matched = 1;
+                    for (int r = 1; r <= 10 && matched; r++) {
+                        int off = gtLen - patLen - r * patLen;
+                        if (off < 0) {
+                            break;
+                        }
+                        matched = 1;
+                        for (int p = 0; p < patLen; p++) {
+                            if (generated_tokens[gtLen - patLen + p] != generated_tokens[off + p]) {
+                                matched = 0;
+                                break;
+                            }
+                        }
+                        if (matched) {
+                            repeats++;
+                        }
+                    }
+                    if (repeats > 5) {
+                        repetition_detected = 1;
+                    }
                 }
             }
 
@@ -4197,6 +4184,7 @@ void generate_token(void) {
 
     token = next;
     pos++;
+    step++;
 }
 
 
@@ -4526,6 +4514,7 @@ cleanup:
     free(sorted_vocab);
 
     free(prompt_tokens);
+    free(generated_tokens);
 
     // Free float weight allocations (norms, etc. - embeddings point to mmap'd file)
     for (int i = 0; i < num_weight_allocations; i++) {
