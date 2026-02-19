@@ -77,9 +77,7 @@ var config = null
 var weights = null
 var state = null
 var tokenizer = null
-var fileBuffer = null
-var fileUint8 = null
-var fileInt8 = null
+var fileFd = null
 var offset = 0n // BigInt for >2GB file support
 
 // Q8_0 buffers for quantizing x vector in matmulQuantized
@@ -100,8 +98,9 @@ var contextSize = 0
 // File reading helpers (supports >2GB files using BigInt offsets)
 
 function readBytesFromFile(position, length) {
-  var pos = Number(position)
-  return fileBuffer.subarray(pos, pos + length)
+  var buffer = Buffer.alloc(length)
+  fs.readSync(fileFd, buffer, 0, length, position)
+  return buffer
 }
 
 function readUint8() {
@@ -170,23 +169,23 @@ function readString() {
 }
 
 function getUint8ArrayAt(srcOffset, length) {
-  return fileUint8.subarray(srcOffset, srcOffset + length)
+  var buf = readBytesFromFile(BigInt(srcOffset), length)
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
 }
 
 function getInt8ArrayAt(srcOffset, length) {
-  return fileInt8.subarray(srcOffset, srcOffset + length)
+  var buf = readBytesFromFile(BigInt(srcOffset), length)
+  return new Int8Array(buf.buffer, buf.byteOffset, buf.byteLength)
 }
 
 function getUint16ArrayAt(srcOffset, count) {
-  return new Uint16Array(fileBuffer.buffer, fileBuffer.byteOffset + srcOffset, count)
+  var buf = readBytesFromFile(BigInt(srcOffset), count * 2)
+  return new Uint16Array(buf.buffer, buf.byteOffset, count)
 }
 
 function getFloat32ArrayAt(srcOffset, count) {
-  return new Float32Array(
-    fileBuffer.buffer,
-    fileBuffer.byteOffset + srcOffset,
-    count
-  )
+  var buf = readBytesFromFile(BigInt(srcOffset), count * 4)
+  return new Float32Array(buf.buffer, buf.byteOffset, count)
 }
 
 // ----------------------------------------------------------------------------
@@ -388,7 +387,7 @@ function accumQ8_0Cache(
   count
 ) {
   // Skip near-zero attention weights
-  if (weight > -1e-5 && weight < 1e-5) {
+  if (weight > -1e-8 && weight < 1e-8) {
     return
   }
 
@@ -1656,30 +1655,37 @@ function vecDotIQ4_NL(x, srcOffset, n) {
 
 // Fused dot product for F16
 function vecDotF16(x, srcOffset, n) {
-  var u16 = getUint16ArrayAt(srcOffset, n)
+  var u8 = getUint8ArrayAt(srcOffset, n * 2)
   var sum = 0.0
+  var bo = 0
   for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * fp16ToFp32(u16[i])
+    sum = sum + x[i] * fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    bo = bo + 2
   }
   return sum
 }
 
 // Fused dot product for BF16
 function vecDotBF16(x, srcOffset, n) {
-  var u16 = getUint16ArrayAt(srcOffset, n)
+  var u8 = getUint8ArrayAt(srcOffset, n * 2)
   var sum = 0.0
+  var bo = 0
   for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * bf16ToFp32(u16[i])
+    sum = sum + x[i] * bf16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    bo = bo + 2
   }
   return sum
 }
 
 // Fused dot product for F32
 function vecDotF32(x, srcOffset, n) {
-  var f32 = getFloat32ArrayAt(srcOffset, n)
+  var u8 = getUint8ArrayAt(srcOffset, n * 4)
   var sum = 0.0
+  var bo = 0
   for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * f32[i]
+    convInt[0] = u8[bo] | (u8[bo + 1] << 8) | (u8[bo + 2] << 16) | (u8[bo + 3] << 24)
+    sum = sum + x[i] * convFloat[0]
+    bo = bo + 4
   }
   return sum
 }
@@ -2428,64 +2434,6 @@ function matmulQuantized(out, x, qw) {
   }
 }
 
-// Shared-input matmul: quantize x to Q8_0 once for two matmuls
-function matmulQuantizedShared2(out1, out2, x, qw1, qw2) {
-  var cols = qw1.cols
-  if (qw1.dotQ8Func) {
-    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
-    var rows1 = qw1.rows
-    var base1 = qw1.dataOffset
-    var rs1 = qw1.rowSize
-    var dot1 = qw1.dotQ8Func
-    for (var i = 0; i < rows1; i = i + 1) {
-      out1[i] = dot1(xQ8Buf, xQ8Int8Buf, base1 + i * rs1, cols)
-    }
-    var rows2 = qw2.rows
-    var base2 = qw2.dataOffset
-    var rs2 = qw2.rowSize
-    var dot2 = qw2.dotQ8Func
-    for (var i = 0; i < rows2; i = i + 1) {
-      out2[i] = dot2(xQ8Buf, xQ8Int8Buf, base2 + i * rs2, cols)
-    }
-  } else {
-    matmulQuantized(out1, x, qw1)
-    matmulQuantized(out2, x, qw2)
-  }
-}
-
-// Shared-input matmul: quantize x to Q8_0 once for three matmuls
-function matmulQuantizedShared3(out1, out2, out3, x, qw1, qw2, qw3) {
-  var cols = qw1.cols
-  if (qw1.dotQ8Func) {
-    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
-    var rows1 = qw1.rows
-    var base1 = qw1.dataOffset
-    var rs1 = qw1.rowSize
-    var dot1 = qw1.dotQ8Func
-    for (var i = 0; i < rows1; i = i + 1) {
-      out1[i] = dot1(xQ8Buf, xQ8Int8Buf, base1 + i * rs1, cols)
-    }
-    var rows2 = qw2.rows
-    var base2 = qw2.dataOffset
-    var rs2 = qw2.rowSize
-    var dot2 = qw2.dotQ8Func
-    for (var i = 0; i < rows2; i = i + 1) {
-      out2[i] = dot2(xQ8Buf, xQ8Int8Buf, base2 + i * rs2, cols)
-    }
-    var rows3 = qw3.rows
-    var base3 = qw3.dataOffset
-    var rs3 = qw3.rowSize
-    var dot3 = qw3.dotQ8Func
-    for (var i = 0; i < rows3; i = i + 1) {
-      out3[i] = dot3(xQ8Buf, xQ8Int8Buf, base3 + i * rs3, cols)
-    }
-  } else {
-    matmulQuantized(out1, x, qw1)
-    matmulQuantized(out2, x, qw2)
-    matmulQuantized(out3, x, qw3)
-  }
-}
-
 // ----------------------------------------------------------------------------
 // Math functions
 
@@ -2527,42 +2475,26 @@ function rmsnorm(out, x, w, size, invSize, eps) {
   eps = eps || 1e-5
   invSize = invSize || 1.0 / size
   var ss = 0.0
-  var size8 = size & ~7
+  // Loop unrolling: process 4 elements at a time
+  var size4 = size & ~3 // size - (size % 4)
   var i = 0
-  for (; i < size8; i = i + 8) {
+  for (; i < size4; i = i + 4) {
     var x0 = x[i]
     var x1 = x[i + 1]
     var x2 = x[i + 2]
     var x3 = x[i + 3]
-    var x4 = x[i + 4]
-    var x5 = x[i + 5]
-    var x6 = x[i + 6]
-    var x7 = x[i + 7]
-    ss =
-      ss +
-      x0 * x0 +
-      x1 * x1 +
-      x2 * x2 +
-      x3 * x3 +
-      x4 * x4 +
-      x5 * x5 +
-      x6 * x6 +
-      x7 * x7
+    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
   }
   for (; i < size; i = i + 1) {
     ss = ss + x[i] * x[i]
   }
   ss = 1.0 / Math.sqrt(ss * invSize + eps)
   i = 0
-  for (; i < size8; i = i + 8) {
+  for (; i < size4; i = i + 4) {
     out[i] = w[i] * ss * x[i]
     out[i + 1] = w[i + 1] * ss * x[i + 1]
     out[i + 2] = w[i + 2] * ss * x[i + 2]
     out[i + 3] = w[i + 3] * ss * x[i + 3]
-    out[i + 4] = w[i + 4] * ss * x[i + 4]
-    out[i + 5] = w[i + 5] * ss * x[i + 5]
-    out[i + 6] = w[i + 6] * ss * x[i + 6]
-    out[i + 7] = w[i + 7] * ss * x[i + 7]
   }
   for (; i < size; i = i + 1) {
     out[i] = w[i] * ss * x[i]
@@ -2573,42 +2505,26 @@ function rmsnormGemma(out, x, w, size, eps, invSize) {
   // Note: GGUF conversion already adds +1 to Gemma norm weights
   invSize = invSize || 1.0 / size
   var ss = 0.0
-  var size8 = size & ~7
+  // Loop unrolling: process 4 elements at a time
+  var size4 = size & ~3
   var i = 0
-  for (; i < size8; i = i + 8) {
+  for (; i < size4; i = i + 4) {
     var x0 = x[i]
     var x1 = x[i + 1]
     var x2 = x[i + 2]
     var x3 = x[i + 3]
-    var x4 = x[i + 4]
-    var x5 = x[i + 5]
-    var x6 = x[i + 6]
-    var x7 = x[i + 7]
-    ss =
-      ss +
-      x0 * x0 +
-      x1 * x1 +
-      x2 * x2 +
-      x3 * x3 +
-      x4 * x4 +
-      x5 * x5 +
-      x6 * x6 +
-      x7 * x7
+    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
   }
   for (; i < size; i = i + 1) {
     ss = ss + x[i] * x[i]
   }
   ss = 1.0 / Math.sqrt(ss * invSize + eps)
   i = 0
-  for (; i < size8; i = i + 8) {
+  for (; i < size4; i = i + 4) {
     out[i] = w[i] * ss * x[i]
     out[i + 1] = w[i + 1] * ss * x[i + 1]
     out[i + 2] = w[i + 2] * ss * x[i + 2]
     out[i + 3] = w[i + 3] * ss * x[i + 3]
-    out[i + 4] = w[i + 4] * ss * x[i + 4]
-    out[i + 5] = w[i + 5] * ss * x[i + 5]
-    out[i + 6] = w[i + 6] * ss * x[i + 6]
-    out[i + 7] = w[i + 7] * ss * x[i + 7]
   }
   for (; i < size; i = i + 1) {
     out[i] = w[i] * ss * x[i]
@@ -2618,30 +2534,17 @@ function rmsnormGemma(out, x, w, size, eps, invSize) {
 // In-place RMS norm at an offset into arr (avoids subarray allocation)
 function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
   var ss = 0.0
-  var size8 = size & ~7
-  var end8 = arrOffset + size8
+  var size4 = size & ~3
+  var end4 = arrOffset + size4
   var end = arrOffset + size
   var i = arrOffset
   var wi = 0
-  for (; i < end8; i = i + 8, wi = wi + 8) {
+  for (; i < end4; i = i + 4, wi = wi + 4) {
     var x0 = arr[i]
     var x1 = arr[i + 1]
     var x2 = arr[i + 2]
     var x3 = arr[i + 3]
-    var x4 = arr[i + 4]
-    var x5 = arr[i + 5]
-    var x6 = arr[i + 6]
-    var x7 = arr[i + 7]
-    ss =
-      ss +
-      x0 * x0 +
-      x1 * x1 +
-      x2 * x2 +
-      x3 * x3 +
-      x4 * x4 +
-      x5 * x5 +
-      x6 * x6 +
-      x7 * x7
+    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
   }
   for (; i < end; i = i + 1) {
     ss = ss + arr[i] * arr[i]
@@ -2649,15 +2552,11 @@ function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
   ss = 1.0 / Math.sqrt(ss * invSize + eps)
   i = arrOffset
   wi = 0
-  for (; i < end8; i = i + 8, wi = wi + 8) {
+  for (; i < end4; i = i + 4, wi = wi + 4) {
     arr[i] = w[wi] * ss * arr[i]
     arr[i + 1] = w[wi + 1] * ss * arr[i + 1]
     arr[i + 2] = w[wi + 2] * ss * arr[i + 2]
     arr[i + 3] = w[wi + 3] * ss * arr[i + 3]
-    arr[i + 4] = w[wi + 4] * ss * arr[i + 4]
-    arr[i + 5] = w[wi + 5] * ss * arr[i + 5]
-    arr[i + 6] = w[wi + 6] * ss * arr[i + 6]
-    arr[i + 7] = w[wi + 7] * ss * arr[i + 7]
   }
   for (; i < end; i = i + 1, wi = wi + 1) {
     arr[i] = w[wi] * ss * arr[i]
@@ -2665,17 +2564,13 @@ function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
 }
 
 function accum(a, b, size) {
-  var size8 = size & ~7
+  var size4 = size & ~3
   var i = 0
-  for (; i < size8; i = i + 8) {
+  for (; i < size4; i = i + 4) {
     a[i] = a[i] + b[i]
     a[i + 1] = a[i + 1] + b[i + 1]
     a[i + 2] = a[i + 2] + b[i + 2]
     a[i + 3] = a[i + 3] + b[i + 3]
-    a[i + 4] = a[i + 4] + b[i + 4]
-    a[i + 5] = a[i + 5] + b[i + 5]
-    a[i + 6] = a[i + 6] + b[i + 6]
-    a[i + 7] = a[i + 7] + b[i + 7]
   }
   for (; i < size; i = i + 1) {
     a[i] = a[i] + b[i]
@@ -2686,17 +2581,7 @@ function accum(a, b, size) {
 // GGUF parsing
 
 function parseGGUF(filePath) {
-  fileBuffer = fs.readFileSync(filePath)
-  fileUint8 = new Uint8Array(
-    fileBuffer.buffer,
-    fileBuffer.byteOffset,
-    fileBuffer.length
-  )
-  fileInt8 = new Int8Array(
-    fileBuffer.buffer,
-    fileBuffer.byteOffset,
-    fileBuffer.length
-  )
+  fileFd = fs.openSync(filePath, "r")
   offset = 0n
 
   var magic = readUint32()
@@ -3044,15 +2929,12 @@ function createRunState(p) {
   var seqLen = p.seqLen
   var ropeCosAll = new Float32Array(seqLen * ropeSize)
   var ropeSinAll = new Float32Array(seqLen * ropeSize)
-  var ropeFreqBase = Math.exp(Math.log(p.ropeTheta) * (2.0 / headSize))
   for (var pos = 0; pos < seqLen; pos = pos + 1) {
     var base = pos * ropeSize
-    var freq = 1.0
     for (var i = 0; i < ropeSize; i = i + 1) {
-      var val = pos / freq
+      var val = pos / Math.pow(p.ropeTheta, (i * 2) / headSize)
       ropeCosAll[base + i] = Math.cos(val)
       ropeSinAll[base + i] = Math.sin(val)
-      freq = freq * ropeFreqBase
     }
   }
 
@@ -3060,15 +2942,12 @@ function createRunState(p) {
   var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
   var ropeCosSwaAll = new Float32Array(seqLen * ropeSize)
   var ropeSinSwaAll = new Float32Array(seqLen * ropeSize)
-  var swaFreqBase = Math.exp(Math.log(swaTheta) * (2.0 / headSize))
   for (var pos = 0; pos < seqLen; pos = pos + 1) {
     var base = pos * ropeSize
-    var freq = 1.0
     for (var i = 0; i < ropeSize; i = i + 1) {
-      var val = pos / freq
+      var val = pos / Math.pow(swaTheta, (i * 2) / headSize)
       ropeCosSwaAll[base + i] = Math.cos(val)
       ropeSinSwaAll[base + i] = Math.sin(val)
-      freq = freq * swaFreqBase
     }
   }
 
@@ -3214,8 +3093,10 @@ function transformer(token, pos, computeLogits) {
       rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
     }
 
-    // QKV matmuls - using quantized weights (shared Q8_0 quantization)
-    matmulQuantizedShared3(s.q, s.k, s.v, xbArr, lw.wq, lw.wk, lw.wv)
+    // QKV matmuls - using quantized weights
+    matmulQuantized(s.q, xbArr, lw.wq)
+    matmulQuantized(s.k, xbArr, lw.wk)
+    matmulQuantized(s.v, xbArr, lw.wv)
 
     if (isGemma && lw.attnQNorm && lw.attnKNorm) {
       for (var h = 0; h < nHeads; h = h + 1) {
@@ -3440,10 +3321,11 @@ function transformer(token, pos, computeLogits) {
       rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
     }
 
-    // FFN gate and up - using quantized weights (shared Q8_0 quantization)
+    // FFN gate and up - using quantized weights
     var hbArr = s.hb
     var hb2Arr = s.hb2
-    matmulQuantizedShared2(hbArr, hb2Arr, xbArr, lw.w1, lw.w3)
+    matmulQuantized(hbArr, xbArr, lw.w1)
+    matmulQuantized(hb2Arr, xbArr, lw.w3)
 
     // Apply activation (GELU for Gemma, SiLU for Llama)
     var hd4 = hiddenDim & ~3
