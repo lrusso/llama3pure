@@ -4,7 +4,7 @@
 Designed by Leonardo Javier Russo
 https://www.lrusso.com
 
-Web Worker for LLM Inference - Llama-3 and Gemma-3 Transformer models.
+Node.js Module for LLM Inference - Llama-3 and Gemma-3 Transformer models.
 Supports GGUF file format with various quantization types.
 
 ----------------------------------------------------------------------------
