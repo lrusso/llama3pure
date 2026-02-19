@@ -95,33 +95,33 @@ var contextSize = 0
 // Stores metadata to read quantized weights on-the-fly during matmul
 
 // ----------------------------------------------------------------------------
-// File reading helpers (supports >2GB files using BigInt offsets)
+// Buffer reading helpers (supports >2GB files using BigInt offsets)
 
-function readBytesFromFile(position, length) {
+function readBytesFromBuffer(position, length) {
   var pos = Number(position)
   return fileBuffer.subarray(pos, pos + length)
 }
 
 function readUint8() {
-  var buf = readBytesFromFile(offset, 1)
+  var buf = readBytesFromBuffer(offset, 1)
   offset = offset + 1n
   return buf.readUInt8(0)
 }
 
 function readUint16() {
-  var buf = readBytesFromFile(offset, 2)
+  var buf = readBytesFromBuffer(offset, 2)
   offset = offset + 2n
   return buf.readUInt16LE(0)
 }
 
 function readUint32() {
-  var buf = readBytesFromFile(offset, 4)
+  var buf = readBytesFromBuffer(offset, 4)
   offset = offset + 4n
   return buf.readUInt32LE(0)
 }
 
 function readUint64() {
-  var buf = readBytesFromFile(offset, 8)
+  var buf = readBytesFromBuffer(offset, 8)
   offset = offset + 8n
   var low = buf.readUInt32LE(0)
   var high = buf.readUInt32LE(4)
@@ -129,19 +129,19 @@ function readUint64() {
 }
 
 function readInt8() {
-  var buf = readBytesFromFile(offset, 1)
+  var buf = readBytesFromBuffer(offset, 1)
   offset = offset + 1n
   return buf.readInt8(0)
 }
 
 function readInt32() {
-  var buf = readBytesFromFile(offset, 4)
+  var buf = readBytesFromBuffer(offset, 4)
   offset = offset + 4n
   return buf.readInt32LE(0)
 }
 
 function readInt64() {
-  var buf = readBytesFromFile(offset, 8)
+  var buf = readBytesFromBuffer(offset, 8)
   offset = offset + 8n
   var low = buf.readUInt32LE(0)
   var high = buf.readInt32LE(4)
@@ -149,41 +149,41 @@ function readInt64() {
 }
 
 function readFloat32() {
-  var buf = readBytesFromFile(offset, 4)
+  var buf = readBytesFromBuffer(offset, 4)
   offset = offset + 4n
   return buf.readFloatLE(0)
 }
 
 function readFloat64() {
-  var buf = readBytesFromFile(offset, 8)
+  var buf = readBytesFromBuffer(offset, 8)
   offset = offset + 8n
   return buf.readDoubleLE(0)
 }
 
 function readString() {
   var len = readUint64()
-  var buf = readBytesFromFile(offset, len)
+  var buf = readBytesFromBuffer(offset, len)
   offset = offset + BigInt(len)
   return buf.toString("utf-8")
 }
 
 function getUint8ArrayAt(srcOffset, length) {
-  var buf = readBytesFromFile(BigInt(srcOffset), length)
+  var buf = readBytesFromBuffer(BigInt(srcOffset), length)
   return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
 }
 
 function getInt8ArrayAt(srcOffset, length) {
-  var buf = readBytesFromFile(BigInt(srcOffset), length)
+  var buf = readBytesFromBuffer(BigInt(srcOffset), length)
   return new Int8Array(buf.buffer, buf.byteOffset, buf.byteLength)
 }
 
 function getUint16ArrayAt(srcOffset, count) {
-  var buf = readBytesFromFile(BigInt(srcOffset), count * 2)
+  var buf = readBytesFromBuffer(BigInt(srcOffset), count * 2)
   return new Uint16Array(buf.buffer, buf.byteOffset, count)
 }
 
 function getFloat32ArrayAt(srcOffset, count) {
-  var buf = readBytesFromFile(BigInt(srcOffset), count * 4)
+  var buf = readBytesFromBuffer(BigInt(srcOffset), count * 4)
   return new Float32Array(buf.buffer, buf.byteOffset, count)
 }
 
@@ -2653,7 +2653,7 @@ function readGGUFValue(type) {
     case GGUF_TYPE.UINT16:
       return readUint16()
     case GGUF_TYPE.INT16:
-      var buf = readBytesFromFile(offset, 2)
+      var buf = readBytesFromBuffer(offset, 2)
       offset = offset + 2n
       return buf.readInt16LE(0)
     case GGUF_TYPE.UINT32:
