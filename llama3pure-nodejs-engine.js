@@ -77,7 +77,7 @@ var config = null
 var weights = null
 var state = null
 var tokenizer = null
-var fileFd = null
+var fileBuffer = null
 var offset = 0n // BigInt for >2GB file support
 
 // Q8_0 buffers for quantizing x vector in matmulQuantized
@@ -98,9 +98,8 @@ var contextSize = 0
 // File reading helpers (supports >2GB files using BigInt offsets)
 
 function readBytesFromFile(position, length) {
-  var buffer = Buffer.alloc(length)
-  fs.readSync(fileFd, buffer, 0, length, position)
-  return buffer
+  var pos = Number(position)
+  return fileBuffer.subarray(pos, pos + length)
 }
 
 function readUint8() {
@@ -2581,7 +2580,7 @@ function accum(a, b, size) {
 // GGUF parsing
 
 function parseGGUF(filePath) {
-  fileFd = fs.openSync(filePath, "r")
+  fileBuffer = fs.readFileSync(filePath)
   offset = 0n
 
   var magic = readUint32()
