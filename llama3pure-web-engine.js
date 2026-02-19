@@ -3222,7 +3222,7 @@ function transformer(token, pos, computeLogits) {
     // Bytes per KV head = (headSize / 32) * 34
     var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
 
-    // SWA: limit attention to sliding window for SWA layers
+    // SWA window enforcement: restrict attention range for SWA layers
     var startT =
       isSwaLayer && config.swaWindow > 0
         ? Math.max(0, pos - config.swaWindow + 1)

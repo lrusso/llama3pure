@@ -324,6 +324,7 @@ function dotQ8_0Cache(x, xOffset, cache, cacheInt8, cacheOffset, count) {
     var d = fp16ToFp32(cache[bo] | (cache[bo + 1] << 8))
     var qOff = bo + 2
 
+    // Unrolled inner loop for JIT optimization
     var blockSum =
       x[xb] * cacheInt8[qOff] +
       x[xb + 1] * cacheInt8[qOff + 1] +
@@ -357,6 +358,7 @@ function dotQ8_0Cache(x, xOffset, cache, cacheInt8, cacheOffset, count) {
       x[xb + 29] * cacheInt8[qOff + 29] +
       x[xb + 30] * cacheInt8[qOff + 30] +
       x[xb + 31] * cacheInt8[qOff + 31]
+
     sum = sum + blockSum * d
     bo = bo + Q8_0_BLOCK_SIZE
     xb = xb + 32
@@ -2721,13 +2723,6 @@ function loadModel(filePath) {
 
   postMessage({
     type: "progress",
-    message:
-      "Model architecture: " +
-      arch +
-      ", isGemma: " +
-      isGemma +
-      ", keyPrefix: " +
-      keyPrefix,
   })
 
   var vocabTokens = meta["tokenizer.ggml.tokens"] || []
@@ -3471,7 +3466,7 @@ function sample(logits, temp) {
     if (logits[i] > minVal) {
       topKVal[minPos] = logits[i]
       topKIdx[minPos] = i
-      // Re-find min
+      // Rescan for new min starting from replaced value as bound
       minVal = topKVal[0]
       minPos = 0
       for (var j = 1; j < k; j = j + 1) {
