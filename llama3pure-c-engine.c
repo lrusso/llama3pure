@@ -99,21 +99,9 @@ enum ggml_type {
     GGML_TYPE_Q5_K    = 13,
     GGML_TYPE_Q6_K    = 14,
     GGML_TYPE_Q8_K    = 15,
-    GGML_TYPE_IQ2_XXS = 16,
-    GGML_TYPE_IQ2_XS  = 17,
-    GGML_TYPE_IQ3_XXS = 18,
-    GGML_TYPE_IQ1_S   = 19,
     GGML_TYPE_IQ4_NL  = 20,
-    GGML_TYPE_IQ3_S   = 21,
-    GGML_TYPE_IQ2_S   = 22,
-    GGML_TYPE_IQ4_XS  = 23,
-    GGML_TYPE_I8      = 24,
-    GGML_TYPE_I16     = 25,
-    GGML_TYPE_I32     = 26,
-    GGML_TYPE_I64     = 27,
-    GGML_TYPE_F64     = 28,
     GGML_TYPE_BF16    = 29,
-    GGML_TYPE_COUNT,
+    GGML_TYPE_BF16_ALT = 30,
 };
 
 // Block sizes for quantized types
@@ -852,7 +840,7 @@ float* dequantize_tensor(const void* src, int n_elements, enum ggml_type type) {
             dequantize_row_iq4_nl(src, dst, n_elements);
             break;
         case GGML_TYPE_BF16:
-        case 30:  // Some GGUF files use type 30 for BF16
+        case GGML_TYPE_BF16_ALT:
             dequantize_row_bf16(src, dst, n_elements);
             break;
         default:
@@ -907,7 +895,7 @@ void dequantize_row(float* dst, const void* src, int n_cols, enum ggml_type type
             dequantize_row_iq4_nl(src, dst, n_cols);
             break;
         case GGML_TYPE_BF16:
-        case 30:  // Some GGUF files use type 30 for BF16
+        case GGML_TYPE_BF16_ALT:
             dequantize_row_bf16(src, dst, n_cols);
             break;
         default:
@@ -933,7 +921,7 @@ int get_block_size(enum ggml_type type) {
         case GGML_TYPE_Q5_K: return QK_K;
         case GGML_TYPE_IQ4_NL: return QK4_NL;
         case GGML_TYPE_BF16: return 1;
-        case 30: return 1;  // BF16 alternate type
+        case GGML_TYPE_BF16_ALT: return 1;
         default: return 1;
     }
 }
@@ -944,7 +932,7 @@ size_t get_type_size(enum ggml_type type) {
         case GGML_TYPE_F32: return sizeof(float);
         case GGML_TYPE_F16: return sizeof(uint16_t);
         case GGML_TYPE_BF16: return sizeof(uint16_t);
-        case 30: return sizeof(uint16_t);  // BF16 alternate type
+        case GGML_TYPE_BF16_ALT: return sizeof(uint16_t);
         case GGML_TYPE_Q4_0: return sizeof(block_q4_0);
         case GGML_TYPE_Q4_1: return sizeof(block_q4_1);
         case GGML_TYPE_Q5_0: return sizeof(block_q5_0);
@@ -1914,7 +1902,7 @@ static inline vec_dot_func get_vec_dot_func(enum ggml_type type) {
         case GGML_TYPE_IQ4_NL: return vec_dot_iq4_nl;
         case GGML_TYPE_F16:   return vec_dot_f16;
         case GGML_TYPE_BF16:
-        case 30:              return vec_dot_bf16;
+        case GGML_TYPE_BF16_ALT: return vec_dot_bf16;
         case GGML_TYPE_F32:   return vec_dot_f32;
         default:              return NULL;
     }
