@@ -7,6 +7,11 @@ import path from "path"
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
+if (!process.execArgv.includes("--max-old-space-size=16384")) {
+  execSync("node --max-old-space-size=16384 " + __filename, { stdio: "inherit" })
+  process.exit()
+}
+
 const models = [
   "gemma-3-270m-it-Q2_K_L.gguf",
   "gemma-3-270m-it-Q3_K_M.gguf",
