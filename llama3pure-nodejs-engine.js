@@ -2990,10 +2990,27 @@ function createRunState(p) {
   var headQOffsets = new Int32Array(p.nHeads)
   var headKvIdx = new Int32Array(p.nHeads)
   var headAttOffsets = new Int32Array(p.nHeads)
+  var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
+  var headKvByteOffsets = new Int32Array(p.nHeads)
   for (var h = 0; h < p.nHeads; h = h + 1) {
     headQOffsets[h] = h * headSize
     headKvIdx[h] = (h / kvMul) | 0
     headAttOffsets[h] = h * p.seqLen
+    headKvByteOffsets[h] = ((h / kvMul) | 0) * headBytesQ8
+  }
+
+  // Pre-compute per-layer RoPE table references (avoid modulo check per layer)
+  var ropeCosLayer = new Array(p.nLayers)
+  var ropeSinLayer = new Array(p.nLayers)
+  for (var l = 0; l < p.nLayers; l = l + 1) {
+    var isSwa = p.swaPattern > 0 && l % p.swaPattern < p.swaPattern - 1
+    if (p.isGemma && isSwa) {
+      ropeCosLayer[l] = ropeCosSwaAll
+      ropeSinLayer[l] = ropeSinSwaAll
+    } else {
+      ropeCosLayer[l] = ropeCosAll
+      ropeSinLayer[l] = ropeSinAll
+    }
   }
 
   return {
@@ -3021,6 +3038,9 @@ function createRunState(p) {
     ropeCosSwaAll: ropeCosSwaAll,
     ropeSinSwaAll: ropeSinSwaAll,
     ropeSize: ropeSize,
+    // Per-layer RoPE table references (avoid modulo check per layer)
+    ropeCosLayer: ropeCosLayer,
+    ropeSinLayer: ropeSinLayer,
     // Cached constants to avoid recomputation in transformer
     headSize: headSize,
     kvDim: kvDim,
@@ -3052,6 +3072,8 @@ function createRunState(p) {
     headQOffsets: headQOffsets,
     headKvIdx: headKvIdx,
     headAttOffsets: headAttOffsets,
+    headKvByteOffsets: headKvByteOffsets,
+    headBytesQ8: headBytesQ8,
   }
 }
 
@@ -3125,9 +3147,8 @@ function transformer(token, pos, computeLogits) {
     }
 
     // Apply RoPE using pre-computed frequencies and cached sin/cos
-    // For Gemma3 with SWA: different layers use different RoPE frequencies
-    var swaPattern = s.swaPattern
-    var isSwaLayer = swaPattern > 0 && l % swaPattern < swaPattern - 1
+    // Use pre-computed per-layer RoPE table references (avoids modulo check per layer)
+    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
     var half = headSize >> 1
     // Cache q and k array references for RoPE
     var qArr = s.q
@@ -3135,15 +3156,8 @@ function transformer(token, pos, computeLogits) {
 
     // Index into pre-computed RoPE tables for this position
     var ropeBase = pos * s.ropeSize
-    var ropeCos
-    var ropeSin
-    if (isGemma && isSwaLayer) {
-      ropeCos = s.ropeCosSwaAll
-      ropeSin = s.ropeSinSwaAll
-    } else {
-      ropeCos = s.ropeCosAll
-      ropeSin = s.ropeSinAll
-    }
+    var ropeCos = s.ropeCosLayer[l]
+    var ropeSin = s.ropeSinLayer[l]
 
     if (isGemma) {
       // Fused RoPE + Q attention scaling (avoids separate scaling pass)
@@ -3250,9 +3264,6 @@ function transformer(token, pos, computeLogits) {
     // Zero xb once for all heads
     xbArr.fill(0, 0, qDim)
 
-    // Bytes per KV head = (headSize / 32) * 34
-    var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-
     // SWA window enforcement: restrict attention range for SWA layers
     var startT =
       isSwaLayer && config.swaWindow > 0
@@ -3261,17 +3272,16 @@ function transformer(token, pos, computeLogits) {
 
     // Cache head offset tables
     var headQOff = s.headQOffsets
-    var headKvI = s.headKvIdx
     var headAttOff = s.headAttOffsets
+    var headKvByteOff = s.headKvByteOffsets
 
     for (var h = 0; h < nHeads; h = h + 1) {
       var qOffset = headQOff[h]
       var attOffset = headAttOff[h]
-      var kvHeadIdx = headKvI[h]
-      var kvHeadByteOff = kvHeadIdx * headBytesQ8
+      var kvHeadByteOff_h = headKvByteOff[h]
 
       // Compute attention scores using Q8_0 dot product
-      var kBase = loff + kvHeadByteOff
+      var kBase = loff + kvHeadByteOff_h
       for (var t = startT; t <= pos; t = t + 1) {
         var kByteOffset = kBase + t * kvBytesPerVec
         var score = dotQ8_0Cache(
@@ -3307,7 +3317,7 @@ function transformer(token, pos, computeLogits) {
 
       // Accumulate weighted values using Q8_0 cache
       var xbOffset = h * headSize
-      var vBase = loff + kvHeadByteOff
+      var vBase = loff + kvHeadByteOff_h
       for (var t = startT; t <= pos; t = t + 1) {
         var vByteOffset = vBase + t * kvBytesPerVec
         var a = sAtt[attOffset + t]
