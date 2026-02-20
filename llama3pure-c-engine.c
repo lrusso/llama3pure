@@ -219,6 +219,11 @@ typedef struct {
     int swa_pattern;                  // SWA pattern (6 for Gemma3: every 6th layer is dense)
 } Config;
 
+// Forward declarations for function pointer types used in QuantizedTensor
+// Actual typed versions (vec_dot_q8_func, vec_dot_func) defined later
+typedef float (*cached_q8_func)(const block_q8_0*, const void*, int);
+typedef float (*cached_dot_func)(const float*, const void*, int);
+
 // Quantized tensor - keeps weights in compressed form
 typedef struct {
     void* data;           // raw quantized data (points into mmap'd file)
@@ -226,6 +231,10 @@ typedef struct {
     int n_elements;       // total number of elements (for output dimension)
     int rows;             // number of rows (output dim for matmul)
     int cols;             // number of cols (input dim for matmul)
+    // cached per-tensor values to avoid re-dispatch in matmul
+    size_t row_size;                // bytes per row (precomputed)
+    cached_q8_func q8_func;        // cached Q8_0 input dot function
+    cached_dot_func dot_func;      // cached float input dot function
 } QuantizedTensor;
 
 typedef struct {
@@ -287,10 +296,19 @@ typedef struct {
     int kv_mul;
     int kv_cache_bytes_per_vec;  // bytes per KV vector in Q8_0 format
     int kv_cache_layer_size;  // seq_len * kv_cache_bytes_per_vec (for layer offset calculation)
+    int head_q8_bytes;        // bytes per head in Q8_0 format (precomputed)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
     float embed_scale;        // sqrt(dim) for Gemma3 embedding scaling
     float inv_dim;            // 1.0/dim for rmsnorm
     float inv_head_size;      // 1.0/head_size for per-head rmsnorm
+    // pre-computed head offset tables (avoid repeated multiply/divide in attention loop)
+    int* head_q_offsets;      // (n_heads,) h * head_size
+    int* head_att_offsets;    // (n_heads,) h * seq_len
+    int* head_kv_indices;     // (n_heads,) h / kv_mul (GQA mapping)
+    int* head_kv_byte_offsets; // (n_heads,) kv_head * head_q8_bytes
+    // per-layer RoPE table pointers (avoid modulo check per layer)
+    float** rope_cos_layer;   // (n_layers,) pointer to correct cos table + pos offset base
+    float** rope_sin_layer;   // (n_layers,) pointer to correct sin table + pos offset base
 } RunState;
 
 // Global memory tracking for cleanup
@@ -366,19 +384,51 @@ void malloc_run_state(RunState* s, Config* p) {
     s->head_size = head_size;
     s->kv_dim = kv_dim;
     s->q_dim = q_dim;
-    s->kv_mul = p->n_heads / p->n_kv_heads;
+    int kv_mul = p->n_heads / p->n_kv_heads;
+    s->kv_mul = kv_mul;
     s->kv_cache_bytes_per_vec = kv_bytes_per_vec;
     s->kv_cache_layer_size = p->seq_len * kv_bytes_per_vec;
+    int head_q8_bytes = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
+    s->head_q8_bytes = head_q8_bytes;
     s->attn_scale = 1.0f / sqrtf((float)head_size);
     s->embed_scale = sqrtf((float)p->dim);
     s->inv_dim = 1.0f / (float)p->dim;
     s->inv_head_size = 1.0f / (float)head_size;
 
+    // Pre-compute head offset tables (avoid repeated multiply/divide in attention loop)
+    s->head_q_offsets = calloc(p->n_heads, sizeof(int));
+    s->head_att_offsets = calloc(p->n_heads, sizeof(int));
+    s->head_kv_indices = calloc(p->n_heads, sizeof(int));
+    s->head_kv_byte_offsets = calloc(p->n_heads, sizeof(int));
+    for (int h = 0; h < p->n_heads; h++) {
+        s->head_q_offsets[h] = h * head_size;
+        s->head_att_offsets[h] = h * p->seq_len;
+        s->head_kv_indices[h] = h / kv_mul;
+        s->head_kv_byte_offsets[h] = (h / kv_mul) * head_q8_bytes;
+    }
+
+    // Pre-compute per-layer RoPE table pointers (avoid modulo check per layer)
+    s->rope_cos_layer = calloc(p->n_layers, sizeof(float*));
+    s->rope_sin_layer = calloc(p->n_layers, sizeof(float*));
+    for (int l = 0; l < p->n_layers; l++) {
+        int is_swa = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
+        if (p->is_gemma3 && is_swa) {
+            s->rope_cos_layer[l] = s->rope_cos_swa_all;
+            s->rope_sin_layer[l] = s->rope_sin_swa_all;
+        } else {
+            s->rope_cos_layer[l] = s->rope_cos_all;
+            s->rope_sin_layer[l] = s->rope_sin_all;
+        }
+    }
+
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
      || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
      || !s->rope_cos_all || !s->rope_sin_all
-     || !s->rope_cos_swa_all || !s->rope_sin_swa_all) {
+     || !s->rope_cos_swa_all || !s->rope_sin_swa_all
+     || !s->head_q_offsets || !s->head_att_offsets
+     || !s->head_kv_indices || !s->head_kv_byte_offsets
+     || !s->rope_cos_layer || !s->rope_sin_layer) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
     }
@@ -403,6 +453,12 @@ void free_run_state(RunState* s) {
     free(s->rope_sin_all);
     free(s->rope_cos_swa_all);
     free(s->rope_sin_swa_all);
+    free(s->head_q_offsets);
+    free(s->head_att_offsets);
+    free(s->head_kv_indices);
+    free(s->head_kv_byte_offsets);
+    free(s->rope_cos_layer);
+    free(s->rope_sin_layer);
 }
 
 // ----------------------------------------------------------------------------
@@ -1931,12 +1987,12 @@ static inline size_t get_row_size(int n_cols, enum ggml_type type) {
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     int d = qw->rows;
     int n = qw->cols;
-    enum ggml_type type = qw->type;
-    size_t row_size = get_row_size(n, type);
+    size_t row_size = qw->row_size;  // use cached row_size
     const char* data = (const char*)qw->data;
 
     // Try Q8_0 quantized input path (integer dot products - faster)
-    vec_dot_q8_func q8_func = get_vec_dot_q8_func(type);
+    // Use cached function pointer from tensor (avoids switch dispatch per call)
+    cached_q8_func q8_func = qw->q8_func;
     if (q8_func && q8_buf) {
         // Quantize x to Q8_0 once before the parallel loop
         quantize_row_q8_0(x, q8_buf, n);
@@ -1951,9 +2007,10 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 
     // Fallback: float dot products (for F16, BF16, F32 weights)
-    vec_dot_func dot_func = get_vec_dot_func(type);
+    // Use cached function pointer from tensor
+    cached_dot_func dot_func = qw->dot_func;
     if (!dot_func) {
-        fprintf(stderr, "Unsupported quantization type in matmul: %d\n", type);
+        fprintf(stderr, "Unsupported quantization type in matmul: %d\n", qw->type);
         exit(1);
     }
 
@@ -2520,6 +2577,10 @@ int load_tensor_quantized(GGUFFile* gguf, const char* name, QuantizedTensor* qt,
     qt->n_elements = (int)n_elements;
     qt->rows = rows;
     qt->cols = cols;
+    // Cache per-tensor dispatch values to avoid re-lookup in matmul
+    qt->row_size = get_row_size(cols, tensor->type);
+    qt->q8_func = get_vec_dot_q8_func(tensor->type);
+    qt->dot_func = get_vec_dot_func(tensor->type);
 
     return 1;
 }
@@ -2674,8 +2735,9 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
         w->wcls.n_elements = p->vocab_size * p->dim;
         w->wcls.rows = p->vocab_size;
         w->wcls.cols = p->dim;
-
-
+        w->wcls.row_size = get_row_size(p->dim, w->token_embedding_type);
+        w->wcls.q8_func = get_vec_dot_q8_func(w->token_embedding_type);
+        w->wcls.dot_func = get_vec_dot_func(w->token_embedding_type);
     }
 
     return 1;
@@ -2778,7 +2840,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int head_size = s->head_size;
     int kv_dim = s->kv_dim;
     int q_dim = s->q_dim;
-    int kv_mul = s->kv_mul;
     float eps = p->rms_norm_eps > 0 ? p->rms_norm_eps : 1e-5f;
     float inv_dim = s->inv_dim;
     float inv_head_size = s->inv_head_size;
@@ -2824,10 +2885,10 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
         int half = head_size / 2;
 
-        // Use pre-computed sin/cos for this position (O(1) lookup, no sin/cos computation)
+        // Use pre-computed per-layer RoPE table pointers (avoids modulo check per layer)
         int rope_base = pos * half;
-        float* rope_cos = (p->is_gemma3 && is_swa_layer) ? s->rope_cos_swa_all + rope_base : s->rope_cos_all + rope_base;
-        float* rope_sin = (p->is_gemma3 && is_swa_layer) ? s->rope_sin_swa_all + rope_base : s->rope_sin_all + rope_base;
+        float* rope_cos = s->rope_cos_layer[l] + rope_base;
+        float* rope_sin = s->rope_sin_layer[l] + rope_base;
 
         if (p->is_gemma3) {
             // NEOX RoPE: rotate dimension i with dimension i + half
@@ -2885,38 +2946,29 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         quantize_to_q8_0_cache(s->v, s->value_cache + cache_offset, kv_dim);
 
         // multihead attention with GQA support
-        // Pre-fetch attention scale for non-Gemma3 models
-        float attn_scale_score = s->attn_scale;
-        int is_gemma3 = p->is_gemma3;
+        // Pre-select attention scale: 1.0 for Gemma3 (already scaled in RoPE), actual scale for others
+        float attn_scale_score = p->is_gemma3 ? 1.0f : s->attn_scale;
         // SWA: limit attention to sliding window for SWA layers (Gemma3)
         int start_t = 0;
-        if (is_gemma3 && is_swa_layer && p->swa_window > 0) {
+        if (p->is_gemma3 && is_swa_layer && p->swa_window > 0) {
             start_t = pos - p->swa_window + 1;
             if (start_t < 0) start_t = 0;
         }
         int att_size = pos - start_t + 1;
-        int head_q8_bytes = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
-            // get the query vector for this head
-            float* q = s->q + h * head_size;
-            // attention scores for this head
-            float* att = s->att + h * p->seq_len;
-            // compute kv_head once per head (constant for all timesteps)
-            int kv_head = h / kv_mul;
-            int kv_head_byte_offset = kv_head * head_q8_bytes;
+            // Use pre-computed head offset tables (avoids repeated multiply/divide)
+            float* q = s->q + s->head_q_offsets[h];
+            float* att = s->att + s->head_att_offsets[h];
+            int kv_head_byte_offset = s->head_kv_byte_offsets[h];
             // iterate over timesteps in attention range
             for (int t = start_t; t <= pos; t++) {
                 // get the key vector for this head and at this timestep (Q8_0 cache)
                 int k_offset = loff + t * kv_bytes_per_vec + kv_head_byte_offset;
                 // calculate the attention score as the dot product of q and k
-                float score = dot_q8_0_cache(q, s->key_cache + k_offset, head_size);
-                // For Gemma3, Q is already scaled by 1/sqrt(head_dim), so no scaling here
-                // For other models, scale by 1/sqrt(head_dim) using pre-computed value
-                if (!is_gemma3) {
-                    score *= attn_scale_score;
-                }
+                // attn_scale_score is 1.0 for Gemma3 (Q already scaled), eliminates per-score branch
+                float score = dot_q8_0_cache(q, s->key_cache + k_offset, head_size) * attn_scale_score;
                 // save the score to the attention buffer (offset by start_t for SWA)
                 att[t - start_t] = score;
             }
@@ -2925,7 +2977,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             softmax(att, att_size);
 
             // weighted sum of the values, store back into xb
-            float* xb = s->xb + h * head_size;
+            float* xb = s->xb + s->head_q_offsets[h];
             memset(xb, 0, head_size * sizeof(float));
             for (int t = start_t; t <= pos; t++) {
                 // get the attention weight for this timestep
