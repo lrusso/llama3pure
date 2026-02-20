@@ -4387,9 +4387,11 @@ int main(int argc, char *argv[]) {
     // Initial token will be set from prompt_tokens[0] if prompt provided
     token = tokenizer.bos_token;
 
-    // Apply context_size override if specified
+    // Apply context_size override if specified (clamped to model's max)
     if (context_size > 0) {
-        config.seq_len = context_size;
+        if (context_size < config.seq_len) {
+            config.seq_len = context_size;
+        }
     }
 
     if (max_tokens <= 0 || max_tokens > config.seq_len) {
