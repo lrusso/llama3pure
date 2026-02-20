@@ -2755,6 +2755,22 @@ function loadModel(arrayBuffer) {
     vocabSize: config.vocabSize,
     bosToken: meta["tokenizer.ggml.bos_token_id"] || 1,
     eosToken: meta["tokenizer.ggml.eos_token_id"] || 2,
+    eotToken: -1,
+  }
+
+  // Look up model-specific end tokens once at init time
+  if (config.isGemma) {
+    var endTurn = findSpecialToken("<end_of_turn>")
+    if (endTurn < 0) {
+      endTurn = 107
+    }
+    tokenizer.eotToken = endTurn
+  } else {
+    var eot = findSpecialToken("<|eot_id|>")
+    if (eot < 0) {
+      eot = 128009
+    }
+    tokenizer.eotToken = eot
   }
 
   postMessage({ type: "progress", message: "Loading weights..." })
@@ -4048,20 +4064,9 @@ function generate(chatHistory) {
         break
       }
 
-      // Check for model-specific end tokens
-      if (config.isGemma) {
-        if (tokenizer.vocab[next] === "<end_of_turn>") {
-          break
-        }
-      } else {
-        // Llama: check for EOT token
-        if (tokenizer.vocab[next] === "<|eot_id|>") {
-          break
-        }
-        if (next === 128009) {
-          // Default EOT token ID
-          break
-        }
+      // Check for model-specific end token
+      if (next === tokenizer.eotToken) {
+        break
       }
 
       // Track generated tokens for repeat detection
