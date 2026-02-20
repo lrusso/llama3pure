@@ -4647,6 +4647,8 @@ cleanup:
 
     free(prompt_tokens);
     free(generated_tokens);
+    free(top_k_idx_buf);
+    free(top_k_val_buf);
 
     // Free float weight allocations (norms, etc. - embeddings point to mmap'd file)
     for (int i = 0; i < num_weight_allocations; i++) {
