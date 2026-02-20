@@ -3503,18 +3503,6 @@ float random_f32() {
     return (random_u32() >> 8) / 16777216.0f;
 }
 
-int sample(float* probabilities, int n) {
-    float r = random_f32();
-    float cdf = 0.0f;
-    for (int i = 0; i < n; i++) {
-        cdf += probabilities[i];
-        if (r < cdf) {
-            return i;
-        }
-    }
-    return n - 1;
-}
-
 int argmax(float* v, int n) {
     int max_i = 0;
     float max_p = v[0];
@@ -4115,12 +4103,17 @@ void generate_token(void) {
                 }
             }
 
-            // Normalize and sample from the filtered distribution
-            float inv_sum = 1.0f / sum;
+            // Sample from the filtered distribution
+            float r = random_f32() * sum;
+            float cdf = 0.0f;
+            int s = n - 1;
             for (int i = 0; i < n; i++) {
-                top_k_val[i] *= inv_sum;
+                cdf += top_k_val[i];
+                if (r < cdf) {
+                    s = i;
+                    break;
+                }
             }
-            int s = sample(top_k_val, n);
             next = top_k_idx[s];
         }
 
