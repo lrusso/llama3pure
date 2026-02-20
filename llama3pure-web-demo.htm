@@ -186,7 +186,7 @@
 
         worker = new Worker("llama3pure-web-engine.js")
 
-        worker.onmessage = function (e) {
+        worker.addEventListener("message", function (e) {
           var data = e.data
           switch (data.type) {
             case "progress":
@@ -287,10 +287,10 @@
               console.error(data.message)
               break
           }
-        }
+        })
       }
 
-      function initialize(files) {
+      function initialize(data) {
         var content = document.querySelector(".content")
 
         var loadingMessage = document.createElement("span")
@@ -302,17 +302,17 @@
         }
         content.appendChild(loadingMessage)
 
-        if (files[0].size >= 2147483648) {
+        var isBuffer = data instanceof ArrayBuffer
+        var dataSize = isBuffer ? data.byteLength : data[0].size
+
+        if (dataSize >= 2147483648) {
           loadingMessage.innerText = t("error_filesize")
           return
         }
 
         initWorker()
 
-        var reader = new FileReader()
-
-        reader.addEventListener("load", function (event) {
-          var arrayBuffer = event.target.result
+        function sendToWorker(arrayBuffer) {
           worker.postMessage(
             {
               type: "load",
@@ -326,9 +326,19 @@
             },
             [arrayBuffer]
           )
-        })
+        }
 
-        reader.readAsArrayBuffer(files[0])
+        if (isBuffer) {
+          sendToWorker(data)
+        } else {
+          var reader = new FileReader()
+
+          reader.addEventListener("load", function (event) {
+            sendToWorker(event.target.result)
+          })
+
+          reader.readAsArrayBuffer(data[0])
+        }
       }
 
       function createComponent(tag, className, innerHTML, innerText) {
@@ -798,7 +808,7 @@
         var filename = url.split("/").pop().split("?")[0]
         var xhr = new XMLHttpRequest()
         xhr.open("GET", url, true)
-        xhr.responseType = "blob"
+        xhr.responseType = "arraybuffer"
 
         xhr.addEventListener("progress", function (event) {
           if (event.lengthComputable) {
@@ -809,11 +819,7 @@
 
         xhr.addEventListener("load", function () {
           if (xhr.status === 200) {
-            var blob = xhr.response
-            var file = new File([blob], filename, {
-              type: "application/octet-stream",
-            })
-            initialize([file])
+            initialize(xhr.response)
           } else {
             downloadStatus.innerText = t("error_download")
           }
