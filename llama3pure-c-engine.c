@@ -4412,11 +4412,15 @@ int main(int argc, char *argv[]) {
         q8_buf = (block_q8_0*)calloc(q8_buf_size, sizeof(block_q8_0));
     }
 
-    // Determine Gemma3-specific stop tokens
-    int gemma3_end_turn = -1;
+    // Set model-specific end token (looked up once at init time)
     if (config.is_gemma3) {
-        gemma3_end_turn = find_special_token("<end_of_turn>");
-        if (gemma3_end_turn < 0) gemma3_end_turn = GEMMA3_END_TURN;
+        int end_turn = find_special_token("<end_of_turn>");
+        if (end_turn < 0) end_turn = GEMMA3_END_TURN;
+        tokenizer.eot_token = end_turn;
+    } else {
+        int eot = find_special_token("<|eot_id|>");
+        if (eot < 0) eot = LLAMA3_EOT;
+        tokenizer.eot_token = eot;
     }
 
     prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
@@ -4486,12 +4490,8 @@ int main(int argc, char *argv[]) {
             if (token == tokenizer.eos_token) {
                 break;
             }
-            // Stop on EOT token (Llama3)
+            // Stop on EOT token
             if (token == tokenizer.eot_token) {
-                break;
-            }
-            // Stop on end_of_turn token (Gemma3)
-            if (config.is_gemma3 && token == gemma3_end_turn) {
                 break;
             }
             // Stop if the model is stuck repeating text
