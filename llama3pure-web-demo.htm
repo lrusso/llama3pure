@@ -805,7 +805,6 @@
 
         var downloadStatus = appendMessage("reply", t("downloading") + " 0%")
 
-        var filename = url.split("/").pop().split("?")[0]
         var xhr = new XMLHttpRequest()
         xhr.open("GET", url, true)
         xhr.responseType = "arraybuffer"
