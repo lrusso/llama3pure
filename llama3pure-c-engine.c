@@ -3351,6 +3351,8 @@ static TrieNode* vocab_trie = NULL;
 static TrieNode* trie_pool = NULL;  // single allocation for all nodes
 static int trie_pool_used = 0;
 static int trie_pool_cap = 0;
+// O(1) single-byte token lookup (fallback when trie misses)
+static int single_char_token[256];  // token id for each byte, -1 if none
 
 TrieNode* alloc_trie_node(void) {
     if (trie_pool_used >= trie_pool_cap) {
@@ -3391,6 +3393,14 @@ void build_sorted_vocab(char** vocab, int vocab_size) {
             }
             node->id = i;
             node->len = len;
+        }
+    }
+
+    // Build O(1) single-byte token lookup for fallback
+    memset(single_char_token, -1, sizeof(single_char_token));
+    for (int i = 0; i < vocab_size; i++) {
+        if (vocab[i] && vocab[i][0] && vocab[i][1] == '\0') {
+            single_char_token[(unsigned char)vocab[i][0]] = i;
         }
     }
 }
@@ -3442,12 +3452,10 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
             tokens[(*n_tokens)++] = best_id;
             pos += best_len;
         } else {
-            // No match found - try to find single character token
-            for (int i = 0; i < vocab_size; i++) {
-                if (vocab[i] && vocab[i][0] == encoded_text[pos] && vocab[i][1] == '\0') {
-                    tokens[(*n_tokens)++] = i;
-                    break;
-                }
+            // No match found - use O(1) single-byte token lookup
+            int sid = single_char_token[(unsigned char)encoded_text[pos]];
+            if (sid >= 0) {
+                tokens[(*n_tokens)++] = sid;
             }
             // Skip this character regardless
             pos++;
@@ -4012,6 +4020,9 @@ TransformerWeights weights;
 RunState state;
 int *prompt_tokens = NULL;
 int num_prompt_tokens = 0;
+// Pre-allocated top-k sampling buffers (avoids repeated stack allocation per token)
+int *top_k_idx_buf = NULL;
+float *top_k_val_buf = NULL;
 int next;
 int token;
 int pos = 0;
@@ -4070,13 +4081,9 @@ void generate_token(void) {
         } else {
             int k = top_k;
             if (k > config.vocab_size) k = config.vocab_size;
-#if defined _WIN32
-            int* top_k_idx = (int*)_alloca(k * sizeof(int));
-            float* top_k_val = (float*)_alloca(k * sizeof(float));
-#else
-            int top_k_idx[k];
-            float top_k_val[k];
-#endif
+            // Use pre-allocated sampling buffers
+            int* top_k_idx = top_k_idx_buf;
+            float* top_k_val = top_k_val_buf;
 
             // Initialize with first k logits
             for (int i = 0; i < k; i++) {
@@ -4462,6 +4469,14 @@ int main(int argc, char *argv[]) {
         if (config.hidden_dim > max_input) max_input = config.hidden_dim;
         int q8_buf_size = (max_input + QK8_0 - 1) / QK8_0;
         q8_buf = (block_q8_0*)calloc(q8_buf_size, sizeof(block_q8_0));
+    }
+
+    // Pre-allocate top-k sampling buffers (avoids repeated stack allocation per token)
+    {
+        int k = top_k;
+        if (k > config.vocab_size) k = config.vocab_size;
+        top_k_idx_buf = (int*)calloc(k, sizeof(int));
+        top_k_val_buf = (float*)calloc(k, sizeof(float));
     }
 
     // Set model-specific end token (looked up once at init time)
