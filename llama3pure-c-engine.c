@@ -294,8 +294,8 @@ typedef struct {
     int kv_dim;
     int q_dim;
     int kv_mul;
-    int kv_cache_bytes_per_vec;  // bytes per KV vector in Q8_0 format
-    int kv_cache_layer_size;  // seq_len * kv_cache_bytes_per_vec (for layer offset calculation)
+    int head_seq_bytes;          // seq_len * head_q8_bytes (per-head KV stride)
+    int kv_cache_layer_size;  // n_kv_heads * head_seq_bytes (for layer offset calculation)
     int head_q8_bytes;        // bytes per head in Q8_0 format (precomputed)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
     float embed_scale;        // sqrt(dim) for Gemma3 embedding scaling
@@ -305,7 +305,10 @@ typedef struct {
     int* head_q_offsets;      // (n_heads,) h * head_size
     int* head_att_offsets;    // (n_heads,) h * seq_len
     int* head_kv_indices;     // (n_heads,) h / kv_mul (GQA mapping)
-    int* head_kv_byte_offsets; // (n_heads,) kv_head * head_q8_bytes
+    int* head_kv_byte_offsets; // (n_heads,) kv_head * head_seq_bytes
+    // Q8_0 quantized query buffer for int8*int8 attention scoring
+    uint8_t* qQ8;             // (n_heads * head_q8_bytes,) Q8_0 quantized query
+    int8_t*  qQ8i8;           // int8 view of qQ8
     // per-layer RoPE table pointers (avoid modulo check per layer)
     float** rope_cos_layer;   // (n_layers,) pointer to correct cos table + pos offset base
     float** rope_sin_layer;   // (n_layers,) pointer to correct sin table + pos offset base
@@ -337,10 +340,12 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = calloc(p->vocab_size, sizeof(float));
     // Q8_0 KV cache: 34 bytes per 32 floats
-    int kv_blocks_per_vec = kv_dim / QK8_0;
-    int kv_bytes_per_vec = kv_blocks_per_vec * Q8_0_BLOCK_SIZE;
-    s->key_cache = calloc((size_t)p->n_layers * p->seq_len * kv_bytes_per_vec, 1);
-    s->value_cache = calloc((size_t)p->n_layers * p->seq_len * kv_bytes_per_vec, 1);
+    // Per-head layout: [layer][kv_head][position][head_data] for cache locality
+    int head_q8_bytes_init = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
+    int head_seq_bytes = p->seq_len * head_q8_bytes_init;
+    int kv_cache_layer_bytes = p->n_kv_heads * head_seq_bytes;
+    s->key_cache = calloc((size_t)p->n_layers * kv_cache_layer_bytes, 1);
+    s->value_cache = calloc((size_t)p->n_layers * kv_cache_layer_bytes, 1);
 
     // Pre-compute RoPE frequencies to avoid powf in hot loop
     int rope_size = head_size / 2;
@@ -386,14 +391,19 @@ void malloc_run_state(RunState* s, Config* p) {
     s->q_dim = q_dim;
     int kv_mul = p->n_heads / p->n_kv_heads;
     s->kv_mul = kv_mul;
-    s->kv_cache_bytes_per_vec = kv_bytes_per_vec;
-    s->kv_cache_layer_size = p->seq_len * kv_bytes_per_vec;
     int head_q8_bytes = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
     s->head_q8_bytes = head_q8_bytes;
+    s->head_seq_bytes = p->seq_len * head_q8_bytes;
+    s->kv_cache_layer_size = p->n_kv_heads * s->head_seq_bytes;
     s->attn_scale = 1.0f / sqrtf((float)head_size);
     s->embed_scale = sqrtf((float)p->dim);
     s->inv_dim = 1.0f / (float)p->dim;
     s->inv_head_size = 1.0f / (float)head_size;
+
+    // Q8_0 quantized query buffer for int8*int8 attention scoring
+    int qQ8TotalBytes = p->n_heads * head_q8_bytes;
+    s->qQ8 = calloc(qQ8TotalBytes, 1);
+    s->qQ8i8 = (int8_t*)s->qQ8;
 
     // Pre-compute head offset tables (avoid repeated multiply/divide in attention loop)
     s->head_q_offsets = calloc(p->n_heads, sizeof(int));
@@ -404,7 +414,7 @@ void malloc_run_state(RunState* s, Config* p) {
         s->head_q_offsets[h] = h * head_size;
         s->head_att_offsets[h] = h * p->seq_len;
         s->head_kv_indices[h] = h / kv_mul;
-        s->head_kv_byte_offsets[h] = (h / kv_mul) * head_q8_bytes;
+        s->head_kv_byte_offsets[h] = (h / kv_mul) * s->head_seq_bytes;
     }
 
     // Pre-compute per-layer RoPE table pointers (avoid modulo check per layer)
@@ -428,6 +438,7 @@ void malloc_run_state(RunState* s, Config* p) {
      || !s->rope_cos_swa_all || !s->rope_sin_swa_all
      || !s->head_q_offsets || !s->head_att_offsets
      || !s->head_kv_indices || !s->head_kv_byte_offsets
+     || !s->qQ8
      || !s->rope_cos_layer || !s->rope_sin_layer) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
@@ -457,6 +468,7 @@ void free_run_state(RunState* s) {
     free(s->head_att_offsets);
     free(s->head_kv_indices);
     free(s->head_kv_byte_offsets);
+    free(s->qQ8);
     free(s->rope_cos_layer);
     free(s->rope_sin_layer);
 }
@@ -1488,25 +1500,29 @@ static void quantize_to_q8_0_cache(const float* src, uint8_t* dst, int count) {
     }
 }
 
-// Dot product of float query vector with Q8_0 cached key
-static float dot_q8_0_cache(const float* x, const uint8_t* cache, int count) {
+// Dot product of Q8_0 quantized query with Q8_0 cached key (int8 * int8)
+// Both sides are Q8_0: avoids float*int8, uses cheaper integer arithmetic
+static float dot_q8_0_q8_0_cache(const uint8_t* aQ8, const int8_t* aI8,
+                                  const uint8_t* bQ8, const int8_t* bI8, int count) {
     int nb = count / QK8_0;
     float sum = 0.0f;
+    int ao = 0;
     int bo = 0;
-    int xb = 0;
 
     for (int i = 0; i < nb; i++) {
-        float d = fp16_to_fp32(cache[bo] | (cache[bo + 1] << 8));
-        const int8_t* qs = (const int8_t*)(cache + bo + 2);
+        float da = fp16_to_fp32(aQ8[ao] | (aQ8[ao + 1] << 8));
+        float db = fp16_to_fp32(bQ8[bo] | (bQ8[bo + 1] << 8));
+        const int8_t* aqs = aI8 + ao + 2;
+        const int8_t* bqs = bI8 + bo + 2;
 
-        float block_sum = 0.0f;
-        for (int j = 0; j < QK8_0; j++) {
-            block_sum += x[xb + j] * qs[j];
+        int isum = 0;
+        for (int j = 0; j < 32; j++) {
+            isum += aqs[j] * bqs[j];
         }
 
-        sum += block_sum * d;
+        sum += da * db * (float)isum;
+        ao += Q8_0_BLOCK_SIZE;
         bo += Q8_0_BLOCK_SIZE;
-        xb += QK8_0;
     }
     return sum;
 }
@@ -2019,6 +2035,23 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     for (i = 0; i < d; i++) {
         const void* row = data + i * row_size;
         xout[i] = dot_func(x, row, n);
+    }
+}
+
+// Quantized matmul using pre-quantized input (avoids redundant quantization)
+// Call quantize_row_q8_0(x, q8_buf, n) once, then call this for multiple weight matrices
+void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    cached_q8_func q8_func = qw->q8_func;
+
+    int i;
+    #pragma omp parallel for private(i)
+    for (i = 0; i < d; i++) {
+        const void* row = data + i * row_size;
+        xout[i] = q8_func(q8_buf, row, n);
     }
 }
 
@@ -2864,9 +2897,17 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, inv_dim, eps);
 
         // qkv matmuls for this position - using quantized weights
-        matmul_quantized(s->q, s->xb, &w->wq[l]);
-        matmul_quantized(s->k, s->xb, &w->wk[l]);
-        matmul_quantized(s->v, s->xb, &w->wv[l]);
+        // Quantize input once and reuse for Q, K, V (avoids 2 redundant quantizations)
+        if (w->wq[l].q8_func && q8_buf) {
+            quantize_row_q8_0(s->xb, q8_buf, w->wq[l].cols);
+            matmul_quantized_preq8(s->q, &w->wq[l]);
+            matmul_quantized_preq8(s->k, &w->wk[l]);
+            matmul_quantized_preq8(s->v, &w->wv[l]);
+        } else {
+            matmul_quantized(s->q, s->xb, &w->wq[l]);
+            matmul_quantized(s->k, s->xb, &w->wk[l]);
+            matmul_quantized(s->v, s->xb, &w->wv[l]);
+        }
 
         // Gemma3: Apply per-head Q and K normalization after projection
         if (p->is_gemma3 && w->attn_q_norm && w->attn_k_norm) {
@@ -2938,12 +2979,21 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // Gemma3: Q attention scaling is fused into the RoPE loop above
 
         // save key,value at this time step (pos) to our kv cache (Q8_0 quantized)
-        // Use pre-computed kv_cache_layer_size for layer offset
-        int kv_bytes_per_vec = s->kv_cache_bytes_per_vec;
+        // Per-head layout: [layer][kv_head][position][head_data]
+        int head_q8_bytes = s->head_q8_bytes;
+        int head_seq_bytes = s->head_seq_bytes;
         int loff = l * s->kv_cache_layer_size;
-        int cache_offset = loff + pos * kv_bytes_per_vec;
-        quantize_to_q8_0_cache(s->k, s->key_cache + cache_offset, kv_dim);
-        quantize_to_q8_0_cache(s->v, s->value_cache + cache_offset, kv_dim);
+        for (int kh = 0; kh < p->n_kv_heads; kh++) {
+            int cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
+            quantize_to_q8_0_cache(s->k + kh * head_size, s->key_cache + cache_offset, head_size);
+            quantize_to_q8_0_cache(s->v + kh * head_size, s->value_cache + cache_offset, head_size);
+        }
+
+        // Quantize Q heads to Q8_0 for int8*int8 attention scoring
+        for (int qh = 0; qh < p->n_heads; qh++) {
+            quantize_to_q8_0_cache(s->q + s->head_q_offsets[qh],
+                                   s->qQ8 + qh * head_q8_bytes, head_size);
+        }
 
         // multihead attention with GQA support
         // Pre-select attention scale: 1.0 for Gemma3 (already scaled in RoPE), actual scale for others
@@ -2959,16 +3009,22 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
             // Use pre-computed head offset tables (avoids repeated multiply/divide)
-            float* q = s->q + s->head_q_offsets[h];
             float* att = s->att + s->head_att_offsets[h];
             int kv_head_byte_offset = s->head_kv_byte_offsets[h];
+            // Q8_0 quantized query for this head (int8*int8 attention scoring)
+            int qOff = h * head_q8_bytes;
+            uint8_t* qH = s->qQ8 + qOff;
+            int8_t* qHi8 = s->qQ8i8 + qOff;
             // iterate over timesteps in attention range
+            // Per-head layout: k_offset = loff + kv_head_byte_offset + t * head_q8_bytes
             for (int t = start_t; t <= pos; t++) {
                 // get the key vector for this head and at this timestep (Q8_0 cache)
-                int k_offset = loff + t * kv_bytes_per_vec + kv_head_byte_offset;
-                // calculate the attention score as the dot product of q and k
+                int k_offset = loff + kv_head_byte_offset + t * head_q8_bytes;
+                // calculate the attention score as int8*int8 dot product of q and k
                 // attn_scale_score is 1.0 for Gemma3 (Q already scaled), eliminates per-score branch
-                float score = dot_q8_0_cache(q, s->key_cache + k_offset, head_size) * attn_scale_score;
+                float score = dot_q8_0_q8_0_cache(qH, qHi8,
+                    s->key_cache + k_offset, (const int8_t*)(s->key_cache + k_offset),
+                    head_size) * attn_scale_score;
                 // save the score to the attention buffer (offset by start_t for SWA)
                 att[t - start_t] = score;
             }
@@ -2983,7 +3039,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 // get the attention weight for this timestep
                 float a = att[t - start_t];
                 // get the value vector for this head and at this timestep (Q8_0 cache)
-                int v_offset = loff + t * kv_bytes_per_vec + kv_head_byte_offset;
+                int v_offset = loff + kv_head_byte_offset + t * head_q8_bytes;
                 // accumulate the weighted value into xb (handles near-zero skip internally)
                 accum_q8_0_cache(xb, s->value_cache + v_offset, a, head_size);
             }
@@ -3005,8 +3061,15 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x) - using quantized weights
-        matmul_quantized(s->hb, s->xb, &w->w1[l]);
-        matmul_quantized(s->hb2, s->xb, &w->w3[l]);
+        // Quantize input once and reuse for gate and up (avoids 1 redundant quantization)
+        if (w->w1[l].q8_func && q8_buf) {
+            quantize_row_q8_0(s->xb, q8_buf, w->w1[l].cols);
+            matmul_quantized_preq8(s->hb, &w->w1[l]);
+            matmul_quantized_preq8(s->hb2, &w->w3[l]);
+        } else {
+            matmul_quantized(s->hb, s->xb, &w->w1[l]);
+            matmul_quantized(s->hb2, s->xb, &w->w3[l]);
+        }
 
         // Gemma3 uses GeGLU activation: gelu(gate) * up
         // hb = w1(x) = ffn_gate(x) = gate
