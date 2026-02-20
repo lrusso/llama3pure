@@ -2965,7 +2965,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             // GELU formula: 0.5*x*(1 + tanh(sqrt(2/pi)*x*(1 + 0.044715*x^2)))
             for (int i = 0; i < hidden_dim; i++) {
                 float x = s->hb[i];  // gate value
-                float gelu_val = 0.5f * x * (1.0f + fast_tanhf(0.7978845608f * x * (1.0f + 0.044715f * x * x)));
+                float gelu_val = 0.5f * x * (1.0f + fast_tanhf(x * (0.7978845608f + 0.035677408137f * x * x)));
                 s->hb[i] = gelu_val * s->hb2[i];  // gelu(gate) * up
             }
         } else {
