@@ -3314,35 +3314,59 @@ char* text_to_sentencepiece(const char* text) {
     return result;
 }
 
-// Build a sorted vocab index for faster longest-match lookup
-typedef struct {
-    int id;
-    int len;
-} VocabEntry;
+// Build trie for O(max_token_len) longest-match lookup
+typedef struct TrieNode {
+    struct TrieNode* children[256];  // byte-indexed children
+    int id;   // token id (-1 if not a terminal)
+    int len;  // token length (valid when id >= 0)
+} TrieNode;
 
-static VocabEntry* sorted_vocab = NULL;
-static int sorted_vocab_size = 0;
+static TrieNode* vocab_trie = NULL;
+static TrieNode* trie_pool = NULL;  // single allocation for all nodes
+static int trie_pool_used = 0;
+static int trie_pool_cap = 0;
 
-int vocab_entry_cmp(const void* a, const void* b) {
-    // Sort by length descending (longest first)
-    return ((VocabEntry*)b)->len - ((VocabEntry*)a)->len;
+TrieNode* alloc_trie_node(void) {
+    if (trie_pool_used >= trie_pool_cap) {
+        // Should not happen if we sized the pool correctly
+        return calloc(1, sizeof(TrieNode));
+    }
+    TrieNode* node = &trie_pool[trie_pool_used++];
+    memset(node, 0, sizeof(TrieNode));
+    node->id = -1;
+    return node;
 }
 
 void build_sorted_vocab(char** vocab, int vocab_size) {
-    if (sorted_vocab) return;  // Already built
+    if (vocab_trie) return;  // Already built
 
-    sorted_vocab = malloc(vocab_size * sizeof(VocabEntry));
-    sorted_vocab_size = 0;
-
+    // Count total characters to estimate pool size (nodes needed <= total chars + 1)
+    int total_chars = 1;  // +1 for root
     for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && strlen(vocab[i]) > 0) {
-            sorted_vocab[sorted_vocab_size].id = i;
-            sorted_vocab[sorted_vocab_size].len = strlen(vocab[i]);
-            sorted_vocab_size++;
+        if (vocab[i] && vocab[i][0]) {
+            total_chars += (int)strlen(vocab[i]);
         }
     }
+    trie_pool_cap = total_chars;
+    trie_pool = calloc(trie_pool_cap, sizeof(TrieNode));
 
-    qsort(sorted_vocab, sorted_vocab_size, sizeof(VocabEntry), vocab_entry_cmp);
+    vocab_trie = alloc_trie_node();
+
+    for (int i = 0; i < vocab_size; i++) {
+        if (vocab[i] && vocab[i][0]) {
+            TrieNode* node = vocab_trie;
+            int len = (int)strlen(vocab[i]);
+            for (int j = 0; j < len; j++) {
+                unsigned char ch = (unsigned char)vocab[i][j];
+                if (!node->children[ch]) {
+                    node->children[ch] = alloc_trie_node();
+                }
+                node = node->children[ch];
+            }
+            node->id = i;
+            node->len = len;
+        }
+    }
 }
 
 // Greedy longest-match tokenizer
@@ -3374,25 +3398,17 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
     size_t pos = 0;
 
     while (pos < text_len) {
+        // Walk trie for longest match at current position
+        TrieNode* node = vocab_trie;
         int best_id = -1;
         int best_len = 0;
-
-        // Try to find longest matching token (vocab is sorted by length descending)
-        for (int i = 0; i < sorted_vocab_size; i++) {
-            int id = sorted_vocab[i].id;
-            int len = sorted_vocab[i].len;
-
-            // Skip if token is longer than remaining text
-            if ((size_t)len > text_len - pos) continue;
-
-            // Skip if shorter than best match we already found
-            if (len <= best_len) break;  // Sorted by length, so no better match possible
-
-            // Check if vocab entry matches
-            if (strncmp(encoded_text + pos, vocab[id], len) == 0) {
-                best_id = id;
-                best_len = len;
-                break;  // Found longest match
+        for (size_t j = pos; j < text_len; j++) {
+            unsigned char ch = (unsigned char)encoded_text[j];
+            node = node->children[ch];
+            if (!node) break;
+            if (node->id >= 0) {
+                best_id = node->id;
+                best_len = node->len;
             }
         }
 
@@ -3400,8 +3416,14 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
             tokens[(*n_tokens)++] = best_id;
             pos += best_len;
         } else {
-            // No match found, skip this byte
-            // This shouldn't happen if vocab contains all single bytes
+            // No match found - try to find single character token
+            for (int i = 0; i < vocab_size; i++) {
+                if (vocab[i] && vocab[i][0] == encoded_text[pos] && vocab[i][1] == '\0') {
+                    tokens[(*n_tokens)++] = i;
+                    break;
+                }
+            }
+            // Skip this character regardless
             pos++;
         }
     }
@@ -3526,6 +3548,17 @@ int argmax(float* v, int n) {
 
 // Helper to find a special token in vocabulary by its string representation
 int find_special_token(const char* token_str) {
+    if (vocab_trie) {
+        // Use trie for O(token_len) exact lookup
+        TrieNode* node = vocab_trie;
+        for (int i = 0; token_str[i]; i++) {
+            unsigned char ch = (unsigned char)token_str[i];
+            node = node->children[ch];
+            if (!node) return -1;
+        }
+        return node->id;
+    }
+    // Fallback: linear scan (trie not built yet)
     for (int i = 0; i < tokenizer.vocab_size; i++) {
         if (tokenizer.vocab[i] && strcmp(tokenizer.vocab[i], token_str) == 0) {
             return i;
@@ -4506,7 +4539,7 @@ cleanup:
     free_run_state(&state);
     free(q8_buf);
     free_tokenizer();
-    free(sorted_vocab);
+    free(trie_pool);
 
     free(prompt_tokens);
     free(generated_tokens);
