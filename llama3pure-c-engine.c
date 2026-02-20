@@ -289,6 +289,8 @@ typedef struct {
     int kv_cache_layer_size;  // seq_len * kv_cache_bytes_per_vec (for layer offset calculation)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
     float embed_scale;        // sqrt(dim) for Gemma3 embedding scaling
+    float inv_dim;            // 1.0/dim for rmsnorm
+    float inv_head_size;      // 1.0/head_size for per-head rmsnorm
 } RunState;
 
 // Global memory tracking for cleanup
@@ -369,6 +371,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->kv_cache_layer_size = p->seq_len * kv_bytes_per_vec;
     s->attn_scale = 1.0f / sqrtf((float)head_size);
     s->embed_scale = sqrtf((float)p->dim);
+    s->inv_dim = 1.0f / (float)p->dim;
+    s->inv_head_size = 1.0f / (float)head_size;
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
@@ -2710,41 +2714,23 @@ void accum(float *a, float *b, int size) {
     }
 }
 
-void rmsnorm(float* o, float* x, float* weight, int size) {
+void rmsnorm(float* o, float* x, float* weight, int size, float inv_size, float eps) {
     // calculate sum of squares
     float ss = 0.0f;
     for (int j = 0; j < size; j++) {
         ss += x[j] * x[j];
     }
-    ss /= size;
-    ss += 1e-5f;
-    ss = 1.0f / sqrtf(ss);
+    ss = 1.0f / sqrtf(ss * inv_size + eps);
     // normalize and scale
     for (int j = 0; j < size; j++) {
         o[j] = weight[j] * (ss * x[j]);
     }
 }
 
-// RMS norm with configurable epsilon (for Gemma3)
-// NOTE: The GGUF conversion script already adds +1 to Gemma norm weights,
-// so we just do standard multiplication here (no need to add +1 at runtime)
-void rmsnorm_gemma(float* o, float* x, float* weight, int size, float eps) {
-    float ss = 0.0f;
-    for (int j = 0; j < size; j++) {
-        ss += x[j] * x[j];
-    }
-    ss /= size;
-    ss += eps;
-    ss = 1.0f / sqrtf(ss);
-    for (int j = 0; j < size; j++) {
-        o[j] = weight[j] * (ss * x[j]);  // Weights already have +1 baked in from GGUF conversion
-    }
-}
-
 // Apply RMS norm per head (for Gemma3 Q/K normalization)
 // input: (n_heads, head_size), weight: (head_size,)
 // NOTE: The GGUF conversion script already adds +1 to Gemma norm weights
-void rmsnorm_per_head_gemma(float* o, float* x, float* weight, int n_heads, int head_size, float eps) {
+void rmsnorm_per_head(float* o, float* x, float* weight, int n_heads, int head_size, float inv_head_size, float eps) {
     for (int h = 0; h < n_heads; h++) {
         float* head_x = x + h * head_size;
         float* head_o = o + h * head_size;
@@ -2753,12 +2739,10 @@ void rmsnorm_per_head_gemma(float* o, float* x, float* weight, int n_heads, int 
         for (int j = 0; j < head_size; j++) {
             ss += head_x[j] * head_x[j];
         }
-        ss /= head_size;
-        ss += eps;
-        ss = 1.0f / sqrtf(ss);
+        ss = 1.0f / sqrtf(ss * inv_head_size + eps);
 
         for (int j = 0; j < head_size; j++) {
-            head_o[j] = weight[j] * (ss * head_x[j]);  // Weights already have +1 baked in
+            head_o[j] = weight[j] * (ss * head_x[j]);
         }
     }
 }
@@ -2796,6 +2780,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     int q_dim = s->q_dim;
     int kv_mul = s->kv_mul;
     float eps = p->rms_norm_eps > 0 ? p->rms_norm_eps : 1e-5f;
+    float inv_dim = s->inv_dim;
+    float inv_head_size = s->inv_head_size;
 
     // dequantize the token embedding into x (on-demand, saves memory)
     // GGUF stores embeddings with ne=[dim, vocab_size], meaning shape (vocab_size, dim) in row-major
@@ -2814,11 +2800,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
         // attention rmsnorm
-        if (p->is_gemma3) {
-            rmsnorm_gemma(s->xb, x, w->rms_att_weight + l * dim, dim, eps);
-        } else {
-            rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim);
-        }
+        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, inv_dim, eps);
 
         // qkv matmuls for this position - using quantized weights
         matmul_quantized(s->q, s->xb, &w->wq[l]);
@@ -2827,8 +2809,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Gemma3: Apply per-head Q and K normalization after projection
         if (p->is_gemma3 && w->attn_q_norm && w->attn_k_norm) {
-            rmsnorm_per_head_gemma(s->q, s->q, w->attn_q_norm + l * head_size, p->n_heads, head_size, eps);
-            rmsnorm_per_head_gemma(s->k, s->k, w->attn_k_norm + l * head_size, p->n_kv_heads, head_size, eps);
+            rmsnorm_per_head(s->q, s->q, w->attn_q_norm + l * head_size, p->n_heads, head_size, inv_head_size, eps);
+            rmsnorm_per_head(s->k, s->k, w->attn_k_norm + l * head_size, p->n_kv_heads, head_size, inv_head_size, eps);
         }
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
@@ -2960,18 +2942,14 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Gemma3: Apply post-attention normalization
         if (p->is_gemma3 && w->attn_post_norm) {
-            rmsnorm_gemma(s->xb2, s->xb2, w->attn_post_norm + l * dim, dim, eps);
+            rmsnorm(s->xb2, s->xb2, w->attn_post_norm + l * dim, dim, inv_dim, eps);
         }
 
         // residual connection back into x
         accum(x, s->xb2, dim);
 
         // ffn rmsnorm
-        if (p->is_gemma3) {
-            rmsnorm_gemma(s->xb, x, w->rms_ffn_weight + l * dim, dim, eps);
-        } else {
-            rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim);
-        }
+        rmsnorm(s->xb, x, w->rms_ffn_weight + l * dim, dim, inv_dim, eps);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x) - using quantized weights
@@ -3004,7 +2982,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // Gemma3: Apply post-FFN normalization
         if (p->is_gemma3 && w->ffn_post_norm) {
-            rmsnorm_gemma(s->xb, s->xb, w->ffn_post_norm + l * dim, dim, eps);
+            rmsnorm(s->xb, s->xb, w->ffn_post_norm + l * dim, dim, inv_dim, eps);
         }
 
         // residual connection
@@ -3012,11 +2990,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     }
 
     // final rmsnorm
-    if (p->is_gemma3) {
-        rmsnorm_gemma(x, x, w->rms_final_weight, dim, eps);
-    } else {
-        rmsnorm(x, x, w->rms_final_weight, dim);
-    }
+    rmsnorm(x, x, w->rms_final_weight, dim, inv_dim, eps);
 
     // classifier into logits - skip during prompt prefill for speed
     if (compute_logits) {
