@@ -224,13 +224,21 @@ var fp16Table = new Float32Array(65536)
   }
 })()
 
+// Pre-computed BF16 to FP32 lookup table (256KB)
+var bf16Table = new Float32Array(65536)
+;(function () {
+  for (var h = 0; h < 65536; h = h + 1) {
+    convInt[0] = h << 16
+    bf16Table[h] = convFloat[0]
+  }
+})()
+
 function fp16ToFp32(h) {
   return fp16Table[h]
 }
 
 function bf16ToFp32(h) {
-  convInt[0] = h << 16
-  return convFloat[0]
+  return bf16Table[h]
 }
 
 // Convert FP32 to FP16 (for Q8_0 scale storage)
@@ -314,61 +322,6 @@ function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
 
 // Compute dot product of float vector with Q8_0 cached vector
 // x: Float32Array query vector, xOffset: start index
-// cache: Uint8Array Q8_0 cache, cacheInt8: Int8Array view of cache
-// cacheOffset: byte offset in cache
-// count: number of elements (must be multiple of 32)
-function dotQ8_0Cache(x, xOffset, cache, cacheInt8, cacheOffset, count) {
-  var nb = count >> 5
-  var sum = 0.0
-  var bo = cacheOffset
-  var xb = xOffset
-
-  for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(cache[bo] | (cache[bo + 1] << 8))
-    var qOff = bo + 2
-
-    // Unrolled inner loop for JIT optimization
-    var blockSum =
-      x[xb] * cacheInt8[qOff] +
-      x[xb + 1] * cacheInt8[qOff + 1] +
-      x[xb + 2] * cacheInt8[qOff + 2] +
-      x[xb + 3] * cacheInt8[qOff + 3] +
-      x[xb + 4] * cacheInt8[qOff + 4] +
-      x[xb + 5] * cacheInt8[qOff + 5] +
-      x[xb + 6] * cacheInt8[qOff + 6] +
-      x[xb + 7] * cacheInt8[qOff + 7] +
-      x[xb + 8] * cacheInt8[qOff + 8] +
-      x[xb + 9] * cacheInt8[qOff + 9] +
-      x[xb + 10] * cacheInt8[qOff + 10] +
-      x[xb + 11] * cacheInt8[qOff + 11] +
-      x[xb + 12] * cacheInt8[qOff + 12] +
-      x[xb + 13] * cacheInt8[qOff + 13] +
-      x[xb + 14] * cacheInt8[qOff + 14] +
-      x[xb + 15] * cacheInt8[qOff + 15] +
-      x[xb + 16] * cacheInt8[qOff + 16] +
-      x[xb + 17] * cacheInt8[qOff + 17] +
-      x[xb + 18] * cacheInt8[qOff + 18] +
-      x[xb + 19] * cacheInt8[qOff + 19] +
-      x[xb + 20] * cacheInt8[qOff + 20] +
-      x[xb + 21] * cacheInt8[qOff + 21] +
-      x[xb + 22] * cacheInt8[qOff + 22] +
-      x[xb + 23] * cacheInt8[qOff + 23] +
-      x[xb + 24] * cacheInt8[qOff + 24] +
-      x[xb + 25] * cacheInt8[qOff + 25] +
-      x[xb + 26] * cacheInt8[qOff + 26] +
-      x[xb + 27] * cacheInt8[qOff + 27] +
-      x[xb + 28] * cacheInt8[qOff + 28] +
-      x[xb + 29] * cacheInt8[qOff + 29] +
-      x[xb + 30] * cacheInt8[qOff + 30] +
-      x[xb + 31] * cacheInt8[qOff + 31]
-
-    sum = sum + blockSum * d
-    bo = bo + Q8_0_BLOCK_SIZE
-    xb = xb + 32
-  }
-  return sum
-}
-
 // Accumulate weighted Q8_0 cached vector to output
 // out: Float32Array output, outOffset: start index
 // cache: Uint8Array Q8_0 cache, cacheInt8: Int8Array view
@@ -435,6 +388,62 @@ function accumQ8_0Cache(
     bo = bo + Q8_0_BLOCK_SIZE
     ob = ob + 32
   }
+}
+
+// Compute dot product of two Q8_0 cached vectors (int8 * int8)
+// Used for Q8-quantized Q heads against Q8_0 KV cache
+function dotQ8_0_Q8_0Cache(aQ8, aI8, aOff, bQ8, bI8, bOff, count) {
+  var nb = count >> 5
+  var sum = 0.0
+  var ao = aOff
+  var bo = bOff
+
+  for (var i = 0; i < nb; i = i + 1) {
+    var da = fp16ToFp32(aQ8[ao] | (aQ8[ao + 1] << 8))
+    var db = fp16ToFp32(bQ8[bo] | (bQ8[bo + 1] << 8))
+    var qa = ao + 2
+    var qb = bo + 2
+
+    // Unrolled 32-term integer dot product
+    var isum =
+      aI8[qa] * bI8[qb] +
+      aI8[qa + 1] * bI8[qb + 1] +
+      aI8[qa + 2] * bI8[qb + 2] +
+      aI8[qa + 3] * bI8[qb + 3] +
+      aI8[qa + 4] * bI8[qb + 4] +
+      aI8[qa + 5] * bI8[qb + 5] +
+      aI8[qa + 6] * bI8[qb + 6] +
+      aI8[qa + 7] * bI8[qb + 7] +
+      aI8[qa + 8] * bI8[qb + 8] +
+      aI8[qa + 9] * bI8[qb + 9] +
+      aI8[qa + 10] * bI8[qb + 10] +
+      aI8[qa + 11] * bI8[qb + 11] +
+      aI8[qa + 12] * bI8[qb + 12] +
+      aI8[qa + 13] * bI8[qb + 13] +
+      aI8[qa + 14] * bI8[qb + 14] +
+      aI8[qa + 15] * bI8[qb + 15] +
+      aI8[qa + 16] * bI8[qb + 16] +
+      aI8[qa + 17] * bI8[qb + 17] +
+      aI8[qa + 18] * bI8[qb + 18] +
+      aI8[qa + 19] * bI8[qb + 19] +
+      aI8[qa + 20] * bI8[qb + 20] +
+      aI8[qa + 21] * bI8[qb + 21] +
+      aI8[qa + 22] * bI8[qb + 22] +
+      aI8[qa + 23] * bI8[qb + 23] +
+      aI8[qa + 24] * bI8[qb + 24] +
+      aI8[qa + 25] * bI8[qb + 25] +
+      aI8[qa + 26] * bI8[qb + 26] +
+      aI8[qa + 27] * bI8[qb + 27] +
+      aI8[qa + 28] * bI8[qb + 28] +
+      aI8[qa + 29] * bI8[qb + 29] +
+      aI8[qa + 30] * bI8[qb + 30] +
+      aI8[qa + 31] * bI8[qb + 31]
+
+    sum = sum + da * db * isum
+    ao = ao + Q8_0_BLOCK_SIZE
+    bo = bo + Q8_0_BLOCK_SIZE
+  }
+  return sum
 }
 
 // ----------------------------------------------------------------------------
@@ -1504,10 +1513,11 @@ function vecDotQ5_K(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
-    var dmin = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
     var scOff = bo + 4
     var qhOff = bo + 16
     var qlOff = bo + 48
@@ -1522,24 +1532,22 @@ function vecDotQ5_K(x, srcOffset, n) {
       var sc
       var m
       if (is < 4) {
-        sc = ggufUint8[scOff + is] & 63
-        m = ggufUint8[scOff + is + 4] & 63
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
       } else {
-        sc =
-          (ggufUint8[scOff + is + 4] & 0xf) | ((ggufUint8[scOff + is - 4] >> 6) << 4)
-        m = (ggufUint8[scOff + is + 4] >> 4) | ((ggufUint8[scOff + is] >> 6) << 4)
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
       }
       var d1 = d * sc
       var m1 = dmin * m
       is = is + 1
 
       if (is < 4) {
-        sc = ggufUint8[scOff + is] & 63
-        m = ggufUint8[scOff + is + 4] & 63
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
       } else {
-        sc =
-          (ggufUint8[scOff + is + 4] & 0xf) | ((ggufUint8[scOff + is - 4] >> 6) << 4)
-        m = (ggufUint8[scOff + is + 4] >> 4) | ((ggufUint8[scOff + is] >> 6) << 4)
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
       }
       var d2 = d * sc
       var m2 = dmin * m
@@ -1549,16 +1557,12 @@ function vecDotQ5_K(x, srcOffset, n) {
         blockSum =
           blockSum +
           x[xb + j + l] *
-            (d1 *
-              ((ggufUint8[qlOff + qlIdx + l] & 0xf) +
-                (ggufUint8[qhOff + l] & u1 ? 16 : 0)) -
+            (d1 * ((u8[qlOff + qlIdx + l] & 0xf) + (u8[qhOff + l] & u1 ? 16 : 0)) -
               m1)
         blockSum =
           blockSum +
           x[xb + j + l + 32] *
-            (d2 *
-              ((ggufUint8[qlOff + qlIdx + l] >> 4) +
-                (ggufUint8[qhOff + l] & u2 ? 16 : 0)) -
+            (d2 * ((u8[qlOff + qlIdx + l] >> 4) + (u8[qhOff + l] & u2 ? 16 : 0)) -
               m2)
       }
       qlIdx = qlIdx + 32
@@ -1578,45 +1582,55 @@ function vecDotQ6_K(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
 
   for (var i = 0; i < nb; i = i + 1) {
     var qlOff = bo
     var qhOff = bo + 128
     var scOff = bo + 192
     var dOff = bo + 208
-    var d = fp16ToFp32(ggufUint8[dOff] | (ggufUint8[dOff + 1] << 8))
+    var d = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
 
     var blockSum = 0.0
     for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
       var scBase = scOff + (nOuter >> 7) * 8
       var qlBase = qlOff + (nOuter >> 1)
       var qhBase = qhOff + (nOuter >> 2)
-      for (var l = 0; l < 32; l = l + 1) {
-        var is = l >> 4
-        var q1 =
-          ((ggufUint8[qlBase + l] & 0xf) |
-            (((ggufUint8[qhBase + l] >> 0) & 3) << 4)) -
-          32
+      // Pre-compute scale multipliers (avoids redundant d * i8[scBase+is] in inner loop)
+      var ds0 = d * i8[scBase]
+      var ds2 = d * i8[scBase + 2]
+      var ds4 = d * i8[scBase + 4]
+      var ds6 = d * i8[scBase + 6]
+      var ds1 = d * i8[scBase + 1]
+      var ds3 = d * i8[scBase + 3]
+      var ds5 = d * i8[scBase + 5]
+      var ds7 = d * i8[scBase + 7]
+      // l = 0..15 (is = 0)
+      for (var l = 0; l < 16; l = l + 1) {
+        var q1 = ((u8[qlBase + l] & 0xf) | (((u8[qhBase + l] >> 0) & 3) << 4)) - 32
         var q2 =
-          ((ggufUint8[qlBase + l + 32] & 0xf) |
-            (((ggufUint8[qhBase + l] >> 2) & 3) << 4)) -
-          32
-        var q3 =
-          ((ggufUint8[qlBase + l] >> 4) |
-            (((ggufUint8[qhBase + l] >> 4) & 3) << 4)) -
-          32
+          ((u8[qlBase + l + 32] & 0xf) | (((u8[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((u8[qlBase + l] >> 4) | (((u8[qhBase + l] >> 4) & 3) << 4)) - 32
         var q4 =
-          ((ggufUint8[qlBase + l + 32] >> 4) |
-            (((ggufUint8[qhBase + l] >> 6) & 3) << 4)) -
-          32
-
-        blockSum = blockSum + x[xb + nOuter + l] * d * ggufInt8[scBase + is] * q1
-        blockSum =
-          blockSum + x[xb + nOuter + l + 32] * d * ggufInt8[scBase + is + 2] * q2
-        blockSum =
-          blockSum + x[xb + nOuter + l + 64] * d * ggufInt8[scBase + is + 4] * q3
-        blockSum =
-          blockSum + x[xb + nOuter + l + 96] * d * ggufInt8[scBase + is + 6] * q4
+          ((u8[qlBase + l + 32] >> 4) | (((u8[qhBase + l] >> 6) & 3) << 4)) - 32
+        blockSum = blockSum + x[xb + nOuter + l] * ds0 * q1
+        blockSum = blockSum + x[xb + nOuter + l + 32] * ds2 * q2
+        blockSum = blockSum + x[xb + nOuter + l + 64] * ds4 * q3
+        blockSum = blockSum + x[xb + nOuter + l + 96] * ds6 * q4
+      }
+      // l = 16..31 (is = 1)
+      for (var l = 16; l < 32; l = l + 1) {
+        var q1 = ((u8[qlBase + l] & 0xf) | (((u8[qhBase + l] >> 0) & 3) << 4)) - 32
+        var q2 =
+          ((u8[qlBase + l + 32] & 0xf) | (((u8[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((u8[qlBase + l] >> 4) | (((u8[qhBase + l] >> 4) & 3) << 4)) - 32
+        var q4 =
+          ((u8[qlBase + l + 32] >> 4) | (((u8[qhBase + l] >> 6) & 3) << 4)) - 32
+        blockSum = blockSum + x[xb + nOuter + l] * ds1 * q1
+        blockSum = blockSum + x[xb + nOuter + l + 32] * ds3 * q2
+        blockSum = blockSum + x[xb + nOuter + l + 64] * ds5 * q3
+        blockSum = blockSum + x[xb + nOuter + l + 96] * ds7 * q4
       }
     }
     sum = sum + blockSum
@@ -1653,8 +1667,9 @@ function vecDotIQ4_NL(x, srcOffset, n) {
 function vecDotF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
+  var u8 = ggufUint8
   for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * fp16ToFp32(dataView.getUint16(bo, true))
+    sum = sum + x[i] * fp16Table[u8[bo] | (u8[bo + 1] << 8)]
     bo = bo + 2
   }
   return sum
@@ -1664,8 +1679,9 @@ function vecDotF16(x, srcOffset, n) {
 function vecDotBF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
+  var u8 = ggufUint8
   for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * bf16ToFp32(dataView.getUint16(bo, true))
+    sum = sum + x[i] * bf16Table[u8[bo] | (u8[bo + 1] << 8)]
     bo = bo + 2
   }
   return sum
@@ -2080,10 +2096,12 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
     var xsum1 = 0
     for (var l = 0; l < 32; l = l + 1) {
       var qByte = u8[qsOff + l]
-      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
-      xsum0 = xsum0 + xQ8i8[qx0 + l]
-      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
-      xsum1 = xsum1 + xQ8i8[qx1 + l]
+      var xv0 = xQ8i8[qx0 + l]
+      var xv1 = xQ8i8[qx1 + l]
+      isum0 = isum0 + xv0 * (qByte & 0xf)
+      xsum0 = xsum0 + xv0
+      isum1 = isum1 + xv1 * (qByte >> 4)
+      xsum1 = xsum1 + xv1
     }
     blockSum =
       blockSum +
@@ -2111,10 +2129,12 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
     xsum1 = 0
     for (var l = 0; l < 32; l = l + 1) {
       var qByte = u8[qsOff + 32 + l]
-      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
-      xsum0 = xsum0 + xQ8i8[qx0 + l]
-      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
-      xsum1 = xsum1 + xQ8i8[qx1 + l]
+      var xv0 = xQ8i8[qx0 + l]
+      var xv1 = xQ8i8[qx1 + l]
+      isum0 = isum0 + xv0 * (qByte & 0xf)
+      xsum0 = xsum0 + xv0
+      isum1 = isum1 + xv1 * (qByte >> 4)
+      xsum1 = xsum1 + xv1
     }
     blockSum =
       blockSum +
@@ -2142,10 +2162,12 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
     xsum1 = 0
     for (var l = 0; l < 32; l = l + 1) {
       var qByte = u8[qsOff + 64 + l]
-      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
-      xsum0 = xsum0 + xQ8i8[qx0 + l]
-      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
-      xsum1 = xsum1 + xQ8i8[qx1 + l]
+      var xv0 = xQ8i8[qx0 + l]
+      var xv1 = xQ8i8[qx1 + l]
+      isum0 = isum0 + xv0 * (qByte & 0xf)
+      xsum0 = xsum0 + xv0
+      isum1 = isum1 + xv1 * (qByte >> 4)
+      xsum1 = xsum1 + xv1
     }
     blockSum =
       blockSum +
@@ -2173,10 +2195,12 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
     xsum1 = 0
     for (var l = 0; l < 32; l = l + 1) {
       var qByte = u8[qsOff + 96 + l]
-      isum0 = isum0 + xQ8i8[qx0 + l] * (qByte & 0xf)
-      xsum0 = xsum0 + xQ8i8[qx0 + l]
-      isum1 = isum1 + xQ8i8[qx1 + l] * (qByte >> 4)
-      xsum1 = xsum1 + xQ8i8[qx1 + l]
+      var xv0 = xQ8i8[qx0 + l]
+      var xv1 = xQ8i8[qx1 + l]
+      isum0 = isum0 + xv0 * (qByte & 0xf)
+      xsum0 = xsum0 + xv0
+      isum1 = isum1 + xv1 * (qByte >> 4)
+      xsum1 = xsum1 + xv1
     }
     blockSum =
       blockSum +
@@ -2243,10 +2267,12 @@ function vecDotQ5_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       for (var l = 0; l < 32; l = l + 1) {
         var qw_lo = (u8[qlOff + qlIdx + l] & 0xf) + (u8[qhOff + l] & u1 ? 16 : 0)
         var qw_hi = (u8[qlOff + qlIdx + l] >> 4) + (u8[qhOff + l] & u2 ? 16 : 0)
-        isum0 = isum0 + xQ8i8[qx0 + l] * qw_lo
-        xsum0 = xsum0 + xQ8i8[qx0 + l]
-        isum1 = isum1 + xQ8i8[qx1 + l] * qw_hi
-        xsum1 = xsum1 + xQ8i8[qx1 + l]
+        var xv0 = xQ8i8[qx0 + l]
+        var xv1 = xQ8i8[qx1 + l]
+        isum0 = isum0 + xv0 * qw_lo
+        xsum0 = xsum0 + xv0
+        isum1 = isum1 + xv1 * qw_hi
+        xsum1 = xsum1 + xv1
       }
       blockSum =
         blockSum +
@@ -2423,6 +2449,19 @@ function matmulQuantized(out, x, qw) {
   }
 }
 
+// Quantized matmul using pre-quantized x (avoids redundant quantization)
+// Caller must have already quantized x into xQ8Buf/xQ8Int8Buf
+function matmulQuantizedPreQ8(out, qw) {
+  var rows = qw.rows
+  var dotQ8Func = qw.dotQ8Func
+  var baseOffset = qw.dataOffset
+  var rowSize = qw.rowSize
+  var cols = qw.cols
+  for (var i = 0; i < rows; i = i + 1) {
+    out[i] = dotQ8Func(xQ8Buf, xQ8Int8Buf, baseOffset + i * rowSize, cols)
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Math functions
 
@@ -2440,24 +2479,6 @@ function fastTanh(x) {
     (x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)))) /
     (135135.0 + x2 * (62370.0 + x2 * (3150.0 + 28.0 * x2)))
   )
-}
-
-// Fast exp approximation for sigmoid range (|x| < ~10)
-// Uses Schraudolph-style bit manipulation via polynomial
-function fastExp(x) {
-  if (x > 10.0) {
-    return 22026.47
-  }
-  if (x < -10.0) {
-    return 0.0
-  }
-  // Padé [3,3] approximation of exp(x) around 0
-  // exp(x) ≈ (1 + x/2 + x²/10 + x³/120) / (1 - x/2 + x²/10 - x³/120)
-  var x2 = x * x
-  var x3 = x2 * x
-  var num = 120.0 + 60.0 * x + 12.0 * x2 + x3
-  var den = 120.0 - 60.0 * x + 12.0 * x2 - x3
-  return num / den
 }
 
 function rmsnorm(out, x, w, size, invSize, eps) {
@@ -2954,10 +2975,11 @@ function createRunState(p) {
   }
 
   // Q8_0 KV cache: 34 bytes per 32 floats
-  // Number of Q8_0 blocks per KV vector = kvDim / 32
-  var kvBlocksPerVec = kvDim >> 5 // kvDim / 32
-  var kvCacheBytesPerVec = kvBlocksPerVec * Q8_0_BLOCK_SIZE // 34 bytes per block
-  var kvCacheTotalBytes = p.nLayers * p.seqLen * kvCacheBytesPerVec
+  // Per-head layout: [layer][kv_head][position][head_data] for cache locality
+  var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
+  var headSeqBytes = seqLen * headBytesQ8
+  var kvCacheLayerBytes = p.nKvHeads * headSeqBytes
+  var kvCacheTotalBytes = p.nLayers * kvCacheLayerBytes
 
   // Create ArrayBuffer for KV caches with both Uint8 and Int8 views
   var keyCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
@@ -2970,18 +2992,21 @@ function createRunState(p) {
   xQ8Buf = new Uint8Array(xQ8Buffer)
   xQ8Int8Buf = new Int8Array(xQ8Buffer)
 
+  // Q8_0 buffer for quantized Q heads (for Q8 attention scoring)
+  var qQ8TotalBytes = p.nHeads * headBytesQ8
+  var qQ8Buffer = new ArrayBuffer(qQ8TotalBytes)
+
   // Pre-compute head offset tables to avoid repeated multiplication in attention loop
   var kvMul = p.nHeads / p.nKvHeads
   var headQOffsets = new Int32Array(p.nHeads)
   var headKvIdx = new Int32Array(p.nHeads)
   var headAttOffsets = new Int32Array(p.nHeads)
-  var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
   var headKvByteOffsets = new Int32Array(p.nHeads)
   for (var h = 0; h < p.nHeads; h = h + 1) {
     headQOffsets[h] = h * headSize
     headKvIdx[h] = (h / kvMul) | 0
     headAttOffsets[h] = h * p.seqLen
-    headKvByteOffsets[h] = ((h / kvMul) | 0) * headBytesQ8
+    headKvByteOffsets[h] = ((h / kvMul) | 0) * headSeqBytes
   }
 
   // Pre-compute per-layer RoPE table references (avoid modulo check per layer)
@@ -3015,8 +3040,11 @@ function createRunState(p) {
     // Int8 views for reading quantized values
     keyCacheInt8: new Int8Array(keyCacheBuffer),
     valueCacheInt8: new Int8Array(valueCacheBuffer),
+    // Q8_0 quantized Q heads for attention scoring
+    qQ8: new Uint8Array(qQ8Buffer),
+    qQ8i8: new Int8Array(qQ8Buffer),
     // Cache layout info
-    kvCacheBytesPerVec: kvCacheBytesPerVec,
+    headSeqBytes: headSeqBytes,
     // Pre-computed RoPE sin/cos for all positions
     ropeCosAll: ropeCosAll,
     ropeSinAll: ropeSinAll,
@@ -3031,8 +3059,8 @@ function createRunState(p) {
     kvDim: kvDim,
     qDim: qDim,
     kvMul: p.nHeads / p.nKvHeads,
-    // Q8_0 cache: layer size in bytes
-    kvCacheLayerSize: p.seqLen * kvCacheBytesPerVec,
+    // Q8_0 cache: layer size in bytes (nKvHeads * seqLen * headBytesQ8)
+    kvCacheLayerSize: kvCacheLayerBytes,
     attnScale: 1.0 / Math.sqrt(headSize),
     embedScale: Math.sqrt(p.dim),
     // Cache config values to avoid property lookups in hot loops
@@ -3065,361 +3093,534 @@ function createRunState(p) {
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
-function transformer(token, pos, computeLogits) {
+// Llama-optimized transformer: fused attnScale in RoPE, SiLU via tanh,
+// per-head KV layout, Q8 attention, GQA batching, pre-quantized matmul
+function transformerLlama(token, pos, computeLogits) {
   var w = weights
   var s = state
-  // Use cached values from state instead of config lookups
   var dim = s.dim
   var headSize = s.headSize
   var kvDim = s.kvDim
+  var qDim = s.qDim
+  var hiddenDim = s.hiddenDim
+  var nLayers = s.nLayers
+  var nHeads = s.nHeads
+  var nKvHeads = s.nKvHeads
+  var invDim = s.invDim
+  var kvMul = s.kvMul
+  var headBytesQ8 = s.headBytesQ8
+  var headSeqBytes = s.headSeqBytes
+  var attnScale = s.attnScale
+  var seqLen = s.seqLen
+
+  var xArr = s.x
+  var xbArr = s.xb
+  var xb2Arr = s.xb2
+  var qArr = s.q
+  var kArr = s.k
+  var vArr = s.v
+  var sAtt = s.att
+  var keyCache = s.keyCache
+  var valueCache = s.valueCache
+  var keyCacheInt8 = s.keyCacheInt8
+  var valueCacheInt8 = s.valueCacheInt8
+  var qQ8 = s.qQ8
+  var qQ8i8 = s.qQ8i8
+
+  // Embedding
+  var emb = w.tokenEmbedding
+  dequantizeRow(xArr, emb.dataOffset + token * emb.rowSize, dim, emb.type)
+
+  for (var l = 0; l < nLayers; l = l + 1) {
+    var lw = w.layers[l]
+
+    rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
+
+    // QKV matmuls - quantize once, reuse (#1+2)
+    if (lw.wq.dotQ8Func) {
+      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
+      matmulQuantizedPreQ8(qArr, lw.wq)
+      matmulQuantizedPreQ8(kArr, lw.wk)
+      matmulQuantizedPreQ8(vArr, lw.wv)
+    } else {
+      matmulQuantized(qArr, xbArr, lw.wq)
+      matmulQuantized(kArr, xbArr, lw.wk)
+      matmulQuantized(vArr, xbArr, lw.wv)
+    }
+
+    // RoPE with fused attnScale on Q (#18)
+    var half = headSize >> 1
+    var ropeBase = pos * s.ropeSize
+    var ropeCos = s.ropeCosLayer[l]
+    var ropeSin = s.ropeSinLayer[l]
+
+    var kvDim4 = kvDim & ~3
+    for (var i = 0; i < kvDim4; i = i + 4) {
+      var fi0 = (i >> 1) % half
+      var fi1 = ((i + 2) >> 1) % half
+      var fcr0 = ropeCos[ropeBase + fi0]
+      var fci0 = ropeSin[ropeBase + fi0]
+      var fcr1 = ropeCos[ropeBase + fi1]
+      var fci1 = ropeSin[ropeBase + fi1]
+      var qv0 = qArr[i]
+      var qv1 = qArr[i + 1]
+      qArr[i] = (qv0 * fcr0 - qv1 * fci0) * attnScale
+      qArr[i + 1] = (qv0 * fci0 + qv1 * fcr0) * attnScale
+      var qv2 = qArr[i + 2]
+      var qv3 = qArr[i + 3]
+      qArr[i + 2] = (qv2 * fcr1 - qv3 * fci1) * attnScale
+      qArr[i + 3] = (qv2 * fci1 + qv3 * fcr1) * attnScale
+      var kv0 = kArr[i]
+      var kv1 = kArr[i + 1]
+      kArr[i] = kv0 * fcr0 - kv1 * fci0
+      kArr[i + 1] = kv0 * fci0 + kv1 * fcr0
+      var kv2 = kArr[i + 2]
+      var kv3 = kArr[i + 3]
+      kArr[i + 2] = kv2 * fcr1 - kv3 * fci1
+      kArr[i + 3] = kv2 * fci1 + kv3 * fcr1
+    }
+    for (var i = kvDim4; i < kvDim; i = i + 2) {
+      var freqIdx = (i >> 1) % half
+      var fcr = ropeCos[ropeBase + freqIdx]
+      var fci = ropeSin[ropeBase + freqIdx]
+      var v0 = qArr[i]
+      var v1 = qArr[i + 1]
+      qArr[i] = (v0 * fcr - v1 * fci) * attnScale
+      qArr[i + 1] = (v0 * fci + v1 * fcr) * attnScale
+      v0 = kArr[i]
+      v1 = kArr[i + 1]
+      kArr[i] = v0 * fcr - v1 * fci
+      kArr[i + 1] = v0 * fci + v1 * fcr
+    }
+    for (var i = kvDim; i < qDim; i = i + 2) {
+      var freqIdx = (i >> 1) % half
+      var fcr = ropeCos[ropeBase + freqIdx]
+      var fci = ropeSin[ropeBase + freqIdx]
+      var v0 = qArr[i]
+      var v1 = qArr[i + 1]
+      qArr[i] = (v0 * fcr - v1 * fci) * attnScale
+      qArr[i + 1] = (v0 * fci + v1 * fcr) * attnScale
+    }
+
+    // Per-head KV cache write (#20)
+    var loff = l * s.kvCacheLayerSize
+    for (var h = 0; h < nKvHeads; h = h + 1) {
+      var headOff = loff + h * headSeqBytes + pos * headBytesQ8
+      quantizeToQ8_0Cache(
+        kArr,
+        h * headSize,
+        keyCache,
+        keyCacheInt8,
+        headOff,
+        headSize
+      )
+      quantizeToQ8_0Cache(
+        vArr,
+        h * headSize,
+        valueCache,
+        valueCacheInt8,
+        headOff,
+        headSize
+      )
+    }
+
+    // Quantize Q to Q8_0 for integer attention (#15)
+    for (var h = 0; h < nHeads; h = h + 1) {
+      quantizeToQ8_0Cache(qArr, h * headSize, qQ8, qQ8i8, h * headBytesQ8, headSize)
+    }
+
+    xbArr.fill(0, 0, qDim)
+
+    // GQA-batched attention (#16) with Q8 scoring (#15)
+    for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
+      var kBase = loff + kvH * headSeqBytes
+      for (var mh = 0; mh < kvMul; mh = mh + 1) {
+        var h = kvH * kvMul + mh
+        var qHeadOff = h * headBytesQ8
+        var attOffset = h * seqLen
+
+        // Q8 attention scoring (attnScale fused in RoPE)
+        for (var t = 0; t <= pos; t = t + 1) {
+          sAtt[attOffset + t] = dotQ8_0_Q8_0Cache(
+            qQ8,
+            qQ8i8,
+            qHeadOff,
+            keyCache,
+            keyCacheInt8,
+            kBase + t * headBytesQ8,
+            headSize
+          )
+        }
+
+        // Softmax
+        var softmaxEnd = attOffset + pos
+        var maxVal = sAtt[attOffset]
+        for (var i = attOffset + 1; i <= softmaxEnd; i = i + 1) {
+          if (sAtt[i] > maxVal) {
+            maxVal = sAtt[i]
+          }
+        }
+        var expSum = 0.0
+        for (var i = attOffset; i <= softmaxEnd; i = i + 1) {
+          var e = Math.exp(sAtt[i] - maxVal)
+          sAtt[i] = e
+          expSum = expSum + e
+        }
+        var invSum = 1.0 / expSum
+        for (var i = attOffset; i <= softmaxEnd; i = i + 1) {
+          sAtt[i] = sAtt[i] * invSum
+        }
+
+        // Value accumulation
+        var xbOffset = h * headSize
+        for (var t = 0; t <= pos; t = t + 1) {
+          accumQ8_0Cache(
+            xbArr,
+            xbOffset,
+            valueCache,
+            valueCacheInt8,
+            kBase + t * headBytesQ8,
+            sAtt[attOffset + t],
+            headSize
+          )
+        }
+      }
+    }
+
+    // Attention output
+    matmulQuantized(xb2Arr, xbArr, lw.wo)
+    accum(xArr, xb2Arr, dim)
+
+    // FFN
+    rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
+
+    var hbArr = s.hb
+    var hb2Arr = s.hb2
+
+    // FFN gate and up - quantize once, reuse (#1+2)
+    if (lw.w1.dotQ8Func) {
+      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
+      matmulQuantizedPreQ8(hbArr, lw.w1)
+      matmulQuantizedPreQ8(hb2Arr, lw.w3)
+    } else {
+      matmulQuantized(hbArr, xbArr, lw.w1)
+      matmulQuantized(hb2Arr, xbArr, lw.w3)
+    }
+
+    // SiLU via tanh: silu(x) = 0.5 * x * (1 + tanh(x/2)) (#17)
+    var hd4 = hiddenDim & ~3
+    for (var i = 0; i < hd4; i = i + 4) {
+      var v0 = hbArr[i]
+      var v1 = hbArr[i + 1]
+      var v2 = hbArr[i + 2]
+      var v3 = hbArr[i + 3]
+      hbArr[i] = 0.5 * v0 * (1.0 + fastTanh(0.5 * v0)) * hb2Arr[i]
+      hbArr[i + 1] = 0.5 * v1 * (1.0 + fastTanh(0.5 * v1)) * hb2Arr[i + 1]
+      hbArr[i + 2] = 0.5 * v2 * (1.0 + fastTanh(0.5 * v2)) * hb2Arr[i + 2]
+      hbArr[i + 3] = 0.5 * v3 * (1.0 + fastTanh(0.5 * v3)) * hb2Arr[i + 3]
+    }
+    for (var i = hd4; i < hiddenDim; i = i + 1) {
+      var val = hbArr[i]
+      hbArr[i] = 0.5 * val * (1.0 + fastTanh(0.5 * val)) * hb2Arr[i]
+    }
+
+    // FFN down
+    matmulQuantized(xbArr, hbArr, lw.w2)
+    accum(xArr, xbArr, dim)
+  }
+
+  // Final norm
+  rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
+
+  // Classifier into logits
+  if (computeLogits !== false) {
+    matmulQuantized(s.logits, xArr, w.wcls)
+  }
+}
+
+// Gemma-optimized transformer: per-head KV layout, Q8 attention,
+// GQA batching, pre-quantized matmul, SWA, QK norms, post-norms
+function transformerGemma(token, pos, computeLogits) {
+  var w = weights
+  var s = state
+  var dim = s.dim
+  var headSize = s.headSize
   var qDim = s.qDim
   var hiddenDim = s.hiddenDim
   var eps = s.rmsNormEps
   var nLayers = s.nLayers
   var nHeads = s.nHeads
   var nKvHeads = s.nKvHeads
-  var isGemma = s.isGemma
   var invDim = s.invDim
   var invHeadSize = s.invHeadSize
+  var kvMul = s.kvMul
+  var headBytesQ8 = s.headBytesQ8
+  var headSeqBytes = s.headSeqBytes
+  var attnScale = s.attnScale
+  var seqLen = s.seqLen
 
-  // Cache array references for JIT optimization
   var xArr = s.x
   var xbArr = s.xb
   var xb2Arr = s.xb2
+  var qArr = s.q
+  var kArr = s.k
+  var vArr = s.v
+  var sAtt = s.att
+  var keyCache = s.keyCache
+  var valueCache = s.valueCache
+  var keyCacheInt8 = s.keyCacheInt8
+  var valueCacheInt8 = s.valueCacheInt8
+  var qQ8 = s.qQ8
+  var qQ8i8 = s.qQ8i8
 
-  // Dequantize token embedding on-demand (saves ~500MB+ for large vocab models)
+  // Embedding with Gemma scaling
   var emb = w.tokenEmbedding
-  var embByteOffset = emb.dataOffset + token * emb.rowSize
-  dequantizeRow(xArr, embByteOffset, dim, emb.type)
+  dequantizeRow(xArr, emb.dataOffset + token * emb.rowSize, dim, emb.type)
 
-  // Gemma: Scale embeddings by sqrt(dim) - use pre-computed value
-  if (isGemma) {
-    var scale = s.embedScale
-    var dim4 = dim & ~3
-    var i = 0
-    for (; i < dim4; i = i + 4) {
-      xArr[i] *= scale
-      xArr[i + 1] *= scale
-      xArr[i + 2] *= scale
-      xArr[i + 3] *= scale
-    }
-    for (; i < dim; i = i + 1) {
-      xArr[i] *= scale
-    }
+  var scale = s.embedScale
+  var dim4 = dim & ~3
+  var i = 0
+  for (; i < dim4; i = i + 4) {
+    xArr[i] *= scale
+    xArr[i + 1] *= scale
+    xArr[i + 2] *= scale
+    xArr[i + 3] *= scale
+  }
+  for (; i < dim; i = i + 1) {
+    xArr[i] *= scale
   }
 
   for (var l = 0; l < nLayers; l = l + 1) {
-    var lw = w.layers[l] // Layer weights
+    var lw = w.layers[l]
 
-    if (isGemma) {
-      rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
+    rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
+
+    // QKV matmuls - quantize once, reuse (#1+2)
+    if (lw.wq.dotQ8Func) {
+      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
+      matmulQuantizedPreQ8(qArr, lw.wq)
+      matmulQuantizedPreQ8(kArr, lw.wk)
+      matmulQuantizedPreQ8(vArr, lw.wv)
     } else {
-      rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
+      matmulQuantized(qArr, xbArr, lw.wq)
+      matmulQuantized(kArr, xbArr, lw.wk)
+      matmulQuantized(vArr, xbArr, lw.wv)
     }
 
-    // QKV matmuls - using quantized weights
-    matmulQuantized(s.q, xbArr, lw.wq)
-    matmulQuantized(s.k, xbArr, lw.wk)
-    matmulQuantized(s.v, xbArr, lw.wv)
-
-    if (isGemma && lw.attnQNorm && lw.attnKNorm) {
+    // Gemma QK norms
+    if (lw.attnQNorm && lw.attnKNorm) {
       for (var h = 0; h < nHeads; h = h + 1) {
-        rmsnormGemmaAt(s.q, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+        rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
       }
       for (var h = 0; h < nKvHeads; h = h + 1) {
-        rmsnormGemmaAt(s.k, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
+        rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
       }
     }
 
-    // Apply RoPE using pre-computed frequencies and cached sin/cos
-    // Use pre-computed per-layer RoPE table references (avoids modulo check per layer)
-    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
+    // Fused RoPE + Q attention scaling
     var half = headSize >> 1
-    // Cache q and k array references for RoPE
-    var qArr = s.q
-    var kArr = s.k
-
-    // Index into pre-computed RoPE tables for this position
     var ropeBase = pos * s.ropeSize
     var ropeCos = s.ropeCosLayer[l]
     var ropeSin = s.ropeSinLayer[l]
 
-    if (isGemma) {
-      // Fused RoPE + Q attention scaling (avoids separate scaling pass)
-      var attnScale = s.attnScale
-      for (var h = 0; h < nHeads; h = h + 1) {
-        var idx = h * headSize
-        for (var i = 0; i < half; i = i + 1) {
-          var fcr = ropeCos[ropeBase + i]
-          var fci = ropeSin[ropeBase + i]
-          var v0 = qArr[idx + i]
-          var v1 = qArr[idx + i + half]
-          qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
-          qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
-        }
+    for (var h = 0; h < nHeads; h = h + 1) {
+      var idx = h * headSize
+      for (var i = 0; i < half; i = i + 1) {
+        var fcr = ropeCos[ropeBase + i]
+        var fci = ropeSin[ropeBase + i]
+        var v0 = qArr[idx + i]
+        var v1 = qArr[idx + i + half]
+        qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
+        qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
       }
-      for (var h = 0; h < nKvHeads; h = h + 1) {
-        var idx = h * headSize
-        for (var i = 0; i < half; i = i + 1) {
-          var fcr = ropeCos[ropeBase + i]
-          var fci = ropeSin[ropeBase + i]
-          var v0 = kArr[idx + i]
-          var v1 = kArr[idx + i + half]
-          kArr[idx + i] = v0 * fcr - v1 * fci
-          kArr[idx + i + half] = v0 * fci + v1 * fcr
-        }
-      }
-    } else {
-      // Apply RoPE to Q and K with 4-way unrolling (Llama path)
-      var kvDim4 = kvDim & ~3
-      for (var i = 0; i < kvDim4; i = i + 4) {
-        var fi0 = (i >> 1) % half
-        var fi1 = ((i + 2) >> 1) % half
-        var fcr0 = ropeCos[ropeBase + fi0]
-        var fci0 = ropeSin[ropeBase + fi0]
-        var fcr1 = ropeCos[ropeBase + fi1]
-        var fci1 = ropeSin[ropeBase + fi1]
-        // Process Q pair 0
-        var qv0 = qArr[i]
-        var qv1 = qArr[i + 1]
-        qArr[i] = qv0 * fcr0 - qv1 * fci0
-        qArr[i + 1] = qv0 * fci0 + qv1 * fcr0
-        // Process Q pair 1
-        var qv2 = qArr[i + 2]
-        var qv3 = qArr[i + 3]
-        qArr[i + 2] = qv2 * fcr1 - qv3 * fci1
-        qArr[i + 3] = qv2 * fci1 + qv3 * fcr1
-        // Process K pair 0
-        var kv0 = kArr[i]
-        var kv1 = kArr[i + 1]
-        kArr[i] = kv0 * fcr0 - kv1 * fci0
-        kArr[i + 1] = kv0 * fci0 + kv1 * fcr0
-        // Process K pair 1
-        var kv2 = kArr[i + 2]
-        var kv3 = kArr[i + 3]
-        kArr[i + 2] = kv2 * fcr1 - kv3 * fci1
-        kArr[i + 3] = kv2 * fci1 + kv3 * fcr1
-      }
-      // kvDim remainder (if kvDim not multiple of 4)
-      for (var i = kvDim4; i < kvDim; i = i + 2) {
-        var freqIdx = (i >> 1) % half
-        var fcr = ropeCos[ropeBase + freqIdx]
-        var fci = ropeSin[ropeBase + freqIdx]
-        var v0 = qArr[i]
-        var v1 = qArr[i + 1]
-        qArr[i] = v0 * fcr - v1 * fci
-        qArr[i + 1] = v0 * fci + v1 * fcr
-        v0 = kArr[i]
-        v1 = kArr[i + 1]
-        kArr[i] = v0 * fcr - v1 * fci
-        kArr[i + 1] = v0 * fci + v1 * fcr
-      }
-      // Q-only remainder (qDim > kvDim for GQA)
-      for (var i = kvDim; i < qDim; i = i + 2) {
-        var freqIdx = (i >> 1) % half
-        var fcr = ropeCos[ropeBase + freqIdx]
-        var fci = ropeSin[ropeBase + freqIdx]
-        var v0 = qArr[i]
-        var v1 = qArr[i + 1]
-        qArr[i] = v0 * fcr - v1 * fci
-        qArr[i + 1] = v0 * fci + v1 * fcr
+    }
+    for (var h = 0; h < nKvHeads; h = h + 1) {
+      var idx = h * headSize
+      for (var i = 0; i < half; i = i + 1) {
+        var fcr = ropeCos[ropeBase + i]
+        var fci = ropeSin[ropeBase + i]
+        var v0 = kArr[idx + i]
+        var v1 = kArr[idx + i + half]
+        kArr[idx + i] = v0 * fcr - v1 * fci
+        kArr[idx + i + half] = v0 * fci + v1 * fcr
       }
     }
 
-    // Q8_0 KV cache: use byte offsets
-    var kvBytesPerVec = s.kvCacheBytesPerVec
-    var loff = l * s.kvCacheLayerSize // layer offset in bytes
-    var cacheOffset = loff + pos * kvBytesPerVec // byte offset for this position
-    var vArr = s.v
-    var keyCache = s.keyCache
-    var valueCache = s.valueCache
-    var keyCacheInt8 = s.keyCacheInt8
-    var valueCacheInt8 = s.valueCacheInt8
+    // Per-head KV cache write (#20)
+    var loff = l * s.kvCacheLayerSize
+    for (var h = 0; h < nKvHeads; h = h + 1) {
+      var headOff = loff + h * headSeqBytes + pos * headBytesQ8
+      quantizeToQ8_0Cache(
+        kArr,
+        h * headSize,
+        keyCache,
+        keyCacheInt8,
+        headOff,
+        headSize
+      )
+      quantizeToQ8_0Cache(
+        vArr,
+        h * headSize,
+        valueCache,
+        valueCacheInt8,
+        headOff,
+        headSize
+      )
+    }
 
-    // Quantize K and V to Q8_0 format and store in cache
-    quantizeToQ8_0Cache(kArr, 0, keyCache, keyCacheInt8, cacheOffset, kvDim)
-    quantizeToQ8_0Cache(vArr, 0, valueCache, valueCacheInt8, cacheOffset, kvDim)
+    // Quantize Q to Q8_0 for integer attention (#15)
+    for (var h = 0; h < nHeads; h = h + 1) {
+      quantizeToQ8_0Cache(qArr, h * headSize, qQ8, qQ8i8, h * headBytesQ8, headSize)
+    }
 
-    // Use pre-computed attention scale
-    var attScale = isGemma ? 1.0 : s.attnScale
-
-    // Cache array references for JIT optimization
-    var sAtt = s.att
-
-    // Zero xb once for all heads
     xbArr.fill(0, 0, qDim)
 
-    // SWA window enforcement: restrict attention range for SWA layers
+    // SWA window enforcement
+    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
     var startT =
       isSwaLayer && config.swaWindow > 0
         ? Math.max(0, pos - config.swaWindow + 1)
         : 0
 
-    // Cache head offset tables
-    var headQOff = s.headQOffsets
-    var headAttOff = s.headAttOffsets
-    var headKvByteOff = s.headKvByteOffsets
+    // GQA-batched attention (#16) with Q8 scoring (#15)
+    for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
+      var kBase = loff + kvH * headSeqBytes
+      for (var mh = 0; mh < kvMul; mh = mh + 1) {
+        var h = kvH * kvMul + mh
+        var qHeadOff = h * headBytesQ8
+        var attOffset = h * seqLen
 
-    for (var h = 0; h < nHeads; h = h + 1) {
-      var qOffset = headQOff[h]
-      var attOffset = headAttOff[h]
-      var kvHeadByteOff_h = headKvByteOff[h]
-
-      // Compute attention scores using Q8_0 dot product
-      var kBase = loff + kvHeadByteOff_h
-      for (var t = startT; t <= pos; t = t + 1) {
-        var kByteOffset = kBase + t * kvBytesPerVec
-        var score = dotQ8_0Cache(
-          qArr,
-          qOffset,
-          keyCache,
-          keyCacheInt8,
-          kByteOffset,
-          headSize
-        )
-        sAtt[attOffset + t] = score * attScale
-      }
-
-      // Fused softmax: pass 1 = find max, pass 2 = exp + sum + normalize
-      var softmaxStart = attOffset + startT
-      var softmaxEnd = attOffset + pos
-      var maxVal = sAtt[softmaxStart]
-      for (var i = softmaxStart + 1; i <= softmaxEnd; i = i + 1) {
-        if (sAtt[i] > maxVal) {
-          maxVal = sAtt[i]
+        // Q8 attention scoring (attnScale fused in RoPE)
+        for (var t = startT; t <= pos; t = t + 1) {
+          sAtt[attOffset + t] = dotQ8_0_Q8_0Cache(
+            qQ8,
+            qQ8i8,
+            qHeadOff,
+            keyCache,
+            keyCacheInt8,
+            kBase + t * headBytesQ8,
+            headSize
+          )
         }
-      }
-      var expSum = 0.0
-      for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
-        var e = Math.exp(sAtt[i] - maxVal)
-        sAtt[i] = e
-        expSum = expSum + e
-      }
-      var invSum = 1.0 / expSum
-      for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
-        sAtt[i] = sAtt[i] * invSum
-      }
 
-      // Accumulate weighted values using Q8_0 cache
-      var xbOffset = h * headSize
-      var vBase = loff + kvHeadByteOff_h
-      for (var t = startT; t <= pos; t = t + 1) {
-        var vByteOffset = vBase + t * kvBytesPerVec
-        var a = sAtt[attOffset + t]
-        accumQ8_0Cache(
-          xbArr,
-          xbOffset,
-          valueCache,
-          valueCacheInt8,
-          vByteOffset,
-          a,
-          headSize
-        )
+        // Softmax
+        var softmaxStart = attOffset + startT
+        var softmaxEnd = attOffset + pos
+        var maxVal = sAtt[softmaxStart]
+        for (var i = softmaxStart + 1; i <= softmaxEnd; i = i + 1) {
+          if (sAtt[i] > maxVal) {
+            maxVal = sAtt[i]
+          }
+        }
+        var expSum = 0.0
+        for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
+          var e = Math.exp(sAtt[i] - maxVal)
+          sAtt[i] = e
+          expSum = expSum + e
+        }
+        var invSum = 1.0 / expSum
+        for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
+          sAtt[i] = sAtt[i] * invSum
+        }
+
+        // Value accumulation
+        var xbOffset = h * headSize
+        for (var t = startT; t <= pos; t = t + 1) {
+          accumQ8_0Cache(
+            xbArr,
+            xbOffset,
+            valueCache,
+            valueCacheInt8,
+            kBase + t * headBytesQ8,
+            sAtt[attOffset + t],
+            headSize
+          )
+        }
       }
     }
 
-    // Attention output - using quantized weights
+    // Attention output
     matmulQuantized(xb2Arr, xbArr, lw.wo)
 
-    if (isGemma && lw.attnPostNorm) {
+    if (lw.attnPostNorm) {
       rmsnormGemma(xb2Arr, xb2Arr, lw.attnPostNorm, dim, eps, invDim)
     }
 
     accum(xArr, xb2Arr, dim)
 
-    if (isGemma) {
-      rmsnormGemma(xbArr, xArr, lw.rmsFfnWeight, dim, eps, invDim)
-    } else {
-      rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
-    }
+    // FFN
+    rmsnormGemma(xbArr, xArr, lw.rmsFfnWeight, dim, eps, invDim)
 
-    // FFN gate and up - using quantized weights
     var hbArr = s.hb
     var hb2Arr = s.hb2
-    matmulQuantized(hbArr, xbArr, lw.w1)
-    matmulQuantized(hb2Arr, xbArr, lw.w3)
 
-    // Apply activation (GELU for Gemma, SiLU for Llama)
-    var hd4 = hiddenDim & ~3
-    // GELU constants: factor out 0.7978845608 * 0.044715 = 0.035677408137
-    var GELU_A = 0.7978845608
-    var GELU_B = 0.035677408137
-
-    if (isGemma) {
-      // GELU activation
-      for (var i = 0; i < hd4; i = i + 4) {
-        var x0 = hbArr[i]
-        var x1 = hbArr[i + 1]
-        var x2 = hbArr[i + 2]
-        var x3 = hbArr[i + 3]
-        hbArr[i] =
-          0.5 * x0 * (1.0 + fastTanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
-        hbArr[i + 1] =
-          0.5 *
-          x1 *
-          (1.0 + fastTanh(x1 * (GELU_A + GELU_B * x1 * x1))) *
-          hb2Arr[i + 1]
-        hbArr[i + 2] =
-          0.5 *
-          x2 *
-          (1.0 + fastTanh(x2 * (GELU_A + GELU_B * x2 * x2))) *
-          hb2Arr[i + 2]
-        hbArr[i + 3] =
-          0.5 *
-          x3 *
-          (1.0 + fastTanh(x3 * (GELU_A + GELU_B * x3 * x3))) *
-          hb2Arr[i + 3]
-      }
-      for (var i = hd4; i < hiddenDim; i = i + 1) {
-        var x = hbArr[i]
-        hbArr[i] =
-          0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
-      }
+    // FFN gate and up - quantize once, reuse (#1+2)
+    if (lw.w1.dotQ8Func) {
+      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
+      matmulQuantizedPreQ8(hbArr, lw.w1)
+      matmulQuantizedPreQ8(hb2Arr, lw.w3)
     } else {
-      // SiLU activation
-      for (var i = 0; i < hd4; i = i + 4) {
-        var v0 = hbArr[i]
-        var v1 = hbArr[i + 1]
-        var v2 = hbArr[i + 2]
-        var v3 = hbArr[i + 3]
-        hbArr[i] = (v0 / (1.0 + fastExp(-v0))) * hb2Arr[i]
-        hbArr[i + 1] = (v1 / (1.0 + fastExp(-v1))) * hb2Arr[i + 1]
-        hbArr[i + 2] = (v2 / (1.0 + fastExp(-v2))) * hb2Arr[i + 2]
-        hbArr[i + 3] = (v3 / (1.0 + fastExp(-v3))) * hb2Arr[i + 3]
-      }
-      for (var i = hd4; i < hiddenDim; i = i + 1) {
-        var val = hbArr[i]
-        hbArr[i] = (val / (1.0 + fastExp(-val))) * hb2Arr[i]
-      }
+      matmulQuantized(hbArr, xbArr, lw.w1)
+      matmulQuantized(hb2Arr, xbArr, lw.w3)
     }
 
-    // FFN down - using quantized weights
+    // GELU activation
+    var hd4 = hiddenDim & ~3
+    var GELU_A = 0.7978845608
+    var GELU_B = 0.035677408137
+    for (var i = 0; i < hd4; i = i + 4) {
+      var x0 = hbArr[i]
+      var x1 = hbArr[i + 1]
+      var x2 = hbArr[i + 2]
+      var x3 = hbArr[i + 3]
+      hbArr[i] =
+        0.5 * x0 * (1.0 + fastTanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
+      hbArr[i + 1] =
+        0.5 * x1 * (1.0 + fastTanh(x1 * (GELU_A + GELU_B * x1 * x1))) * hb2Arr[i + 1]
+      hbArr[i + 2] =
+        0.5 * x2 * (1.0 + fastTanh(x2 * (GELU_A + GELU_B * x2 * x2))) * hb2Arr[i + 2]
+      hbArr[i + 3] =
+        0.5 * x3 * (1.0 + fastTanh(x3 * (GELU_A + GELU_B * x3 * x3))) * hb2Arr[i + 3]
+    }
+    for (var i = hd4; i < hiddenDim; i = i + 1) {
+      var x = hbArr[i]
+      hbArr[i] =
+        0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
+    }
+
+    // FFN down
     matmulQuantized(xbArr, hbArr, lw.w2)
 
-    if (isGemma && lw.ffnPostNorm) {
+    if (lw.ffnPostNorm) {
       rmsnormGemma(xbArr, xbArr, lw.ffnPostNorm, dim, eps, invDim)
     }
 
     accum(xArr, xbArr, dim)
   }
 
-  if (isGemma) {
-    rmsnormGemma(xArr, xArr, w.rmsFinalWeight, dim, eps, invDim)
-  } else {
-    rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
-  }
+  // Final norm
+  rmsnormGemma(xArr, xArr, w.rmsFinalWeight, dim, eps, invDim)
 
-  // Classifier into logits - skip during prompt prefill for speed
+  // Classifier into logits
   if (computeLogits !== false) {
     matmulQuantized(s.logits, xArr, w.wcls)
 
-    if (isGemma && config.finalLogitSoftcapping > 0) {
+    if (config.finalLogitSoftcapping > 0) {
       var cap = config.finalLogitSoftcapping
       var vocabSize = s.vocabSize
       for (var i = 0; i < vocabSize; i = i + 1) {
         s.logits[i] = cap * fastTanh(s.logits[i] / cap)
       }
     }
+  }
+}
+
+// Dispatch to model-specific transformer (#21)
+function transformer(token, pos, computeLogits) {
+  if (state.isGemma) {
+    transformerGemma(token, pos, computeLogits)
+  } else {
+    transformerLlama(token, pos, computeLogits)
   }
 }
 
