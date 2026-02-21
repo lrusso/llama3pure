@@ -1394,13 +1394,14 @@ function vecDotQ4_0(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset // block offset in buffer
   var xb = 0 // x offset
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
 
     var blockSum = 0.0
     for (var j = 0; j < 16; j = j + 1) {
-      var qsByte = ggufUint8[bo + 2 + j]
+      var qsByte = u8[bo + 2 + j]
       var x0 = (qsByte & 0x0f) - 8
       var x1 = (qsByte >> 4) - 8
       blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
@@ -1418,15 +1419,16 @@ function vecDotQ4_1(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
-    var m = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var m = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
 
     var blockSum = 0.0
     var xSum = 0.0
     for (var j = 0; j < 16; j = j + 1) {
-      var qsByte = ggufUint8[bo + 4 + j]
+      var qsByte = u8[bo + 4 + j]
       var x0 = qsByte & 0x0f
       var x1 = qsByte >> 4
       blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
@@ -1445,20 +1447,17 @@ function vecDotQ5_0(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
-    var qh =
-      ggufUint8[bo + 2] |
-      (ggufUint8[bo + 3] << 8) |
-      (ggufUint8[bo + 4] << 16) |
-      (ggufUint8[bo + 5] << 24)
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var qh = u8[bo + 2] | (u8[bo + 3] << 8) | (u8[bo + 4] << 16) | (u8[bo + 5] << 24)
 
     var blockSum = 0.0
     for (var j = 0; j < 16; j = j + 1) {
       var xh_0 = ((qh >> j) & 1) << 4
       var xh_1 = ((qh >> (j + 16)) & 1) << 4
-      var qsByte = ggufUint8[bo + 6 + j]
+      var qsByte = u8[bo + 6 + j]
       var x0 = ((qsByte & 0x0f) | xh_0) - 16
       var x1 = ((qsByte >> 4) | xh_1) - 16
       blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
@@ -1476,22 +1475,19 @@ function vecDotQ5_1(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
-    var m = fp16ToFp32(ggufUint8[bo + 2] | (ggufUint8[bo + 3] << 8))
-    var qh =
-      ggufUint8[bo + 4] |
-      (ggufUint8[bo + 5] << 8) |
-      (ggufUint8[bo + 6] << 16) |
-      (ggufUint8[bo + 7] << 24)
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var m = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
+    var qh = u8[bo + 4] | (u8[bo + 5] << 8) | (u8[bo + 6] << 16) | (u8[bo + 7] << 24)
 
     var blockSum = 0.0
     var xSum = 0.0
     for (var j = 0; j < 16; j = j + 1) {
       var xh_0 = ((qh >> j) & 1) << 4
       var xh_1 = ((qh >> (j + 16)) & 1) << 4
-      var qsByte = ggufUint8[bo + 8 + j]
+      var qsByte = u8[bo + 8 + j]
       var x0 = (qsByte & 0x0f) | xh_0
       var x1 = (qsByte >> 4) | xh_1
       blockSum = blockSum + x[xb + j] * x0 + x[xb + j + 16] * x1
@@ -1625,29 +1621,30 @@ function vecDotQ3_K(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var hmOff = bo
     var qsOff = bo + 32
     var scOff = bo + 96
     var dOff = bo + 108
-    var dAll = fp16ToFp32(ggufUint8[dOff] | (ggufUint8[dOff + 1] << 8))
+    var dAll = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
 
     var aux0 =
-      ggufUint8[scOff] |
-      (ggufUint8[scOff + 1] << 8) |
-      (ggufUint8[scOff + 2] << 16) |
-      (ggufUint8[scOff + 3] << 24)
+      u8[scOff] |
+      (u8[scOff + 1] << 8) |
+      (u8[scOff + 2] << 16) |
+      (u8[scOff + 3] << 24)
     var aux1 =
-      ggufUint8[scOff + 4] |
-      (ggufUint8[scOff + 5] << 8) |
-      (ggufUint8[scOff + 6] << 16) |
-      (ggufUint8[scOff + 7] << 24)
+      u8[scOff + 4] |
+      (u8[scOff + 5] << 8) |
+      (u8[scOff + 6] << 16) |
+      (u8[scOff + 7] << 24)
     var aux2 =
-      ggufUint8[scOff + 8] |
-      (ggufUint8[scOff + 9] << 8) |
-      (ggufUint8[scOff + 10] << 16) |
-      (ggufUint8[scOff + 11] << 24)
+      u8[scOff + 8] |
+      (u8[scOff + 9] << 8) |
+      (u8[scOff + 10] << 16) |
+      (u8[scOff + 11] << 24)
 
     var s0 = (aux0 & kmask2) | (((aux2 >> 0) & kmask1) << 4)
     var s1 = (aux1 & kmask2) | (((aux2 >> 2) & kmask1) << 4)
@@ -1688,16 +1685,16 @@ function vecDotQ3_K(x, srcOffset, n) {
         var dl = dAll * (q3kScales[is] - 32)
         is = is + 1
         for (var l = 0; l < 16; l = l + 1) {
-          var q = (ggufUint8[qsOff + qIdx + l] >> shift) & 3
-          var h = ggufUint8[hmOff + l] & m ? 0 : 4
+          var q = (u8[qsOff + qIdx + l] >> shift) & 3
+          var h = u8[hmOff + l] & m ? 0 : 4
           blockSum = blockSum + x[xb + nOuter + j * 32 + l] * dl * (q - h)
         }
 
         dl = dAll * (q3kScales[is] - 32)
         is = is + 1
         for (var l = 0; l < 16; l = l + 1) {
-          var q = (ggufUint8[qsOff + qIdx + l + 16] >> shift) & 3
-          var h = ggufUint8[hmOff + l + 16] & m ? 0 : 4
+          var q = (u8[qsOff + qIdx + l + 16] >> shift) & 3
+          var h = u8[hmOff + l + 16] & m ? 0 : 4
           blockSum = blockSum + x[xb + nOuter + j * 32 + 16 + l] * dl * (q - h)
         }
         shift = shift + 2
@@ -1935,13 +1932,14 @@ function vecDotIQ4_NL(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(ggufUint8[bo] | (ggufUint8[bo + 1] << 8))
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
 
     var blockSum = 0.0
     for (var j = 0; j < 16; j = j + 1) {
-      var qsByte = ggufUint8[bo + 2 + j]
+      var qsByte = u8[bo + 2 + j]
       blockSum = blockSum + x[xb + j] * kvalues_iq4nl[qsByte & 0xf]
       blockSum = blockSum + x[xb + j + 16] * kvalues_iq4nl[qsByte >> 4]
     }

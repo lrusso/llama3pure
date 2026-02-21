@@ -77,11 +77,10 @@ var config = null
 var weights = null
 var state = null
 var tokenizer = null
-var fileArrayBuffer = null
-var fileDataView = null
-var fileUint8 = null
-var fileInt8 = null
-var offset = 0n // BigInt for >2GB file support
+var ggufData = null
+var dataView = null
+var ggufTextDecoder = new TextDecoder("utf-8")
+var offset = 0
 
 // Q8_0 buffers for quantizing x vector in matmulQuantized
 var xQ8Buf = null
@@ -98,87 +97,93 @@ var contextSize = 0
 // Stores metadata to read quantized weights on-the-fly during matmul
 
 // ----------------------------------------------------------------------------
-// Buffer reading helpers (supports >2GB files using BigInt offsets)
+// DataView helpers
 
 function readUint8() {
-  var value = fileDataView.getUint8(Number(offset))
-  offset = offset + 1n
-  return value
+  var val = dataView.getUint8(offset)
+  offset = offset + 1
+  return val
 }
 
 function readUint16() {
-  var value = fileDataView.getUint16(Number(offset), true)
-  offset = offset + 2n
-  return value
+  var val = dataView.getUint16(offset, true)
+  offset = offset + 2
+  return val
 }
 
 function readUint32() {
-  var value = fileDataView.getUint32(Number(offset), true)
-  offset = offset + 4n
-  return value
+  var val = dataView.getUint32(offset, true)
+  offset = offset + 4
+  return val
 }
 
 function readUint64() {
-  var pos = Number(offset)
-  var low = fileDataView.getUint32(pos, true)
-  var high = fileDataView.getUint32(pos + 4, true)
-  offset = offset + 8n
+  var low = dataView.getUint32(offset, true)
+  var high = dataView.getUint32(offset + 4, true)
+  offset = offset + 8
   return low + high * 0x100000000
 }
 
 function readInt8() {
-  var value = fileDataView.getInt8(Number(offset))
-  offset = offset + 1n
-  return value
+  var val = dataView.getInt8(offset)
+  offset = offset + 1
+  return val
 }
 
 function readInt32() {
-  var value = fileDataView.getInt32(Number(offset), true)
-  offset = offset + 4n
-  return value
+  var val = dataView.getInt32(offset, true)
+  offset = offset + 4
+  return val
 }
 
 function readInt64() {
-  var pos = Number(offset)
-  var low = fileDataView.getUint32(pos, true)
-  var high = fileDataView.getInt32(pos + 4, true)
-  offset = offset + 8n
+  var low = dataView.getUint32(offset, true)
+  var high = dataView.getInt32(offset + 4, true)
+  offset = offset + 8
   return low + high * 0x100000000
 }
 
 function readFloat32() {
-  var value = fileDataView.getFloat32(Number(offset), true)
-  offset = offset + 4n
-  return value
+  var val = dataView.getFloat32(offset, true)
+  offset = offset + 4
+  return val
 }
 
 function readFloat64() {
-  var value = fileDataView.getFloat64(Number(offset), true)
-  offset = offset + 8n
-  return value
+  var val = dataView.getFloat64(offset, true)
+  offset = offset + 8
+  return val
 }
 
 function readString() {
   var len = readUint64()
-  var pos = Number(offset)
-  offset = offset + BigInt(len)
-  return new TextDecoder().decode(fileUint8.subarray(pos, pos + len))
+  var bytes = new Uint8Array(ggufData, offset, len)
+  offset = offset + len
+  return ggufTextDecoder.decode(bytes)
 }
 
+// Cached full-buffer typed array views (initialized on model load)
+var ggufUint8 = null
+var ggufInt8 = null
+
+// Get a Uint8Array view from the buffer
 function getUint8ArrayAt(srcOffset, length) {
-  return fileUint8.subarray(srcOffset, srcOffset + length)
+  return new Uint8Array(ggufData, srcOffset, length)
 }
 
+// Get an Int8Array view from the buffer
 function getInt8ArrayAt(srcOffset, length) {
-  return fileInt8.subarray(srcOffset, srcOffset + length)
+  return new Int8Array(ggufData, srcOffset, length)
 }
 
+// Get a Uint16Array view (for F16/BF16)
 function getUint16ArrayAt(srcOffset, count) {
-  return new Uint16Array(fileArrayBuffer, srcOffset, count)
+  return new Uint16Array(ggufData, srcOffset, count)
 }
 
+// Get a Float32Array view
 function getFloat32ArrayAt(srcOffset, count) {
-  return new Float32Array(fileArrayBuffer, srcOffset, count)
+  return new Float32Array(ggufData, srcOffset, count)
 }
 
 // ----------------------------------------------------------------------------
@@ -1388,12 +1393,10 @@ function dequantizeRow(dst, srcOffset, nCols, type) {
 // Fused dot product for Q4_0
 function vecDotQ4_0(x, srcOffset, n) {
   var nb = n >> 5 // n / 32
-  var blockSize = 18 // 2 + 16
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0 // block offset in local buffer
+  var bo = srcOffset // block offset in buffer
   var xb = 0 // x offset
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1415,12 +1418,10 @@ function vecDotQ4_0(x, srcOffset, n) {
 // Fused dot product for Q4_1
 function vecDotQ4_1(x, srcOffset, n) {
   var nb = n >> 5
-  var blockSize = 20 // 2 + 2 + 16
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1445,12 +1446,10 @@ function vecDotQ4_1(x, srcOffset, n) {
 // Fused dot product for Q5_0
 function vecDotQ5_0(x, srcOffset, n) {
   var nb = n >> 5
-  var blockSize = 22 // 2 + 4 + 16
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1475,12 +1474,10 @@ function vecDotQ5_0(x, srcOffset, n) {
 // Fused dot product for Q5_1
 function vecDotQ5_1(x, srcOffset, n) {
   var nb = n >> 5
-  var blockSize = 24 // 2 + 2 + 4 + 16
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1508,14 +1505,12 @@ function vecDotQ5_1(x, srcOffset, n) {
 // Fused dot product for Q8_0 - JIT optimized
 function vecDotQ8_0(x, srcOffset, n) {
   var nb = n >> 5
-  var blockSize = 34 // 2 + 32
-  var totalBytes = nb * blockSize
-  // Get both Uint8 and Int8 views of the same data
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
-  var i8 = getInt8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  // Cache typed array references for JIT
+  var u8 = ggufUint8
+  var i8 = ggufInt8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1566,12 +1561,11 @@ function vecDotQ8_0(x, srcOffset, n) {
 // Fused dot product for Q2_K - JIT optimized
 function vecDotQ2_K(x, srcOffset, n) {
   var nb = n >> 8
-  var blockSize = 84 // Q2_K block size
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  // Cache typed array reference for JIT
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var scOff = bo
@@ -1624,14 +1618,12 @@ var q3kScales = new Int8Array(16)
 // Fused dot product for Q3_K
 function vecDotQ3_K(x, srcOffset, n) {
   var nb = n >> 8
-  var blockSize = 110 // 32 + 64 + 12 + 2
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var kmask1 = 0x03030303
   var kmask2 = 0x0f0f0f0f
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var hmOff = bo
@@ -1722,12 +1714,11 @@ function vecDotQ3_K(x, srcOffset, n) {
 // Fused dot product for Q4_K - JIT optimized
 function vecDotQ4_K(x, srcOffset, n) {
   var nb = n >> 8
-  var blockSize = 144
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  // Cache typed array reference for JIT
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1807,12 +1798,10 @@ function vecDotQ4_K(x, srcOffset, n) {
 // Fused dot product for Q5_K
 function vecDotQ5_K(x, srcOffset, n) {
   var nb = n >> 8
-  var blockSize = 176 // 2 + 2 + 12 + 32 + 128
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1878,13 +1867,11 @@ function vecDotQ5_K(x, srcOffset, n) {
 // Fused dot product for Q6_K
 function vecDotQ6_K(x, srcOffset, n) {
   var nb = n >> 8
-  var blockSize = 210 // 128 + 64 + 16 + 2
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
-  var i8 = getInt8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
 
   for (var i = 0; i < nb; i = i + 1) {
     var qlOff = bo
@@ -1944,12 +1931,10 @@ function vecDotQ6_K(x, srcOffset, n) {
 // Fused dot product for IQ4_NL
 function vecDotIQ4_NL(x, srcOffset, n) {
   var nb = n >> 5
-  var blockSize = 18 // 2 + 16
-  var totalBytes = nb * blockSize
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   var xb = 0
+  var u8 = ggufUint8
 
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
@@ -1970,8 +1955,8 @@ function vecDotIQ4_NL(x, srcOffset, n) {
 // Fused dot product for F16 - unrolled by 8
 function vecDotF16(x, srcOffset, n) {
   var sum = 0.0
-  var bo = 0
-  var u8 = getUint8ArrayAt(srcOffset, n * 2)
+  var bo = srcOffset
+  var u8 = ggufUint8
   var n8 = n & ~7
   var i = 0
   for (; i < n8; i = i + 8) {
@@ -1997,8 +1982,8 @@ function vecDotF16(x, srcOffset, n) {
 // Fused dot product for BF16 - unrolled by 8
 function vecDotBF16(x, srcOffset, n) {
   var sum = 0.0
-  var bo = 0
-  var u8 = getUint8ArrayAt(srcOffset, n * 2)
+  var bo = srcOffset
+  var u8 = ggufUint8
   var n8 = n & ~7
   var i = 0
   for (; i < n8; i = i + 8) {
@@ -2023,12 +2008,10 @@ function vecDotBF16(x, srcOffset, n) {
 
 // Fused dot product for F32
 function vecDotF32(x, srcOffset, n) {
-  var u8 = getUint8ArrayAt(srcOffset, n * 4)
   var sum = 0.0
-  var bo = 0
+  var bo = srcOffset
   for (var i = 0; i < n; i = i + 1) {
-    convInt[0] = u8[bo] | (u8[bo + 1] << 8) | (u8[bo + 2] << 16) | (u8[bo + 3] << 24)
-    sum = sum + x[i] * convFloat[0]
+    sum = sum + x[i] * dataView.getFloat32(bo, true)
     bo = bo + 4
   }
   return sum
@@ -2080,15 +2063,14 @@ function getVecDotFunc(type) {
 
 function vecDotQ4_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 18
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 2
+    var qw = wOff + 2
     var qx = xOff + 2
     var isum = 0
     for (var j = 0; j < 16; j = j + 1) {
@@ -2099,7 +2081,7 @@ function vecDotQ4_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
         xQ8i8[qx + j + 16] * ((qByte >> 4) - 8)
     }
     sum = sum + dw * dx * isum
-    bo = bo + 18
+    wOff = wOff + 18
     xOff = xOff + 34
   }
   return sum
@@ -2107,16 +2089,15 @@ function vecDotQ4_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ4_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 20
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
-    var mw = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 4
+    var qw = wOff + 4
     var qx = xOff + 2
     var isum = 0
     var xsum = 0
@@ -2127,7 +2108,7 @@ function vecDotQ4_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
     }
     sum = sum + dw * dx * isum + mw * dx * xsum
-    bo = bo + 20
+    wOff = wOff + 20
     xOff = xOff + 34
   }
   return sum
@@ -2135,16 +2116,19 @@ function vecDotQ4_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ5_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 22
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
-    var qh = u8[bo + 2] | (u8[bo + 3] << 8) | (u8[bo + 4] << 16) | (u8[bo + 5] << 24)
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var qh =
+      u8[wOff + 2] |
+      (u8[wOff + 3] << 8) |
+      (u8[wOff + 4] << 16) |
+      (u8[wOff + 5] << 24)
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 6
+    var qw = wOff + 6
     var qx = xOff + 2
     var isum = 0
     for (var j = 0; j < 16; j = j + 1) {
@@ -2157,7 +2141,7 @@ function vecDotQ5_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
         xQ8i8[qx + j + 16] * (((qByte >> 4) | xh_1) - 16)
     }
     sum = sum + dw * dx * isum
-    bo = bo + 22
+    wOff = wOff + 22
     xOff = xOff + 34
   }
   return sum
@@ -2165,17 +2149,20 @@ function vecDotQ5_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ5_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 24
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
-    var mw = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
-    var qh = u8[bo + 4] | (u8[bo + 5] << 8) | (u8[bo + 6] << 16) | (u8[bo + 7] << 24)
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var qh =
+      u8[wOff + 4] |
+      (u8[wOff + 5] << 8) |
+      (u8[wOff + 6] << 16) |
+      (u8[wOff + 7] << 24)
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 8
+    var qw = wOff + 8
     var qx = xOff + 2
     var isum = 0
     var xsum = 0
@@ -2190,7 +2177,7 @@ function vecDotQ5_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
     }
     sum = sum + dw * dx * isum + mw * dx * xsum
-    bo = bo + 24
+    wOff = wOff + 24
     xOff = xOff + 34
   }
   return sum
@@ -2198,16 +2185,15 @@ function vecDotQ5_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ8_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 34
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
-  var i8 = getInt8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 2
+    var qw = wOff + 2
     var qx = xOff + 2
     var isum =
       xQ8i8[qx] * i8[qw] +
@@ -2243,7 +2229,7 @@ function vecDotQ8_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       xQ8i8[qx + 30] * i8[qw + 30] +
       xQ8i8[qx + 31] * i8[qw + 31]
     sum = sum + dw * dx * isum
-    bo = bo + 34
+    wOff = wOff + 34
     xOff = xOff + 34
   }
   return sum
@@ -2251,15 +2237,14 @@ function vecDotQ8_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ2_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 8
-  var totalBytes = nb * 84
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var scOff = bo
-    var qsOff = bo + 16
-    var dOff = bo + 80
+    var scOff = wOff
+    var qsOff = wOff + 16
+    var dOff = wOff + 80
     var d = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
     var dmin = fp16ToFp32(u8[dOff + 2] | (u8[dOff + 3] << 8))
     var is = 0
@@ -2301,25 +2286,24 @@ function vecDotQ2_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       qIdx = qIdx + 32
     }
     sum = sum + blockSum
-    bo = bo + 84
+    wOff = wOff + 84
   }
   return sum
 }
 
 function vecDotQ3_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 8
-  var totalBytes = nb * 110
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var kmask1 = 0x03030303
   var kmask2 = 0x0f0f0f0f
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var hmOff = bo
-    var qsOff = bo + 32
-    var scOff = bo + 96
-    var dOff = bo + 108
+    var hmOff = wOff
+    var qsOff = wOff + 32
+    var scOff = wOff + 96
+    var dOff = wOff + 108
     var dAll = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
     var aux0 =
       u8[scOff] |
@@ -2394,23 +2378,22 @@ function vecDotQ3_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       qIdx = qIdx + 32
     }
     sum = sum + blockSum
-    bo = bo + 110
+    wOff = wOff + 110
   }
   return sum
 }
 
 function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 8
-  var totalBytes = nb * 144
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
-    var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
-    var scOff = bo + 4
-    var qsOff = bo + 16
+    var d = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dmin = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var scOff = wOff + 4
+    var qsOff = wOff + 16
     var blockSum = 0.0
 
     // Section 0 (is=0,1)
@@ -2546,7 +2529,7 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       dm2 * dx1 * xsum1
 
     sum = sum + blockSum
-    bo = bo + 144
+    wOff = wOff + 144
     xOff = xOff + 272
   }
   return sum
@@ -2554,17 +2537,16 @@ function vecDotQ4_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
 
 function vecDotQ5_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 8
-  var totalBytes = nb * 176
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
-    var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
-    var scOff = bo + 4
-    var qhOff = bo + 16
-    var qlOff = bo + 48
+    var d = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
+    var dmin = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
+    var scOff = wOff + 4
+    var qhOff = wOff + 16
+    var qlOff = wOff + 48
     var is = 0
     var u1 = 1
     var u2 = 2
@@ -2623,24 +2605,23 @@ function vecDotQ5_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       xOff = xOff + 68
     }
     sum = sum + blockSum
-    bo = bo + 176
+    wOff = wOff + 176
   }
   return sum
 }
 
 function vecDotQ6_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 8
-  var totalBytes = nb * 210
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
-  var i8 = getInt8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
+  var i8 = ggufInt8
   for (var i = 0; i < nb; i = i + 1) {
-    var qlOff = bo
-    var qhOff = bo + 128
-    var scOff = bo + 192
-    var dOff = bo + 208
+    var qlOff = wOff
+    var qhOff = wOff + 128
+    var scOff = wOff + 192
+    var dOff = wOff + 208
     var d = fp16ToFp32(u8[dOff] | (u8[dOff + 1] << 8))
     var blockSum = 0.0
     for (var nOuter = 0; nOuter < 256; nOuter = nOuter + 128) {
@@ -2704,22 +2685,21 @@ function vecDotQ6_K_Q8_0(xQ8, xQ8i8, srcOffset, n) {
       xOff = xOff + 136
     }
     sum = sum + blockSum
-    bo = bo + 210
+    wOff = wOff + 210
   }
   return sum
 }
 
 function vecDotIQ4_NL_Q8_0(xQ8, xQ8i8, srcOffset, n) {
   var nb = n >> 5
-  var totalBytes = nb * 18
-  var u8 = getUint8ArrayAt(srcOffset, totalBytes)
   var sum = 0.0
-  var bo = 0
+  var wOff = srcOffset
   var xOff = 0
+  var u8 = ggufUint8
   for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
     var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = bo + 2
+    var qw = wOff + 2
     var qx = xOff + 2
     var isum = 0
     for (var j = 0; j < 16; j = j + 1) {
@@ -2730,7 +2710,7 @@ function vecDotIQ4_NL_Q8_0(xQ8, xQ8i8, srcOffset, n) {
         xQ8i8[qx + j + 16] * kvalues_iq4nl[qByte >> 4]
     }
     sum = sum + dw * dx * isum
-    bo = bo + 18
+    wOff = wOff + 18
     xOff = xOff + 34
   }
   return sum
@@ -2966,22 +2946,10 @@ function accum(a, b, size) {
 // ----------------------------------------------------------------------------
 // GGUF parsing
 
-function parseGGUF(filePath) {
-  var fd = fs.openSync(filePath, "r")
-  var fileSize = fs.fstatSync(fd).size
-  fileArrayBuffer = new ArrayBuffer(fileSize)
-  fileUint8 = new Uint8Array(fileArrayBuffer)
-  fileInt8 = new Int8Array(fileArrayBuffer)
-  fileDataView = new DataView(fileArrayBuffer)
-  var chunkSize = 256 * 1024 * 1024
-  var pos = 0
-  while (pos < fileSize) {
-    var toRead = Math.min(chunkSize, fileSize - pos)
-    fs.readSync(fd, fileUint8, pos, toRead, pos)
-    pos = pos + toRead
-  }
-  fs.closeSync(fd)
-  offset = 0n
+function parseGGUF(arrayBuffer) {
+  ggufData = arrayBuffer
+  dataView = new DataView(arrayBuffer)
+  offset = 0
 
   var magic = readUint32()
   if (magic !== GGUF_MAGIC) {
@@ -3033,8 +3001,7 @@ function parseGGUF(filePath) {
   }
 
   var alignment = metadata["general.alignment"] || 32
-  var currentOffset = Number(offset)
-  var tensorDataOffset = Math.ceil(currentOffset / alignment) * alignment
+  var tensorDataOffset = Math.ceil(offset / alignment) * alignment
 
   return {
     version: version,
@@ -3053,9 +3020,9 @@ function readGGUFValue(type) {
     case GGUF_TYPE.UINT16:
       return readUint16()
     case GGUF_TYPE.INT16:
-      var value = fileDataView.getInt16(Number(offset), true)
-      offset = offset + 2n
-      return value
+      var int16Val = dataView.getInt16(offset, true)
+      offset = offset + 2
+      return int16Val
     case GGUF_TYPE.UINT32:
       return readUint32()
     case GGUF_TYPE.INT32:
@@ -3089,11 +3056,29 @@ function readGGUFValue(type) {
 // Model loading
 
 function loadModel(filePath) {
+  // Read file into ArrayBuffer (supports large files via chunked reads)
+  var fd = fs.openSync(filePath, "r")
+  var fileSize = fs.fstatSync(fd).size
+  var arrayBuffer = new ArrayBuffer(fileSize)
+  var fileUint8 = new Uint8Array(arrayBuffer)
+  var chunkSize = 256 * 1024 * 1024
+  var pos = 0
+  while (pos < fileSize) {
+    var toRead = Math.min(chunkSize, fileSize - pos)
+    fs.readSync(fd, fileUint8, pos, toRead, pos)
+    pos = pos + toRead
+  }
+  fs.closeSync(fd)
+
   // Reset vocab cache when loading a new model
   vocabTrie = null
   vocabMap = null
 
-  var gguf = parseGGUF(filePath)
+  // Initialize cached buffer views for fast matmul access
+  ggufUint8 = new Uint8Array(arrayBuffer)
+  ggufInt8 = new Int8Array(arrayBuffer)
+
+  var gguf = parseGGUF(arrayBuffer)
   var meta = gguf.metadata
 
   var arch = meta["general.architecture"] || "llama"
@@ -4792,7 +4777,7 @@ function llama3pure(data) {
         break
 
       case "generate":
-        if (cbRender) {
+        if (ggufUint8) {
           generate(data.chatHistory)
         }
         break
