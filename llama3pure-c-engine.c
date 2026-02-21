@@ -3004,13 +3004,12 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             quantize_to_q8_0_cache(s->v + kh * head_size, s->value_cache + cache_offset, head_size);
         }
 
-        // Quantize Q heads to Q8_0 for int8*int8 attention scoring
-        for (int qh = 0; qh < p->n_heads; qh++) {
-            quantize_to_q8_0_cache(s->q + s->head_q_offsets[qh],
-                                   s->qQ8 + qh * head_q8_bytes, head_size);
-        }
+        // Quantize all Q heads to Q8_0 in one batch call (#15)
+        int q_dim = p->n_heads * head_size;
+        quantize_to_q8_0_cache(s->q, s->qQ8, q_dim);
 
-        // multihead attention with GQA support
+        memset(s->xb, 0, q_dim * sizeof(float));
+
         // Pre-select attention scale: 1.0 for Gemma3 (already scaled in RoPE), actual scale for others
         float attn_scale_score = p->is_gemma3 ? 1.0f : s->attn_scale;
         // SWA: limit attention to sliding window for SWA layers (Gemma3)
@@ -3020,43 +3019,41 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             if (start_t < 0) start_t = 0;
         }
         int att_size = pos - start_t + 1;
-        int h;
-        #pragma omp parallel for private(h)
-        for (h = 0; h < p->n_heads; h++) {
-            // Use pre-computed head offset tables (avoids repeated multiply/divide)
-            float* att = s->att + s->head_att_offsets[h];
-            int kv_head_byte_offset = s->head_kv_byte_offsets[h];
-            // Q8_0 quantized query for this head (int8*int8 attention scoring)
-            int qOff = h * head_q8_bytes;
-            uint8_t* qH = s->qQ8 + qOff;
-            int8_t* qHi8 = s->qQ8i8 + qOff;
-            // iterate over timesteps in attention range
-            // Per-head layout: k_offset = loff + kv_head_byte_offset + t * head_q8_bytes
+        int kv_mul = s->kv_mul;
+
+        // GQA-batched attention (#16) with Q8 scoring (#15)
+        // Loop reordered: position-first for K/V cache locality (#1)
+        int kvH;
+        #pragma omp parallel for private(kvH)
+        for (kvH = 0; kvH < p->n_kv_heads; kvH++) {
+            int kBase = loff + kvH * head_seq_bytes;
+
+            // Score all Q heads in this GQA group against all K positions
             for (int t = start_t; t <= pos; t++) {
-                // get the key vector for this head and at this timestep (Q8_0 cache)
-                int k_offset = loff + kv_head_byte_offset + t * head_q8_bytes;
-                // calculate the attention score as int8*int8 dot product of q and k
-                // attn_scale_score is 1.0 for Gemma3 (Q already scaled), eliminates per-score branch
-                float score = dot_q8_0_q8_0_cache(qH, qHi8,
-                    s->key_cache + k_offset, (const int8_t*)(s->key_cache + k_offset),
-                    head_size) * attn_scale_score;
-                // save the score to the attention buffer (offset by start_t for SWA)
-                att[t - start_t] = score;
+                int kOff = kBase + t * head_q8_bytes;
+                const uint8_t* kQ8 = s->key_cache + kOff;
+                const int8_t* kI8 = (const int8_t*)kQ8;
+                for (int mh = 0; mh < kv_mul; mh++) {
+                    int h = kvH * kv_mul + mh;
+                    int qOff = h * head_q8_bytes;
+                    s->att[s->head_att_offsets[h] + t - start_t] =
+                        dot_q8_0_q8_0_cache(s->qQ8 + qOff, s->qQ8i8 + qOff,
+                            kQ8, kI8, head_size) * attn_scale_score;
+                }
             }
 
-            // softmax the scores to get attention weights
-            softmax(att, att_size);
+            // Softmax + value accumulation per Q head
+            for (int mh = 0; mh < kv_mul; mh++) {
+                int h = kvH * kv_mul + mh;
+                float* att = s->att + s->head_att_offsets[h];
+                softmax(att, att_size);
 
-            // weighted sum of the values, store back into xb
-            float* xb = s->xb + s->head_q_offsets[h];
-            memset(xb, 0, head_size * sizeof(float));
-            for (int t = start_t; t <= pos; t++) {
-                // get the attention weight for this timestep
-                float a = att[t - start_t];
-                // get the value vector for this head and at this timestep (Q8_0 cache)
-                int v_offset = loff + kv_head_byte_offset + t * head_q8_bytes;
-                // accumulate the weighted value into xb (handles near-zero skip internally)
-                accum_q8_0_cache(xb, s->value_cache + v_offset, a, head_size);
+                // Value accumulation - position-first for V cache locality
+                float* xb = s->xb + s->head_q_offsets[h];
+                for (int t = start_t; t <= pos; t++) {
+                    int vOff = kBase + t * head_q8_bytes;
+                    accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
+                }
             }
         }
 
