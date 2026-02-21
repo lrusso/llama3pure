@@ -279,18 +279,245 @@ function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
   var bo = dstOffset // byte offset in destination
 
   for (var i = 0; i < nb; i = i + 1) {
-    var blockStart = srcOffset + (i << 5) // i * 32
+    var bs = srcOffset + (i << 5) // i * 32
 
-    // Find max absolute value in block
+    // Find max absolute value in block - unrolled by 8
     var amax = 0.0
-    for (var j = 0; j < 32; j = j + 1) {
-      var av = src[blockStart + j]
-      if (av < 0) {
-        av = -av
-      }
-      if (av > amax) {
-        amax = av
-      }
+    var av0
+    var av1
+    var av2
+    var av3
+    var av4
+    var av5
+    var av6
+    var av7
+
+    av0 = src[bs]
+    if (av0 < 0) {
+      av0 = -av0
+    }
+    av1 = src[bs + 1]
+    if (av1 < 0) {
+      av1 = -av1
+    }
+    av2 = src[bs + 2]
+    if (av2 < 0) {
+      av2 = -av2
+    }
+    av3 = src[bs + 3]
+    if (av3 < 0) {
+      av3 = -av3
+    }
+    av4 = src[bs + 4]
+    if (av4 < 0) {
+      av4 = -av4
+    }
+    av5 = src[bs + 5]
+    if (av5 < 0) {
+      av5 = -av5
+    }
+    av6 = src[bs + 6]
+    if (av6 < 0) {
+      av6 = -av6
+    }
+    av7 = src[bs + 7]
+    if (av7 < 0) {
+      av7 = -av7
+    }
+    if (av0 > amax) {
+      amax = av0
+    }
+    if (av1 > amax) {
+      amax = av1
+    }
+    if (av2 > amax) {
+      amax = av2
+    }
+    if (av3 > amax) {
+      amax = av3
+    }
+    if (av4 > amax) {
+      amax = av4
+    }
+    if (av5 > amax) {
+      amax = av5
+    }
+    if (av6 > amax) {
+      amax = av6
+    }
+    if (av7 > amax) {
+      amax = av7
+    }
+
+    av0 = src[bs + 8]
+    if (av0 < 0) {
+      av0 = -av0
+    }
+    av1 = src[bs + 9]
+    if (av1 < 0) {
+      av1 = -av1
+    }
+    av2 = src[bs + 10]
+    if (av2 < 0) {
+      av2 = -av2
+    }
+    av3 = src[bs + 11]
+    if (av3 < 0) {
+      av3 = -av3
+    }
+    av4 = src[bs + 12]
+    if (av4 < 0) {
+      av4 = -av4
+    }
+    av5 = src[bs + 13]
+    if (av5 < 0) {
+      av5 = -av5
+    }
+    av6 = src[bs + 14]
+    if (av6 < 0) {
+      av6 = -av6
+    }
+    av7 = src[bs + 15]
+    if (av7 < 0) {
+      av7 = -av7
+    }
+    if (av0 > amax) {
+      amax = av0
+    }
+    if (av1 > amax) {
+      amax = av1
+    }
+    if (av2 > amax) {
+      amax = av2
+    }
+    if (av3 > amax) {
+      amax = av3
+    }
+    if (av4 > amax) {
+      amax = av4
+    }
+    if (av5 > amax) {
+      amax = av5
+    }
+    if (av6 > amax) {
+      amax = av6
+    }
+    if (av7 > amax) {
+      amax = av7
+    }
+
+    av0 = src[bs + 16]
+    if (av0 < 0) {
+      av0 = -av0
+    }
+    av1 = src[bs + 17]
+    if (av1 < 0) {
+      av1 = -av1
+    }
+    av2 = src[bs + 18]
+    if (av2 < 0) {
+      av2 = -av2
+    }
+    av3 = src[bs + 19]
+    if (av3 < 0) {
+      av3 = -av3
+    }
+    av4 = src[bs + 20]
+    if (av4 < 0) {
+      av4 = -av4
+    }
+    av5 = src[bs + 21]
+    if (av5 < 0) {
+      av5 = -av5
+    }
+    av6 = src[bs + 22]
+    if (av6 < 0) {
+      av6 = -av6
+    }
+    av7 = src[bs + 23]
+    if (av7 < 0) {
+      av7 = -av7
+    }
+    if (av0 > amax) {
+      amax = av0
+    }
+    if (av1 > amax) {
+      amax = av1
+    }
+    if (av2 > amax) {
+      amax = av2
+    }
+    if (av3 > amax) {
+      amax = av3
+    }
+    if (av4 > amax) {
+      amax = av4
+    }
+    if (av5 > amax) {
+      amax = av5
+    }
+    if (av6 > amax) {
+      amax = av6
+    }
+    if (av7 > amax) {
+      amax = av7
+    }
+
+    av0 = src[bs + 24]
+    if (av0 < 0) {
+      av0 = -av0
+    }
+    av1 = src[bs + 25]
+    if (av1 < 0) {
+      av1 = -av1
+    }
+    av2 = src[bs + 26]
+    if (av2 < 0) {
+      av2 = -av2
+    }
+    av3 = src[bs + 27]
+    if (av3 < 0) {
+      av3 = -av3
+    }
+    av4 = src[bs + 28]
+    if (av4 < 0) {
+      av4 = -av4
+    }
+    av5 = src[bs + 29]
+    if (av5 < 0) {
+      av5 = -av5
+    }
+    av6 = src[bs + 30]
+    if (av6 < 0) {
+      av6 = -av6
+    }
+    av7 = src[bs + 31]
+    if (av7 < 0) {
+      av7 = -av7
+    }
+    if (av0 > amax) {
+      amax = av0
+    }
+    if (av1 > amax) {
+      amax = av1
+    }
+    if (av2 > amax) {
+      amax = av2
+    }
+    if (av3 > amax) {
+      amax = av3
+    }
+    if (av4 > amax) {
+      amax = av4
+    }
+    if (av5 > amax) {
+      amax = av5
+    }
+    if (av6 > amax) {
+      amax = av6
+    }
+    if (av7 > amax) {
+      amax = av7
     }
 
     // Compute scale
@@ -302,19 +529,84 @@ function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
     dst[bo] = dFp16 & 0xff
     dst[bo + 1] = (dFp16 >> 8) & 0xff
 
-    // Quantize and store values
-    for (var j = 0; j < 32; j = j + 1) {
-      var v = src[blockStart + j] * id
-      // Round to nearest int8
-      var q = v > 0 ? (v + 0.5) | 0 : (v - 0.5) | 0
-      if (q > 127) {
-        q = 127
-      }
-      if (q < -128) {
-        q = -128
-      }
-      dstInt8[bo + 2 + j] = q
-    }
+    // Quantize and store values - unrolled by 8
+    var qo = bo + 2
+    var v0
+    var v1
+    var v2
+    var v3
+    var v4
+    var v5
+    var v6
+    var v7
+
+    v0 = src[bs] * id
+    v1 = src[bs + 1] * id
+    v2 = src[bs + 2] * id
+    v3 = src[bs + 3] * id
+    v4 = src[bs + 4] * id
+    v5 = src[bs + 5] * id
+    v6 = src[bs + 6] * id
+    v7 = src[bs + 7] * id
+    dstInt8[qo] = v0 > 0 ? (v0 + 0.5) | 0 : (v0 - 0.5) | 0
+    dstInt8[qo + 1] = v1 > 0 ? (v1 + 0.5) | 0 : (v1 - 0.5) | 0
+    dstInt8[qo + 2] = v2 > 0 ? (v2 + 0.5) | 0 : (v2 - 0.5) | 0
+    dstInt8[qo + 3] = v3 > 0 ? (v3 + 0.5) | 0 : (v3 - 0.5) | 0
+    dstInt8[qo + 4] = v4 > 0 ? (v4 + 0.5) | 0 : (v4 - 0.5) | 0
+    dstInt8[qo + 5] = v5 > 0 ? (v5 + 0.5) | 0 : (v5 - 0.5) | 0
+    dstInt8[qo + 6] = v6 > 0 ? (v6 + 0.5) | 0 : (v6 - 0.5) | 0
+    dstInt8[qo + 7] = v7 > 0 ? (v7 + 0.5) | 0 : (v7 - 0.5) | 0
+
+    v0 = src[bs + 8] * id
+    v1 = src[bs + 9] * id
+    v2 = src[bs + 10] * id
+    v3 = src[bs + 11] * id
+    v4 = src[bs + 12] * id
+    v5 = src[bs + 13] * id
+    v6 = src[bs + 14] * id
+    v7 = src[bs + 15] * id
+    dstInt8[qo + 8] = v0 > 0 ? (v0 + 0.5) | 0 : (v0 - 0.5) | 0
+    dstInt8[qo + 9] = v1 > 0 ? (v1 + 0.5) | 0 : (v1 - 0.5) | 0
+    dstInt8[qo + 10] = v2 > 0 ? (v2 + 0.5) | 0 : (v2 - 0.5) | 0
+    dstInt8[qo + 11] = v3 > 0 ? (v3 + 0.5) | 0 : (v3 - 0.5) | 0
+    dstInt8[qo + 12] = v4 > 0 ? (v4 + 0.5) | 0 : (v4 - 0.5) | 0
+    dstInt8[qo + 13] = v5 > 0 ? (v5 + 0.5) | 0 : (v5 - 0.5) | 0
+    dstInt8[qo + 14] = v6 > 0 ? (v6 + 0.5) | 0 : (v6 - 0.5) | 0
+    dstInt8[qo + 15] = v7 > 0 ? (v7 + 0.5) | 0 : (v7 - 0.5) | 0
+
+    v0 = src[bs + 16] * id
+    v1 = src[bs + 17] * id
+    v2 = src[bs + 18] * id
+    v3 = src[bs + 19] * id
+    v4 = src[bs + 20] * id
+    v5 = src[bs + 21] * id
+    v6 = src[bs + 22] * id
+    v7 = src[bs + 23] * id
+    dstInt8[qo + 16] = v0 > 0 ? (v0 + 0.5) | 0 : (v0 - 0.5) | 0
+    dstInt8[qo + 17] = v1 > 0 ? (v1 + 0.5) | 0 : (v1 - 0.5) | 0
+    dstInt8[qo + 18] = v2 > 0 ? (v2 + 0.5) | 0 : (v2 - 0.5) | 0
+    dstInt8[qo + 19] = v3 > 0 ? (v3 + 0.5) | 0 : (v3 - 0.5) | 0
+    dstInt8[qo + 20] = v4 > 0 ? (v4 + 0.5) | 0 : (v4 - 0.5) | 0
+    dstInt8[qo + 21] = v5 > 0 ? (v5 + 0.5) | 0 : (v5 - 0.5) | 0
+    dstInt8[qo + 22] = v6 > 0 ? (v6 + 0.5) | 0 : (v6 - 0.5) | 0
+    dstInt8[qo + 23] = v7 > 0 ? (v7 + 0.5) | 0 : (v7 - 0.5) | 0
+
+    v0 = src[bs + 24] * id
+    v1 = src[bs + 25] * id
+    v2 = src[bs + 26] * id
+    v3 = src[bs + 27] * id
+    v4 = src[bs + 28] * id
+    v5 = src[bs + 29] * id
+    v6 = src[bs + 30] * id
+    v7 = src[bs + 31] * id
+    dstInt8[qo + 24] = v0 > 0 ? (v0 + 0.5) | 0 : (v0 - 0.5) | 0
+    dstInt8[qo + 25] = v1 > 0 ? (v1 + 0.5) | 0 : (v1 - 0.5) | 0
+    dstInt8[qo + 26] = v2 > 0 ? (v2 + 0.5) | 0 : (v2 - 0.5) | 0
+    dstInt8[qo + 27] = v3 > 0 ? (v3 + 0.5) | 0 : (v3 - 0.5) | 0
+    dstInt8[qo + 28] = v4 > 0 ? (v4 + 0.5) | 0 : (v4 - 0.5) | 0
+    dstInt8[qo + 29] = v5 > 0 ? (v5 + 0.5) | 0 : (v5 - 0.5) | 0
+    dstInt8[qo + 30] = v6 > 0 ? (v6 + 0.5) | 0 : (v6 - 0.5) | 0
+    dstInt8[qo + 31] = v7 > 0 ? (v7 + 0.5) | 0 : (v7 - 0.5) | 0
 
     bo = bo + Q8_0_BLOCK_SIZE
   }
@@ -404,8 +696,8 @@ function dotQ8_0_Q8_0Cache(aQ8, aI8, aOff, bQ8, bI8, bOff, count) {
     var qa = ao + 2
     var qb = bo + 2
 
-    // Unrolled 32-term integer dot product
-    var isum =
+    // Two independent 16-term partial sums for superscalar ILP
+    var isum1 =
       aI8[qa] * bI8[qb] +
       aI8[qa + 1] * bI8[qb + 1] +
       aI8[qa + 2] * bI8[qb + 2] +
@@ -421,7 +713,9 @@ function dotQ8_0_Q8_0Cache(aQ8, aI8, aOff, bQ8, bI8, bOff, count) {
       aI8[qa + 12] * bI8[qb + 12] +
       aI8[qa + 13] * bI8[qb + 13] +
       aI8[qa + 14] * bI8[qb + 14] +
-      aI8[qa + 15] * bI8[qb + 15] +
+      aI8[qa + 15] * bI8[qb + 15]
+
+    var isum2 =
       aI8[qa + 16] * bI8[qb + 16] +
       aI8[qa + 17] * bI8[qb + 17] +
       aI8[qa + 18] * bI8[qb + 18] +
@@ -439,7 +733,7 @@ function dotQ8_0_Q8_0Cache(aQ8, aI8, aOff, bQ8, bI8, bOff, count) {
       aI8[qa + 30] * bI8[qb + 30] +
       aI8[qa + 31] * bI8[qb + 31]
 
-    sum = sum + da * db * isum
+    sum = sum + da * db * (isum1 + isum2)
     ao = ao + Q8_0_BLOCK_SIZE
     bo = bo + Q8_0_BLOCK_SIZE
   }
@@ -597,12 +891,9 @@ function dequantizeQ2_K(srcOffset, dst, dstOffset, count) {
 
   for (var i = 0; i < nb; i = i + 1) {
     var blockOffset = i * blockSize
-    var scales = src.subarray(blockOffset, blockOffset + QK_K / 16)
-    var qs = src.subarray(
-      blockOffset + QK_K / 16,
-      blockOffset + QK_K / 16 + QK_K / 4
-    )
-    var dOffset = blockOffset + QK_K / 16 + QK_K / 4
+    var scOff = blockOffset
+    var qsOff = blockOffset + 16
+    var dOffset = blockOffset + 80
     var d = fp16ToFp32(src[dOffset] | (src[dOffset + 1] << 8))
     var dmin = fp16ToFp32(src[dOffset + 2] | (src[dOffset + 3] << 8))
 
@@ -613,21 +904,21 @@ function dequantizeQ2_K(srcOffset, dst, dstOffset, count) {
     for (var n = 0; n < QK_K; n = n + 128) {
       var shift = 0
       for (var j = 0; j < 4; j = j + 1) {
-        var sc = scales[is]
+        var sc = src[scOff + is]
         is = is + 1
         var dl = d * (sc & 0xf)
         var ml = dmin * (sc >> 4)
         for (var l = 0; l < 16; l = l + 1) {
-          dst[y] = dl * ((qs[qIdx + l] >> shift) & 3) - ml
+          dst[y] = dl * ((src[qsOff + qIdx + l] >> shift) & 3) - ml
           y = y + 1
         }
 
-        sc = scales[is]
+        sc = src[scOff + is]
         is = is + 1
         dl = d * (sc & 0xf)
         ml = dmin * (sc >> 4)
         for (var l = 0; l < 16; l = l + 1) {
-          dst[y] = dl * ((qs[qIdx + l + 16] >> shift) & 3) - ml
+          dst[y] = dl * ((src[qsOff + qIdx + l + 16] >> shift) & 3) - ml
           y = y + 1
         }
 
@@ -650,30 +941,27 @@ function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
 
   for (var i = 0; i < nb; i = i + 1) {
     var blockOffset = i * blockSize
-    var hmask = src.subarray(blockOffset, blockOffset + QK_K / 8)
-    var qs = src.subarray(blockOffset + QK_K / 8, blockOffset + QK_K / 8 + QK_K / 4)
-    var scalesRaw = src.subarray(
-      blockOffset + QK_K / 8 + QK_K / 4,
-      blockOffset + QK_K / 8 + QK_K / 4 + 12
-    )
-    var dOffset = blockOffset + QK_K / 8 + QK_K / 4 + 12
+    var hmOff = blockOffset
+    var qsOff = blockOffset + 32
+    var scRawOff = blockOffset + 96
+    var dOffset = blockOffset + 108
     var d_all = fp16ToFp32(src[dOffset] | (src[dOffset + 1] << 8))
 
     var aux0 =
-      scalesRaw[0] |
-      (scalesRaw[1] << 8) |
-      (scalesRaw[2] << 16) |
-      (scalesRaw[3] << 24)
+      src[scRawOff] |
+      (src[scRawOff + 1] << 8) |
+      (src[scRawOff + 2] << 16) |
+      (src[scRawOff + 3] << 24)
     var aux1 =
-      scalesRaw[4] |
-      (scalesRaw[5] << 8) |
-      (scalesRaw[6] << 16) |
-      (scalesRaw[7] << 24)
+      src[scRawOff + 4] |
+      (src[scRawOff + 5] << 8) |
+      (src[scRawOff + 6] << 16) |
+      (src[scRawOff + 7] << 24)
     var aux2 =
-      scalesRaw[8] |
-      (scalesRaw[9] << 8) |
-      (scalesRaw[10] << 16) |
-      (scalesRaw[11] << 24)
+      src[scRawOff + 8] |
+      (src[scRawOff + 9] << 8) |
+      (src[scRawOff + 10] << 16) |
+      (src[scRawOff + 11] << 24)
 
     var tmp = aux2
     var s0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4)
@@ -715,8 +1003,8 @@ function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
         var dl = d_all * (scales[is] - 32)
         is = is + 1
         for (var l = 0; l < 16; l = l + 1) {
-          var q = (qs[qIdx + l] >> shift) & 3
-          var h = hmask[l] & m ? 0 : 4
+          var q = (src[qsOff + qIdx + l] >> shift) & 3
+          var h = src[hmOff + l] & m ? 0 : 4
           dst[y] = dl * (q - h)
           y = y + 1
         }
@@ -724,8 +1012,8 @@ function dequantizeQ3_K(srcOffset, dst, dstOffset, count) {
         dl = d_all * (scales[is] - 32)
         is = is + 1
         for (var l = 0; l < 16; l = l + 1) {
-          var q = (qs[qIdx + l + 16] >> shift) & 3
-          var h = hmask[l + 16] & m ? 0 : 4
+          var q = (src[qsOff + qIdx + l + 16] >> shift) & 3
+          var h = src[hmOff + l + 16] & m ? 0 : 4
           dst[y] = dl * (q - h)
           y = y + 1
         }
@@ -748,12 +1036,9 @@ function dequantizeQ5_K(srcOffset, dst, dstOffset, count) {
     var blockOffset = i * blockSize
     var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
     var dmin = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
-    var scales = src.subarray(blockOffset + 4, blockOffset + 16)
-    var qh = src.subarray(blockOffset + 16, blockOffset + 16 + QK_K / 8)
-    var ql = src.subarray(
-      blockOffset + 16 + QK_K / 8,
-      blockOffset + 16 + QK_K / 8 + QK_K / 2
-    )
+    var scOff = blockOffset + 4
+    var qhOff = blockOffset + 16
+    var qlOff = blockOffset + 48
 
     var y = dstOffset + i * QK_K
     var is = 0
@@ -765,33 +1050,34 @@ function dequantizeQ5_K(srcOffset, dst, dstOffset, count) {
       var sc
       var m
       if (is < 4) {
-        sc = scales[is] & 63
-        m = scales[is + 4] & 63
+        sc = src[scOff + is] & 63
+        m = src[scOff + is + 4] & 63
       } else {
-        sc = (scales[is + 4] & 0xf) | ((scales[is - 4] >> 6) << 4)
-        m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4)
+        sc = (src[scOff + is + 4] & 0xf) | ((src[scOff + is - 4] >> 6) << 4)
+        m = (src[scOff + is + 4] >> 4) | ((src[scOff + is] >> 6) << 4)
       }
       var d1 = d * sc
       var m1 = dmin * m
 
       is = is + 1
       if (is < 4) {
-        sc = scales[is] & 63
-        m = scales[is + 4] & 63
+        sc = src[scOff + is] & 63
+        m = src[scOff + is + 4] & 63
       } else {
-        sc = (scales[is + 4] & 0xf) | ((scales[is - 4] >> 6) << 4)
-        m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4)
+        sc = (src[scOff + is + 4] & 0xf) | ((src[scOff + is - 4] >> 6) << 4)
+        m = (src[scOff + is + 4] >> 4) | ((src[scOff + is] >> 6) << 4)
       }
       var d2 = d * sc
       var m2 = dmin * m
       is = is + 1
 
       for (var l = 0; l < 32; l = l + 1) {
-        dst[y + j + l] = d1 * ((ql[qlIdx + l] & 0xf) + (qh[l] & u1 ? 16 : 0)) - m1
+        dst[y + j + l] =
+          d1 * ((src[qlOff + qlIdx + l] & 0xf) + (src[qhOff + l] & u1 ? 16 : 0)) - m1
       }
       for (var l = 0; l < 32; l = l + 1) {
         dst[y + j + l + 32] =
-          d2 * ((ql[qlIdx + l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2
+          d2 * ((src[qlOff + qlIdx + l] >> 4) + (src[qhOff + l] & u2 ? 16 : 0)) - m2
       }
 
       qlIdx = qlIdx + 32
@@ -811,8 +1097,8 @@ function dequantizeQ4_K(srcOffset, dst, dstOffset, count) {
     var blockOffset = i * blockSize
     var d = fp16ToFp32(src[blockOffset] | (src[blockOffset + 1] << 8))
     var dmin = fp16ToFp32(src[blockOffset + 2] | (src[blockOffset + 3] << 8))
-    var scales = src.subarray(blockOffset + 4, blockOffset + 16)
-    var qs = src.subarray(blockOffset + 16, blockOffset + 16 + QK_K / 2)
+    var scOff = blockOffset + 4
+    var qsOff = blockOffset + 16
 
     var is = 0
     var y = dstOffset + i * QK_K
@@ -821,22 +1107,22 @@ function dequantizeQ4_K(srcOffset, dst, dstOffset, count) {
       var sc
       var m
       if (is < 4) {
-        sc = scales[is] & 63
-        m = scales[is + 4] & 63
+        sc = src[scOff + is] & 63
+        m = src[scOff + is + 4] & 63
       } else {
-        sc = (scales[is + 4] & 0xf) | ((scales[is - 4] >> 6) << 4)
-        m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4)
+        sc = (src[scOff + is + 4] & 0xf) | ((src[scOff + is - 4] >> 6) << 4)
+        m = (src[scOff + is + 4] >> 4) | ((src[scOff + is] >> 6) << 4)
       }
       var d1 = d * sc
       var m1 = dmin * m
 
       is = is + 1
       if (is < 4) {
-        sc = scales[is] & 63
-        m = scales[is + 4] & 63
+        sc = src[scOff + is] & 63
+        m = src[scOff + is + 4] & 63
       } else {
-        sc = (scales[is + 4] & 0xf) | ((scales[is - 4] >> 6) << 4)
-        m = (scales[is + 4] >> 4) | ((scales[is] >> 6) << 4)
+        sc = (src[scOff + is + 4] & 0xf) | ((src[scOff + is - 4] >> 6) << 4)
+        m = (src[scOff + is + 4] >> 4) | ((src[scOff + is] >> 6) << 4)
       }
       var d2 = d * sc
       var m2 = dmin * m
@@ -844,7 +1130,7 @@ function dequantizeQ4_K(srcOffset, dst, dstOffset, count) {
 
       var qIdx = j / 2
       for (var l = 0; l < 32; l = l + 1) {
-        var qByte = qs[qIdx + l]
+        var qByte = src[qsOff + qIdx + l]
         dst[y + j + l] = d1 * (qByte & 0xf) - m1
         dst[y + j + l + 32] = d2 * (qByte >> 4) - m2
       }
@@ -861,23 +1147,26 @@ function dequantizeQ6_K(srcOffset, dst, dstOffset, count) {
 
   for (var i = 0; i < nb; i = i + 1) {
     var blockOffset = i * blockSize
-    var ql = src.subarray(blockOffset, blockOffset + QK_K / 2)
-    var qh = src.subarray(blockOffset + QK_K / 2, blockOffset + QK_K / 2 + QK_K / 4)
-    var scalesOffset = blockOffset + QK_K / 2 + QK_K / 4
-    var dOffset = blockOffset + QK_K / 2 + QK_K / 4 + QK_K / 16
+    var qlOff = blockOffset
+    var qhOff = blockOffset + 128
+    var scalesOffset = blockOffset + 192
+    var dOffset = blockOffset + 208
     var d = fp16ToFp32(src[dOffset] | (src[dOffset + 1] << 8))
 
     var y = dstOffset + i * QK_K
 
     for (var n = 0; n < QK_K; n = n + 128) {
+      var qlBase = qlOff + (n >> 1)
+      var qhBase = qhOff + (n >> 2)
       for (var l = 0; l < 32; l = l + 1) {
         var is = l >> 4
         var scBase = scalesOffset + (n >> 7) * 8
-        var q1 = ((ql[n / 2 + l] & 0xf) | (((qh[n / 4 + l] >> 0) & 3) << 4)) - 32
+        var q1 = ((src[qlBase + l] & 0xf) | (((src[qhBase + l] >> 0) & 3) << 4)) - 32
         var q2 =
-          ((ql[n / 2 + l + 32] & 0xf) | (((qh[n / 4 + l] >> 2) & 3) << 4)) - 32
-        var q3 = ((ql[n / 2 + l] >> 4) | (((qh[n / 4 + l] >> 4) & 3) << 4)) - 32
-        var q4 = ((ql[n / 2 + l + 32] >> 4) | (((qh[n / 4 + l] >> 6) & 3) << 4)) - 32
+          ((src[qlBase + l + 32] & 0xf) | (((src[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((src[qlBase + l] >> 4) | (((src[qhBase + l] >> 4) & 3) << 4)) - 32
+        var q4 =
+          ((src[qlBase + l + 32] >> 4) | (((src[qhBase + l] >> 6) & 3) << 4)) - 32
 
         dst[y + n + l] = d * srcSigned[scBase + is + 0] * q1
         dst[y + n + l + 32] = d * srcSigned[scBase + is + 2] * q2
@@ -2573,6 +2862,43 @@ function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
   }
 }
 
+// Fused embedding scale + RMS norm for Gemma first layer
+// Scales x in-place and computes rmsnorm in 2 passes instead of 3
+function rmsnormGemmaFusedScale(out, x, w, size, eps, invSize, scale) {
+  var ss = 0.0
+  var size4 = size & ~3
+  var i = 0
+  // Pass 1: scale x in-place and accumulate sum of squares
+  for (; i < size4; i = i + 4) {
+    var x0 = x[i] * scale
+    var x1 = x[i + 1] * scale
+    var x2 = x[i + 2] * scale
+    var x3 = x[i + 3] * scale
+    x[i] = x0
+    x[i + 1] = x1
+    x[i + 2] = x2
+    x[i + 3] = x3
+    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
+  }
+  for (; i < size; i = i + 1) {
+    var xv = x[i] * scale
+    x[i] = xv
+    ss = ss + xv * xv
+  }
+  // Pass 2: normalize
+  ss = 1.0 / Math.sqrt(ss * invSize + eps)
+  i = 0
+  for (; i < size4; i = i + 4) {
+    out[i] = w[i] * ss * x[i]
+    out[i + 1] = w[i + 1] * ss * x[i + 1]
+    out[i + 2] = w[i + 2] * ss * x[i + 2]
+    out[i + 3] = w[i + 3] * ss * x[i + 3]
+  }
+  for (; i < size; i = i + 1) {
+    out[i] = w[i] * ss * x[i]
+  }
+}
+
 function accum(a, b, size) {
   var size4 = size & ~3
   var i = 0
@@ -3373,27 +3699,27 @@ function transformerGemma(token, pos, computeLogits) {
   var qQ8 = s.qQ8
   var qQ8i8 = s.qQ8i8
 
-  // Embedding with Gemma scaling
+  // Embedding (scaling fused into first rmsnorm)
   var emb = w.tokenEmbedding
   dequantizeRow(xArr, emb.dataOffset + token * emb.rowSize, dim, emb.type)
-
-  var scale = s.embedScale
-  var dim4 = dim & ~3
-  var i = 0
-  for (; i < dim4; i = i + 4) {
-    xArr[i] *= scale
-    xArr[i + 1] *= scale
-    xArr[i + 2] *= scale
-    xArr[i + 3] *= scale
-  }
-  for (; i < dim; i = i + 1) {
-    xArr[i] *= scale
-  }
 
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
-    rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
+    if (l === 0) {
+      // First layer: fused embed scale + rmsnorm (3 passes → 2)
+      rmsnormGemmaFusedScale(
+        xbArr,
+        xArr,
+        lw.rmsAttWeight,
+        dim,
+        eps,
+        invDim,
+        s.embedScale
+      )
+    } else {
+      rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
+    }
 
     // QKV matmuls - quantize once, reuse (#1+2)
     if (lw.wq.dotQ8Func) {
