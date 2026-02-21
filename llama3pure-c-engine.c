@@ -2822,6 +2822,23 @@ void rmsnorm(float* o, float* x, float* weight, int size, float inv_size, float 
     }
 }
 
+// Fused embedding scale + RMS norm for Gemma first layer
+// Scales x in-place and computes rmsnorm in 2 passes instead of 3
+void rmsnorm_fused_scale(float* o, float* x, float* weight, int size, float inv_size, float eps, float scale) {
+    // Pass 1: scale x in-place and accumulate sum of squares
+    float ss = 0.0f;
+    for (int j = 0; j < size; j++) {
+        float xv = x[j] * scale;
+        x[j] = xv;
+        ss += xv * xv;
+    }
+    // Pass 2: normalize
+    ss = 1.0f / sqrtf(ss * inv_size + eps);
+    for (int j = 0; j < size; j++) {
+        o[j] = weight[j] * (ss * x[j]);
+    }
+}
+
 // Apply RMS norm per head (for Gemma3 Q/K normalization)
 // input: (n_heads, head_size), weight: (head_size,)
 // NOTE: The GGUF conversion script already adds +1 to Gemma norm weights
@@ -2877,24 +2894,22 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float inv_dim = s->inv_dim;
     float inv_head_size = s->inv_head_size;
 
+    // Embedding (scaling fused into first rmsnorm)
     // dequantize the token embedding into x (on-demand, saves memory)
     // GGUF stores embeddings with ne=[dim, vocab_size], meaning shape (vocab_size, dim) in row-major
     // Each token's embedding is contiguous in quantized form
     const char* emb_row = (const char*)w->token_embedding_data + token * w->token_embedding_row_size;
     dequantize_row(x, emb_row, dim, w->token_embedding_type);
 
-    // Gemma3: Scale embeddings by sqrt(dim) - use pre-computed value
-    if (p->is_gemma3) {
-        float scale = s->embed_scale;
-        for (int i = 0; i < dim; i++) {
-            x[i] *= scale;
-        }
-    }
-
     // forward all the layers
     for (int l = 0; l < p->n_layers; l++) {
         // attention rmsnorm
-        rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, inv_dim, eps);
+        if (p->is_gemma3 && l == 0) {
+            // First layer: fused embed scale + rmsnorm (3 passes -> 2)
+            rmsnorm_fused_scale(s->xb, x, w->rms_att_weight, dim, inv_dim, eps, s->embed_scale);
+        } else {
+            rmsnorm(s->xb, x, w->rms_att_weight + l * dim, dim, inv_dim, eps);
+        }
 
         // qkv matmuls for this position - using quantized weights
         // Quantize input once and reuse for Q, K, V (avoids 2 redundant quantizations)
