@@ -1952,24 +1952,54 @@ function vecDotIQ4_NL(x, srcOffset, n) {
   return sum
 }
 
-// Fused dot product for F16
+// Fused dot product for F16 - unrolled by 8
 function vecDotF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var u8 = ggufUint8
-  for (var i = 0; i < n; i = i + 1) {
+  var n8 = n & ~7
+  var i = 0
+  for (; i < n8; i = i + 8) {
+    sum =
+      sum +
+      x[i] * fp16Table[u8[bo] | (u8[bo + 1] << 8)] +
+      x[i + 1] * fp16Table[u8[bo + 2] | (u8[bo + 3] << 8)] +
+      x[i + 2] * fp16Table[u8[bo + 4] | (u8[bo + 5] << 8)] +
+      x[i + 3] * fp16Table[u8[bo + 6] | (u8[bo + 7] << 8)] +
+      x[i + 4] * fp16Table[u8[bo + 8] | (u8[bo + 9] << 8)] +
+      x[i + 5] * fp16Table[u8[bo + 10] | (u8[bo + 11] << 8)] +
+      x[i + 6] * fp16Table[u8[bo + 12] | (u8[bo + 13] << 8)] +
+      x[i + 7] * fp16Table[u8[bo + 14] | (u8[bo + 15] << 8)]
+    bo = bo + 16
+  }
+  for (; i < n; i = i + 1) {
     sum = sum + x[i] * fp16Table[u8[bo] | (u8[bo + 1] << 8)]
     bo = bo + 2
   }
   return sum
 }
 
-// Fused dot product for BF16
+// Fused dot product for BF16 - unrolled by 8
 function vecDotBF16(x, srcOffset, n) {
   var sum = 0.0
   var bo = srcOffset
   var u8 = ggufUint8
-  for (var i = 0; i < n; i = i + 1) {
+  var n8 = n & ~7
+  var i = 0
+  for (; i < n8; i = i + 8) {
+    sum =
+      sum +
+      x[i] * bf16Table[u8[bo] | (u8[bo + 1] << 8)] +
+      x[i + 1] * bf16Table[u8[bo + 2] | (u8[bo + 3] << 8)] +
+      x[i + 2] * bf16Table[u8[bo + 4] | (u8[bo + 5] << 8)] +
+      x[i + 3] * bf16Table[u8[bo + 6] | (u8[bo + 7] << 8)] +
+      x[i + 4] * bf16Table[u8[bo + 8] | (u8[bo + 9] << 8)] +
+      x[i + 5] * bf16Table[u8[bo + 10] | (u8[bo + 11] << 8)] +
+      x[i + 6] * bf16Table[u8[bo + 12] | (u8[bo + 13] << 8)] +
+      x[i + 7] * bf16Table[u8[bo + 14] | (u8[bo + 15] << 8)]
+    bo = bo + 16
+  }
+  for (; i < n; i = i + 1) {
     sum = sum + x[i] * bf16Table[u8[bo] | (u8[bo + 1] << 8)]
     bo = bo + 2
   }
@@ -3430,7 +3460,6 @@ function transformerLlama(token, pos, computeLogits) {
   var qDim = s.qDim
   var hiddenDim = s.hiddenDim
   var nLayers = s.nLayers
-  var nHeads = s.nHeads
   var nKvHeads = s.nKvHeads
   var invDim = s.invDim
   var kvMul = s.kvMul
@@ -3550,33 +3579,37 @@ function transformerLlama(token, pos, computeLogits) {
       )
     }
 
-    // Quantize Q to Q8_0 for integer attention (#15)
-    for (var h = 0; h < nHeads; h = h + 1) {
-      quantizeToQ8_0Cache(qArr, h * headSize, qQ8, qQ8i8, h * headBytesQ8, headSize)
-    }
+    // Quantize all Q heads to Q8_0 in one batch call (#15)
+    quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
     xbArr.fill(0, 0, qDim)
 
     // GQA-batched attention (#16) with Q8 scoring (#15)
+    // Loop reordered: position-first for K/V cache locality (#1)
     for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
       var kBase = loff + kvH * headSeqBytes
-      for (var mh = 0; mh < kvMul; mh = mh + 1) {
-        var h = kvH * kvMul + mh
-        var qHeadOff = h * headBytesQ8
-        var attOffset = h * seqLen
 
-        // Q8 attention scoring (attnScale fused in RoPE)
-        for (var t = 0; t <= pos; t = t + 1) {
-          sAtt[attOffset + t] = dotQ8_0_Q8_0Cache(
+      // Score all Q heads in this GQA group against all K positions
+      for (var t = 0; t <= pos; t = t + 1) {
+        var kOff = kBase + t * headBytesQ8
+        for (var mh = 0; mh < kvMul; mh = mh + 1) {
+          var h = kvH * kvMul + mh
+          sAtt[h * seqLen + t] = dotQ8_0_Q8_0Cache(
             qQ8,
             qQ8i8,
-            qHeadOff,
+            h * headBytesQ8,
             keyCache,
             keyCacheInt8,
-            kBase + t * headBytesQ8,
+            kOff,
             headSize
           )
         }
+      }
+
+      // Softmax + value accumulation per Q head
+      for (var mh = 0; mh < kvMul; mh = mh + 1) {
+        var h = kvH * kvMul + mh
+        var attOffset = h * seqLen
 
         // Softmax
         var softmaxEnd = attOffset + pos
@@ -3597,7 +3630,7 @@ function transformerLlama(token, pos, computeLogits) {
           sAtt[i] = sAtt[i] * invSum
         }
 
-        // Value accumulation
+        // Value accumulation - position-first for V cache locality
         var xbOffset = h * headSize
         for (var t = 0; t <= pos; t = t + 1) {
           accumQ8_0Cache(
@@ -3794,10 +3827,8 @@ function transformerGemma(token, pos, computeLogits) {
       )
     }
 
-    // Quantize Q to Q8_0 for integer attention (#15)
-    for (var h = 0; h < nHeads; h = h + 1) {
-      quantizeToQ8_0Cache(qArr, h * headSize, qQ8, qQ8i8, h * headBytesQ8, headSize)
-    }
+    // Quantize all Q heads to Q8_0 in one batch call (#15)
+    quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
     xbArr.fill(0, 0, qDim)
 
@@ -3809,25 +3840,31 @@ function transformerGemma(token, pos, computeLogits) {
         : 0
 
     // GQA-batched attention (#16) with Q8 scoring (#15)
+    // Loop reordered: position-first for K/V cache locality (#1)
     for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
       var kBase = loff + kvH * headSeqBytes
-      for (var mh = 0; mh < kvMul; mh = mh + 1) {
-        var h = kvH * kvMul + mh
-        var qHeadOff = h * headBytesQ8
-        var attOffset = h * seqLen
 
-        // Q8 attention scoring (attnScale fused in RoPE)
-        for (var t = startT; t <= pos; t = t + 1) {
-          sAtt[attOffset + t] = dotQ8_0_Q8_0Cache(
+      // Score all Q heads in this GQA group against all K positions
+      for (var t = startT; t <= pos; t = t + 1) {
+        var kOff = kBase + t * headBytesQ8
+        for (var mh = 0; mh < kvMul; mh = mh + 1) {
+          var h = kvH * kvMul + mh
+          sAtt[h * seqLen + t] = dotQ8_0_Q8_0Cache(
             qQ8,
             qQ8i8,
-            qHeadOff,
+            h * headBytesQ8,
             keyCache,
             keyCacheInt8,
-            kBase + t * headBytesQ8,
+            kOff,
             headSize
           )
         }
+      }
+
+      // Softmax + value accumulation per Q head
+      for (var mh = 0; mh < kvMul; mh = mh + 1) {
+        var h = kvH * kvMul + mh
+        var attOffset = h * seqLen
 
         // Softmax
         var softmaxStart = attOffset + startT
@@ -3849,7 +3886,7 @@ function transformerGemma(token, pos, computeLogits) {
           sAtt[i] = sAtt[i] * invSum
         }
 
-        // Value accumulation
+        // Value accumulation - position-first for V cache locality
         var xbOffset = h * headSize
         for (var t = startT; t <= pos; t = t + 1) {
           accumQ8_0Cache(
