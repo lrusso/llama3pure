@@ -65,6 +65,23 @@ Read the GGUF file into an ArrayBuffer and pass it to `llama3pure` with `type: "
 
 ```javascript
 import llama3pure from "./llama3pure-js-engine.js"
+import fs from "fs"
+
+const readFileToArrayBuffer = (filePath) => {
+  const fd = fs.openSync(filePath, "r")
+  const fileSize = fs.fstatSync(fd).size
+  const arrayBuffer = new ArrayBuffer(fileSize)
+  const fileUint8 = new Uint8Array(arrayBuffer)
+  const chunkSize = 256 * 1024 * 1024
+  let pos = 0
+  while (pos < fileSize) {
+    const toRead = Math.min(chunkSize, fileSize - pos)
+    fs.readSync(fd, fileUint8, pos, toRead, pos)
+    pos = pos + toRead
+  }
+  fs.closeSync(fd)
+  return arrayBuffer
+}
 
 llama3pure({
   type: "load",
@@ -81,17 +98,17 @@ llama3pure({
 })
 ```
 
-| Parameter    |   Type   | Required | Description                                                                                             |         Default Value          |
-| :----------- | :------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
-| type         |  string  |   Yes    | Must be `load`                                                                                          |               -                |
-| model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                     |               -                |
-| cbRender     | function |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
-| systemPrompt |  string  |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
-| contextSize  |  number  |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
-| temperature  |  number  |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
-| topP         |  number  |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
-| topK         |  number  |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
+| Parameter    |    Type     | Required | Description                                                                                             |         Default Value          |
+| :----------- | :---------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
+| type         |   string    |   Yes    | Must be `load`                                                                                          |               -                |
+| model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                           |               -                |
+| cbRender     |  function   |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
+| systemPrompt |   string    |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
+| maxTokens    |   number    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| contextSize  |   number    |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
+| temperature  |   number    |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
+| topP         |   number    |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
+| topK         |   number    |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
 
 - Step 2: Generate a response
 
