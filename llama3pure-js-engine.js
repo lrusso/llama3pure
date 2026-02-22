@@ -3053,26 +3053,7 @@ function readGGUFValue(type) {
 // ----------------------------------------------------------------------------
 // Model loading
 
-function loadModel(modelInput, fileSystem) {
-  var arrayBuffer
-  if (modelInput instanceof ArrayBuffer) {
-    arrayBuffer = modelInput
-  } else {
-    // Read file into ArrayBuffer (supports large files via chunked reads)
-    var fd = fileSystem.openSync(modelInput, "r")
-    var fileSize = fileSystem.fstatSync(fd).size
-    arrayBuffer = new ArrayBuffer(fileSize)
-    var fileUint8 = new Uint8Array(arrayBuffer)
-    var chunkSize = 256 * 1024 * 1024
-    var pos = 0
-    while (pos < fileSize) {
-      var toRead = Math.min(chunkSize, fileSize - pos)
-      fileSystem.readSync(fd, fileUint8, pos, toRead, pos)
-      pos = pos + toRead
-    }
-    fileSystem.closeSync(fd)
-  }
-
+function loadModel(arrayBuffer) {
   // Reset vocab cache when loading a new model
   vocabTrie = null
   vocabMap = null
@@ -4775,17 +4756,9 @@ function llama3pure(data) {
         }
         if (data.model instanceof ArrayBuffer) {
           loadModel(data.model)
-        } else if (typeof data.model === "string") {
-          if (typeof data.fs !== "object" || data.fs === null) {
-            console.error(
-              "The fs parameter is required and must be the Node.js fs module."
-            )
-            return
-          }
-          loadModel(data.model, data.fs)
         } else {
           console.error(
-            "The model parameter is required and must be an ArrayBuffer or a string."
+            "The model parameter is required and must be an ArrayBuffer."
           )
           return
         }

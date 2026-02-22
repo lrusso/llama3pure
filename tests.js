@@ -56,6 +56,22 @@ const models = [
   "Meta-Llama-3-8B-Instruct-fp16.gguf",
 ]
 
+const readFileToArrayBuffer = (filePath) => {
+  const fd = fs.openSync(filePath, "r")
+  const fileSize = fs.fstatSync(fd).size
+  const arrayBuffer = new ArrayBuffer(fileSize)
+  const fileUint8 = new Uint8Array(arrayBuffer)
+  const chunkSize = 256 * 1024 * 1024
+  let pos = 0
+  while (pos < fileSize) {
+    const toRead = Math.min(chunkSize, fileSize - pos)
+    fs.readSync(fd, fileUint8, pos, toRead, pos)
+    pos = pos + toRead
+  }
+  fs.closeSync(fd)
+  return arrayBuffer
+}
+
 const testModelUsingC = (model) => {
   try {
     execSync(
@@ -75,8 +91,7 @@ const testModelUsingNode = (model) => {
 
   llama3pure({
     type: "load",
-    model: modelPath,
-    fs: fs,
+    model: readFileToArrayBuffer(modelPath),
     maxTokens: -1,
     contextSize: 2048,
     cbRender: function (token) {
