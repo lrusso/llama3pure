@@ -61,14 +61,14 @@ Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/mai
 
 - Step 1: Load a model
 
-Call `llama3pure` with `type: "load"` to load a GGUF model file and configure the engine.
+Read the GGUF file into an ArrayBuffer and pass it to `llama3pure` with `type: "load"`.
 
 ```javascript
-import llama3pure from "./llama3pure-nodejs-engine.js"
+import llama3pure from "./llama3pure-js-engine.js"
 
 llama3pure({
   type: "load",
-  model: "/path/to/your-model.gguf",
+  model: readFileToArrayBuffer("/path/to/your-model.gguf"),
   cbRender: (token) => {
     process.stdout.write(token)
   },
@@ -84,7 +84,7 @@ llama3pure({
 | Parameter    |   Type   | Required | Description                                                                                             |         Default Value          |
 | :----------- | :------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
 | type         |  string  |   Yes    | Must be `load`                                                                                          |               -                |
-| model        |  string  |   Yes    | Absolute path to a GGUF model file.                                                                     |               -                |
+| model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                     |               -                |
 | cbRender     | function |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
 | systemPrompt |  string  |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
 | maxTokens    |  number  |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
