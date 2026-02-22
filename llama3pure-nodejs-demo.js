@@ -1,6 +1,7 @@
-import llama3pure from "./llama3pure-nodejs-engine.js"
+import llama3pure from "./llama3pure-js-engine.js"
 import { fileURLToPath } from "url"
 import path from "path"
+import fs from "fs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -11,6 +12,7 @@ const main = () => {
   llama3pure({
     type: "load",
     model: modelPath,
+    fs: fs,
     cbRender: (token) => {
       process.stdout.write(token)
     },

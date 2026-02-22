@@ -184,7 +184,7 @@
           worker.terminate()
         }
 
-        worker = new Worker("llama3pure-web-engine.js")
+        worker = new Worker("llama3pure-web-engine.js", { type: "module" })
 
         worker.addEventListener("message", function (e) {
           var data = e.data
