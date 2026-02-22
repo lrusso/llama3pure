@@ -2947,10 +2947,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         float* rope_sin = s->rope_sin_layer[l] + rope_base;
 
         if (p->is_gemma3) {
-            // NEOX RoPE: rotate dimension i with dimension i + half
-            // Fused with attention scaling (1/sqrt(head_dim)) to avoid separate Q scaling loop
+            // Fused RoPE + Q attention scaling
             float attn_scale_fused = s->attn_scale;
-            // Apply to Q (all heads) - fused with attention scaling
             for (int h = 0; h < p->n_heads; h++) {
                 float* q_head = s->q + h * head_size;
                 for (int i = 0; i < half; i++) {
@@ -2962,7 +2960,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                     q_head[i + half] = (v0 * fci + v1 * fcr) * attn_scale_fused;
                 }
             }
-            // Apply to K (kv heads) - no scaling needed for K
             for (int h = 0; h < p->n_kv_heads; h++) {
                 float* k_head = s->k + h * head_size;
                 for (int i = 0; i < half; i++) {
@@ -2975,23 +2972,24 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 }
             }
         } else {
-            // Standard RoPE: rotate consecutive pairs (i, i+1)
+            // RoPE with fused attnScale on Q (#18)
+            float attn_scale_fused = s->attn_scale;
             for (int i = 0; i < q_dim; i += 2) {
                 int head_dim_idx = (i % head_size) / 2;  // index into rope_freqs
                 float fcr = rope_cos[head_dim_idx];
                 float fci = rope_sin[head_dim_idx];
-                int rotn = i < kv_dim ? 2 : 1;  // how many vectors? 2 = q and k, 1 = q only
-                for (int v = 0; v < rotn; v++) {
-                    float* vec = v == 0 ? s->q : s->k;
-                    float v0 = vec[i];
-                    float v1 = vec[i + 1];
-                    vec[i]     = v0 * fcr - v1 * fci;
-                    vec[i + 1] = v0 * fci + v1 * fcr;
+                float v0 = s->q[i];
+                float v1 = s->q[i + 1];
+                s->q[i]     = (v0 * fcr - v1 * fci) * attn_scale_fused;
+                s->q[i + 1] = (v0 * fci + v1 * fcr) * attn_scale_fused;
+                if (i < kv_dim) {
+                    float k0 = s->k[i];
+                    float k1 = s->k[i + 1];
+                    s->k[i]     = k0 * fcr - k1 * fci;
+                    s->k[i + 1] = k0 * fci + k1 * fcr;
                 }
             }
         }
-
-        // Gemma3: Q attention scaling is fused into the RoPE loop above
 
         // save key,value at this time step (pos) to our kv cache (Q8_0 quantized)
         // Per-head layout: [layer][kv_head][position][head_data]
@@ -3010,8 +3008,6 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         memset(s->xb, 0, q_dim * sizeof(float));
 
-        // Pre-select attention scale: 1.0 for Gemma3 (already scaled in RoPE), actual scale for others
-        float attn_scale_score = p->is_gemma3 ? 1.0f : s->attn_scale;
         // SWA: limit attention to sliding window for SWA layers (Gemma3)
         int start_t = 0;
         if (p->is_gemma3 && is_swa_layer && p->swa_window > 0) {
@@ -3038,7 +3034,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                     int qOff = h * head_q8_bytes;
                     s->att[s->head_att_offsets[h] + t - start_t] =
                         dot_q8_0_q8_0_cache(s->qQ8 + qOff, s->qQ8i8 + qOff,
-                            kQ8, kI8, head_size) * attn_scale_score;
+                            kQ8, kI8, head_size);
                 }
             }
 
