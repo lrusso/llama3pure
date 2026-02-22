@@ -8,7 +8,7 @@ const __dirname = path.dirname(__filename)
 
 const modelPath = path.resolve(__dirname, "gemma-3-270m-it-Q8_0.gguf")
 
-const readFileToArrayBuffer = (filePath) => {
+const readFileAsArrayBuffer = (filePath) => {
   const fd = fs.openSync(filePath, "r")
   const fileSize = fs.fstatSync(fd).size
   const arrayBuffer = new ArrayBuffer(fileSize)
@@ -27,7 +27,7 @@ const readFileToArrayBuffer = (filePath) => {
 const main = () => {
   llama3pure({
     type: "load",
-    model: readFileToArrayBuffer(modelPath),
+    model: readFileAsArrayBuffer(modelPath),
     cbRender: (token) => {
       process.stdout.write(token)
     },

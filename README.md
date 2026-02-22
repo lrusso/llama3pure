@@ -67,7 +67,7 @@ Read the GGUF file into an ArrayBuffer and pass it to `llama3pure` with `type: "
 import llama3pure from "./llama3pure-js-engine.js"
 import fs from "fs"
 
-const readFileToArrayBuffer = (filePath) => {
+const readFileAsArrayBuffer = (filePath) => {
   const fd = fs.openSync(filePath, "r")
   const fileSize = fs.fstatSync(fd).size
   const arrayBuffer = new ArrayBuffer(fileSize)
@@ -85,7 +85,7 @@ const readFileToArrayBuffer = (filePath) => {
 
 llama3pure({
   type: "load",
-  model: readFileToArrayBuffer("/path/to/your-model.gguf"),
+  model: readFileAsArrayBuffer("/path/to/your-model.gguf"),
   cbRender: (token) => {
     process.stdout.write(token)
   },
