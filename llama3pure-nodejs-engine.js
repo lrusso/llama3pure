@@ -4774,6 +4774,9 @@ function llama3pure(data) {
         }
         cbRender = data.cbRender
         loadModel(data.model)
+        postMessage({
+          type: "loaded",
+        })
         break
 
       case "generate":
