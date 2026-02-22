@@ -1,8 +1,9 @@
-import llama3pure from "./llama3pure-nodejs-engine.js"
+import llama3pure from "./llama3pure-js-engine.js"
 import { execSync } from "child_process"
 import { fileURLToPath } from "url"
 import { existsSync } from "fs"
 import path from "path"
+import fs from "fs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -75,6 +76,7 @@ const testModelUsingNode = (model) => {
   llama3pure({
     type: "load",
     model: modelPath,
+    fs: fs,
     maxTokens: -1,
     contextSize: 2048,
     cbRender: function (token) {
