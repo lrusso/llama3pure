@@ -22,6 +22,12 @@ Supports GGUF file format with various quantization types.
 #include <math.h>
 #include <string.h>
 #include <fcntl.h>
+#ifdef _OPENMP
+#include <omp.h>
+#else
+#define omp_get_thread_num() 0
+#define omp_get_max_threads() 1
+#endif
 #if defined _WIN32
     #include <windows.h>
     #include <io.h>
@@ -224,6 +230,7 @@ typedef struct {
 // Actual typed versions (vec_dot_q8_func, vec_dot_func) defined later
 typedef float (*cached_q8_func)(const block_q8_0*, const void*, int);
 typedef float (*cached_dot_func)(const float*, const void*, int);
+typedef void (*deq_row_func)(const void* src, float* dst, int k);
 
 // Quantized tensor - keeps weights in compressed form
 typedef struct {
@@ -236,6 +243,7 @@ typedef struct {
     size_t row_size;                // bytes per row (precomputed)
     cached_q8_func q8_func;        // cached Q8_0 input dot function
     cached_dot_func dot_func;      // cached float input dot function
+    deq_row_func deq_func;        // cached dequantize-row function (Q8_0 + K-quants)
 } QuantizedTensor;
 
 typedef struct {
@@ -1482,6 +1490,10 @@ static inline float vec_dot_f32(const float* x, const void* w, int n) {
 // Global Q8_0 buffer for quantized input (allocated once, reused per matmul)
 static block_q8_0* q8_buf = NULL;
 
+// Per-thread dequantize buffer for 4-row matmul (4 * max_cols floats per thread)
+static float* deq_buf = NULL;
+static int deq_buf_stride = 0;
+
 // Quantize a float vector to Q8_0 format
 static void quantize_row_q8_0(const float* x, block_q8_0* y, int n) {
     int nb = n / QK8_0;
@@ -2036,6 +2048,20 @@ static inline vec_dot_func get_vec_dot_func(enum ggml_type type) {
     }
 }
 
+// Get the appropriate dequantize-row function for a quantization type
+// Returns NULL for types that don't have row dequantizers (Q4_0, Q5_0, IQ4_NL, F16, etc.)
+static inline deq_row_func get_deq_row_func(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q8_0: return dequantize_row_q8_0;
+        case GGML_TYPE_Q2_K: return dequantize_row_q2_K;
+        case GGML_TYPE_Q3_K: return dequantize_row_q3_K;
+        case GGML_TYPE_Q4_K: return dequantize_row_q4_K;
+        case GGML_TYPE_Q5_K: return dequantize_row_q5_K;
+        case GGML_TYPE_Q6_K: return dequantize_row_q6_K;
+        default:             return NULL;
+    }
+}
+
 // Get row size in bytes for a quantized type
 static inline size_t get_row_size(int n_cols, enum ggml_type type) {
     int block_size = get_block_size(type);
@@ -2043,11 +2069,22 @@ static inline size_t get_row_size(int n_cols, enum ggml_type type) {
     return (n_cols / block_size) * type_size;
 }
 
+// Forward declarations for optimized matmul variants (defined after matmul_quantized)
+void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw);
+void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
+                           int batch_size, int in_stride, int out_stride);
+
 // Fused quantized matrix-vector multiplication
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
 // Uses Q8_0 quantized input path when available for integer dot products
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
+    // Dequantize-then-4row path (Q8_0 + K-quants)
+    if (qw->deq_func && deq_buf) {
+        matmul_deq_4row(xout, x, qw);
+        return;
+    }
+
     int d = qw->rows;
     int n = qw->cols;
     size_t row_size = qw->row_size;  // use cached row_size
@@ -2085,6 +2122,144 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 }
 
+// Optimized single-token matmul: dequantize 4 weight rows, flat dot product sharing x reads
+void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    deq_row_func dfunc = qw->deq_func;
+
+    int ngroups = d / 4;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 4;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+
+        dfunc(data + (size_t)i * row_size, buf, n);
+        dfunc(data + (size_t)(i + 1) * row_size, buf + n, n);
+        dfunc(data + (size_t)(i + 2) * row_size, buf + 2 * n, n);
+        dfunc(data + (size_t)(i + 3) * row_size, buf + 3 * n, n);
+
+        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        for (int j = 0; j < n; j++) {
+            float xj = x[j];
+            s0 += buf[j] * xj;
+            s1 += buf[n + j] * xj;
+            s2 += buf[2 * n + j] * xj;
+            s3 += buf[3 * n + j] * xj;
+        }
+        xout[i] = s0;
+        xout[i + 1] = s1;
+        xout[i + 2] = s2;
+        xout[i + 3] = s3;
+    }
+
+    for (int r = ngroups * 4; r < d; r++) {
+        float* buf = deq_buf;
+        dfunc(data + (size_t)r * row_size, buf, n);
+        float s = 0;
+        for (int j = 0; j < n; j++) s += buf[j] * x[j];
+        xout[r] = s;
+    }
+}
+
+// Optimized batch matmul: dequantize 4 rows once, 3-batch sharing dot product (12 chains)
+void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
+                           int batch_size, int in_stride, int out_stride) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    deq_row_func dfunc = qw->deq_func;
+
+    int ngroups = d / 4;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 4;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+
+        dfunc(data + (size_t)i * row_size, buf, n);
+        dfunc(data + (size_t)(i + 1) * row_size, buf + n, n);
+        dfunc(data + (size_t)(i + 2) * row_size, buf + 2 * n, n);
+        dfunc(data + (size_t)(i + 3) * row_size, buf + 3 * n, n);
+
+        int b = 0;
+        for (; b + 2 < batch_size; b += 3) {
+            const float* x0 = x + b * in_stride;
+            const float* x1 = x + (b + 1) * in_stride;
+            const float* x2 = x + (b + 2) * in_stride;
+            float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            float t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+            float u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+            for (int j = 0; j < n; j++) {
+                float b0 = buf[j], b1 = buf[n + j], b2 = buf[2 * n + j], b3 = buf[3 * n + j];
+                float v0 = x0[j], v1 = x1[j], v2 = x2[j];
+                s0 += b0 * v0; s1 += b1 * v0; s2 += b2 * v0; s3 += b3 * v0;
+                t0 += b0 * v1; t1 += b1 * v1; t2 += b2 * v1; t3 += b3 * v1;
+                u0 += b0 * v2; u1 += b1 * v2; u2 += b2 * v2; u3 += b3 * v2;
+            }
+            xout[b * out_stride + i] = s0;
+            xout[b * out_stride + i + 1] = s1;
+            xout[b * out_stride + i + 2] = s2;
+            xout[b * out_stride + i + 3] = s3;
+            xout[(b + 1) * out_stride + i] = t0;
+            xout[(b + 1) * out_stride + i + 1] = t1;
+            xout[(b + 1) * out_stride + i + 2] = t2;
+            xout[(b + 1) * out_stride + i + 3] = t3;
+            xout[(b + 2) * out_stride + i] = u0;
+            xout[(b + 2) * out_stride + i + 1] = u1;
+            xout[(b + 2) * out_stride + i + 2] = u2;
+            xout[(b + 2) * out_stride + i + 3] = u3;
+        }
+
+        for (; b < batch_size; b++) {
+            const float* xb = x + b * in_stride;
+            float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+            for (int j = 0; j < n; j++) {
+                float bv = xb[j];
+                s0 += buf[j] * bv;
+                s1 += buf[n + j] * bv;
+                s2 += buf[2 * n + j] * bv;
+                s3 += buf[3 * n + j] * bv;
+            }
+            xout[b * out_stride + i] = s0;
+            xout[b * out_stride + i + 1] = s1;
+            xout[b * out_stride + i + 2] = s2;
+            xout[b * out_stride + i + 3] = s3;
+        }
+    }
+
+    for (int r = ngroups * 4; r < d; r++) {
+        float* buf = deq_buf;
+        dfunc(data + (size_t)r * row_size, buf, n);
+        int b = 0;
+        for (; b + 2 < batch_size; b += 3) {
+            const float* x0 = x + b * in_stride;
+            const float* x1 = x + (b + 1) * in_stride;
+            const float* x2 = x + (b + 2) * in_stride;
+            float s = 0, t = 0, u = 0;
+            for (int j = 0; j < n; j++) {
+                float bv = buf[j];
+                s += bv * x0[j];
+                t += bv * x1[j];
+                u += bv * x2[j];
+            }
+            xout[b * out_stride + r] = s;
+            xout[(b + 1) * out_stride + r] = t;
+            xout[(b + 2) * out_stride + r] = u;
+        }
+        for (; b < batch_size; b++) {
+            const float* xb = x + b * in_stride;
+            float s = 0;
+            for (int j = 0; j < n; j++) s += buf[j] * xb[j];
+            xout[b * out_stride + r] = s;
+        }
+    }
+}
+
 // Quantized matmul using pre-quantized input (avoids redundant quantization)
 // Call quantize_row_q8_0(x, q8_buf, n) once, then call this for multiple weight matrices
 void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
@@ -2106,6 +2281,12 @@ void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
 void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* qw,
                             int batch_size, int in_stride, int out_stride,
                             block_q8_0* q8_bufs, int q8_stride) {
+    // Dequantize-then-4row-batch path (Q8_0 + K-quants)
+    if (qw->deq_func && deq_buf) {
+        matmul_deq_batch_4row(xout, x, qw, batch_size, in_stride, out_stride);
+        return;
+    }
+
     int d = qw->rows;
     int n = qw->cols;
     size_t row_size = qw->row_size;
@@ -2701,6 +2882,7 @@ int load_tensor_quantized(GGUFFile* gguf, const char* name, QuantizedTensor* qt,
     qt->row_size = get_row_size(cols, tensor->type);
     qt->q8_func = get_vec_dot_q8_func(tensor->type);
     qt->dot_func = get_vec_dot_func(tensor->type);
+    qt->deq_func = get_deq_row_func(tensor->type);
 
     return 1;
 }
@@ -2858,6 +3040,7 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
         w->wcls.row_size = get_row_size(p->dim, w->token_embedding_type);
         w->wcls.q8_func = get_vec_dot_q8_func(w->token_embedding_type);
         w->wcls.dot_func = get_vec_dot_func(w->token_embedding_type);
+        w->wcls.deq_func = get_deq_row_func(w->token_embedding_type);
     }
 
     return 1;
@@ -3000,7 +3183,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
         // qkv matmuls for this position - using quantized weights
         // Quantize input once and reuse for Q, K, V (avoids 2 redundant quantizations)
-        if (w->wq[l].q8_func && q8_buf) {
+        if (w->wq[l].q8_func && q8_buf && !w->wq[l].deq_func) {
             quantize_row_q8_0(s->xb, q8_buf, w->wq[l].cols);
             matmul_quantized_preq8(s->q, &w->wq[l]);
             matmul_quantized_preq8(s->k, &w->wk[l]);
@@ -3157,7 +3340,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x) - using quantized weights
         // Quantize input once and reuse for gate and up (avoids 1 redundant quantization)
-        if (w->w1[l].q8_func && q8_buf) {
+        if (w->w1[l].q8_func && q8_buf && !w->w1[l].deq_func) {
             quantize_row_q8_0(s->xb, q8_buf, w->w1[l].cols);
             matmul_quantized_preq8(s->hb, &w->w1[l]);
             matmul_quantized_preq8(s->hb2, &w->w3[l]);
@@ -4872,6 +5055,11 @@ int main(int argc, char *argv[]) {
         if (config.hidden_dim > max_input) max_input = config.hidden_dim;
         int q8_buf_size = (max_input + QK8_0 - 1) / QK8_0;
         q8_buf = (block_q8_0*)calloc(q8_buf_size, sizeof(block_q8_0));
+
+        // Per-thread dequantize buffer: 4 rows * max_cols floats per thread
+        int num_threads = omp_get_max_threads();
+        deq_buf_stride = 4 * max_input;
+        deq_buf = (float*)calloc((size_t)num_threads * deq_buf_stride, sizeof(float));
     }
 
     // Pre-allocate top-k sampling buffers (avoids repeated stack allocation per token)
@@ -4994,6 +5182,7 @@ cleanup:
     // Cleanup (safe to call on NULL - all globals are zero-initialized)
     free_run_state(&state);
     free(q8_buf);
+    free(deq_buf);
     free_tokenizer();
     free(trie_pool);
 
