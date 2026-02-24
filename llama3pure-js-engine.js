@@ -1178,6 +1178,259 @@ function dequantizeQ6_K(srcOffset, dst, dstOffset, count) {
   }
 }
 
+// Row-dequantize functions for K-quant types
+// These use local typed array views (passed as params) instead of getUint8ArrayAt
+// to avoid allocating new views on each call in the hot matmul path.
+// off = offset within local view to start of this row's data
+
+function deqRowQ2_K(u8, off, dst, dstOff, cols) {
+  var nb = cols >> 8
+  for (var i = 0; i < nb; i = i + 1) {
+    var bo = off + i * 84
+    var scOff = bo
+    var qsOff = bo + 16
+    var dOffset = bo + 80
+    var d = fp16ToFp32(u8[dOffset] | (u8[dOffset + 1] << 8))
+    var dmin = fp16ToFp32(u8[dOffset + 2] | (u8[dOffset + 3] << 8))
+    var y = dstOff + i * 256
+    var is = 0
+    var qIdx = 0
+    for (var n = 0; n < 256; n = n + 128) {
+      var shift = 0
+      for (var j = 0; j < 4; j = j + 1) {
+        var sc = u8[scOff + is]
+        is = is + 1
+        var dl = d * (sc & 0xf)
+        var ml = dmin * (sc >> 4)
+        for (var l = 0; l < 16; l = l + 1) {
+          dst[y] = dl * ((u8[qsOff + qIdx + l] >> shift) & 3) - ml
+          y = y + 1
+        }
+        sc = u8[scOff + is]
+        is = is + 1
+        dl = d * (sc & 0xf)
+        ml = dmin * (sc >> 4)
+        for (var l = 0; l < 16; l = l + 1) {
+          dst[y] = dl * ((u8[qsOff + qIdx + l + 16] >> shift) & 3) - ml
+          y = y + 1
+        }
+        shift = shift + 2
+      }
+      qIdx = qIdx + 32
+    }
+  }
+}
+
+function deqRowQ3_K(u8, off, dst, dstOff, cols) {
+  var nb = cols >> 8
+  var kmask1 = 0x03030303
+  var kmask2 = 0x0f0f0f0f
+  var scales = q3kScales
+  for (var i = 0; i < nb; i = i + 1) {
+    var bo = off + i * 110
+    var hmOff = bo
+    var qsOff = bo + 32
+    var scRawOff = bo + 96
+    var dOffset = bo + 108
+    var d_all = fp16ToFp32(u8[dOffset] | (u8[dOffset + 1] << 8))
+    var aux0 =
+      u8[scRawOff] |
+      (u8[scRawOff + 1] << 8) |
+      (u8[scRawOff + 2] << 16) |
+      (u8[scRawOff + 3] << 24)
+    var aux1 =
+      u8[scRawOff + 4] |
+      (u8[scRawOff + 5] << 8) |
+      (u8[scRawOff + 6] << 16) |
+      (u8[scRawOff + 7] << 24)
+    var aux2 =
+      u8[scRawOff + 8] |
+      (u8[scRawOff + 9] << 8) |
+      (u8[scRawOff + 10] << 16) |
+      (u8[scRawOff + 11] << 24)
+    var tmp = aux2
+    var s0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4)
+    var s1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4)
+    var s2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4)
+    var s3 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4)
+    scales[0] = s0 & 0xff
+    scales[1] = (s0 >> 8) & 0xff
+    scales[2] = (s0 >> 16) & 0xff
+    scales[3] = (s0 >> 24) & 0xff
+    scales[4] = s1 & 0xff
+    scales[5] = (s1 >> 8) & 0xff
+    scales[6] = (s1 >> 16) & 0xff
+    scales[7] = (s1 >> 24) & 0xff
+    scales[8] = s2 & 0xff
+    scales[9] = (s2 >> 8) & 0xff
+    scales[10] = (s2 >> 16) & 0xff
+    scales[11] = (s2 >> 24) & 0xff
+    scales[12] = s3 & 0xff
+    scales[13] = (s3 >> 8) & 0xff
+    scales[14] = (s3 >> 16) & 0xff
+    scales[15] = (s3 >> 24) & 0xff
+    for (var si = 0; si < 16; si = si + 1) {
+      if (scales[si] > 127) {
+        scales[si] = scales[si] - 256
+      }
+    }
+    var y = dstOff + i * 256
+    var is = 0
+    var m = 1
+    var qIdx = 0
+    for (var n = 0; n < 256; n = n + 128) {
+      var shift = 0
+      for (var j = 0; j < 4; j = j + 1) {
+        var dl = d_all * (scales[is] - 32)
+        is = is + 1
+        for (var l = 0; l < 16; l = l + 1) {
+          var q = (u8[qsOff + qIdx + l] >> shift) & 3
+          var h = u8[hmOff + l] & m ? 0 : 4
+          dst[y] = dl * (q - h)
+          y = y + 1
+        }
+        dl = d_all * (scales[is] - 32)
+        is = is + 1
+        for (var l = 0; l < 16; l = l + 1) {
+          var q = (u8[qsOff + qIdx + l + 16] >> shift) & 3
+          var h = u8[hmOff + l + 16] & m ? 0 : 4
+          dst[y] = dl * (q - h)
+          y = y + 1
+        }
+        shift = shift + 2
+        m <<= 1
+      }
+      qIdx = qIdx + 32
+    }
+  }
+}
+
+function deqRowQ4_K(u8, off, dst, dstOff, cols) {
+  var nb = cols >> 8
+  for (var i = 0; i < nb; i = i + 1) {
+    var bo = off + i * 144
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
+    var scOff = bo + 4
+    var qsOff = bo + 16
+    var is = 0
+    var y = dstOff + i * 256
+    for (var j = 0; j < 256; j = j + 64) {
+      var sc
+      var m
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d1 = d * sc
+      var m1 = dmin * m
+      is = is + 1
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d2 = d * sc
+      var m2 = dmin * m
+      is = is + 1
+      var qIdx = j / 2
+      for (var l = 0; l < 32; l = l + 1) {
+        var qByte = u8[qsOff + qIdx + l]
+        dst[y + j + l] = d1 * (qByte & 0xf) - m1
+        dst[y + j + l + 32] = d2 * (qByte >> 4) - m2
+      }
+    }
+  }
+}
+
+function deqRowQ5_K(u8, off, dst, dstOff, cols) {
+  var nb = cols >> 8
+  for (var i = 0; i < nb; i = i + 1) {
+    var bo = off + i * 176
+    var d = fp16ToFp32(u8[bo] | (u8[bo + 1] << 8))
+    var dmin = fp16ToFp32(u8[bo + 2] | (u8[bo + 3] << 8))
+    var scOff = bo + 4
+    var qhOff = bo + 16
+    var qlOff = bo + 48
+    var y = dstOff + i * 256
+    var is = 0
+    var u1 = 1
+    var u2 = 2
+    var qlIdx = 0
+    for (var j = 0; j < 256; j = j + 64) {
+      var sc
+      var m
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d1 = d * sc
+      var m1 = dmin * m
+      is = is + 1
+      if (is < 4) {
+        sc = u8[scOff + is] & 63
+        m = u8[scOff + is + 4] & 63
+      } else {
+        sc = (u8[scOff + is + 4] & 0xf) | ((u8[scOff + is - 4] >> 6) << 4)
+        m = (u8[scOff + is + 4] >> 4) | ((u8[scOff + is] >> 6) << 4)
+      }
+      var d2 = d * sc
+      var m2 = dmin * m
+      is = is + 1
+      for (var l = 0; l < 32; l = l + 1) {
+        dst[y + j + l] =
+          d1 * ((u8[qlOff + qlIdx + l] & 0xf) + (u8[qhOff + l] & u1 ? 16 : 0)) - m1
+      }
+      for (var l = 0; l < 32; l = l + 1) {
+        dst[y + j + l + 32] =
+          d2 * ((u8[qlOff + qlIdx + l] >> 4) + (u8[qhOff + l] & u2 ? 16 : 0)) - m2
+      }
+      qlIdx = qlIdx + 32
+      u1 <<= 2
+      u2 <<= 2
+    }
+  }
+}
+
+function deqRowQ6_K(u8, off, dst, dstOff, cols, i8) {
+  var nb = cols >> 8
+  for (var i = 0; i < nb; i = i + 1) {
+    var bo = off + i * 210
+    var qlOff = bo
+    var qhOff = bo + 128
+    var scalesOffset = bo + 192
+    var dOffset = bo + 208
+    var d = fp16ToFp32(u8[dOffset] | (u8[dOffset + 1] << 8))
+    var y = dstOff + i * 256
+    for (var n = 0; n < 256; n = n + 128) {
+      var qlBase = qlOff + (n >> 1)
+      var qhBase = qhOff + (n >> 2)
+      for (var l = 0; l < 32; l = l + 1) {
+        var is = l >> 4
+        var scBase = scalesOffset + (n >> 7) * 8
+        var q1 = ((u8[qlBase + l] & 0xf) | (((u8[qhBase + l] >> 0) & 3) << 4)) - 32
+        var q2 =
+          ((u8[qlBase + l + 32] & 0xf) | (((u8[qhBase + l] >> 2) & 3) << 4)) - 32
+        var q3 = ((u8[qlBase + l] >> 4) | (((u8[qhBase + l] >> 4) & 3) << 4)) - 32
+        var q4 =
+          ((u8[qlBase + l + 32] >> 4) | (((u8[qhBase + l] >> 6) & 3) << 4)) - 32
+        dst[y + n + l] = d * i8[scBase + is + 0] * q1
+        dst[y + n + l + 32] = d * i8[scBase + is + 2] * q2
+        dst[y + n + l + 64] = d * i8[scBase + is + 4] * q3
+        dst[y + n + l + 96] = d * i8[scBase + is + 6] * q4
+      }
+    }
+  }
+}
+
 function dequantizeIQ4_NL(srcOffset, dst, dstOffset, count) {
   var nb = count >> 5
   var blockSize = 2 + QK4_NL / 2
@@ -2693,6 +2946,23 @@ function getVecDotQ8Func(type) {
   }
 }
 
+function getDeqRowFunc(type) {
+  switch (type) {
+    case GGML_TYPE.Q2_K:
+      return deqRowQ2_K
+    case GGML_TYPE.Q3_K:
+      return deqRowQ3_K
+    case GGML_TYPE.Q4_K:
+      return deqRowQ4_K
+    case GGML_TYPE.Q5_K:
+      return deqRowQ5_K
+    case GGML_TYPE.Q6_K:
+      return deqRowQ6_K
+    default:
+      return null
+  }
+}
+
 function matmulQuantized(out, x, qw) {
   var rows = qw.rows
   var cols = qw.cols
@@ -2703,6 +2973,18 @@ function matmulQuantized(out, x, qw) {
   if (qw.type === GGML_TYPE.Q8_0) {
     // Per-matrix local views for better V8 bounds check elimination
     matmulQ8_0Local(out, x, qw.localU8, qw.localI8, rows, cols, rowSize)
+  } else if (qw.deqRowFunc) {
+    // K-quant: dequantize 4 rows at a time, flat dot product
+    matmulKQuantLocal(
+      out,
+      x,
+      qw.localU8,
+      qw.localI8,
+      rows,
+      cols,
+      rowSize,
+      qw.deqRowFunc
+    )
   } else if (dotQ8Func) {
     // Quantize x to Q8_0 once, then use integer dot products
     quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
@@ -2752,6 +3034,19 @@ function matmulQuantizedBatch(outs, xs, qw, batchSize) {
       cols,
       rowSize,
       batchSize
+    )
+  } else if (qw.deqRowFunc) {
+    // K-quant: dequantize 4 rows at a time, 3-batch sharing dot product
+    matmulKQuantLocalBatch(
+      outs,
+      xs,
+      qw.localU8,
+      qw.localI8,
+      rows,
+      cols,
+      rowSize,
+      batchSize,
+      qw.deqRowFunc
     )
   } else if (dotQ8Func) {
     var bQ8 = state.batchQ8
@@ -3166,6 +3461,245 @@ function matmulQ8_0Local(out, x, localU8, localI8, rows, cols, rowSize) {
     out[i + 1] = sum1
     out[i + 2] = sum2
     out[i + 3] = sum3
+  }
+}
+
+// K-quant matmul: dequantize 4 rows into buffer, then flat dot product
+function matmulKQuantLocal(out, x, localU8, localI8, rows, cols, rowSize, deqFunc) {
+  var buf = matmulDeqBuf
+  var rows4 = rows & ~3
+  var off1 = cols
+  var off2 = cols + cols
+  var off3 = off2 + cols
+  var cols4 = cols & ~3
+  for (var i = 0; i < rows4; i = i + 4) {
+    var bo = i * rowSize
+    deqFunc(localU8, bo, buf, 0, cols, localI8)
+    deqFunc(localU8, bo + rowSize, buf, off1, cols, localI8)
+    deqFunc(localU8, bo + rowSize + rowSize, buf, off2, cols, localI8)
+    deqFunc(localU8, bo + rowSize + rowSize + rowSize, buf, off3, cols, localI8)
+    var s0 = 0.0
+    var s1 = 0.0
+    var s2 = 0.0
+    var s3 = 0.0
+    for (var j = 0; j < cols4; j = j + 4) {
+      var a = x[j]
+      var b = x[j + 1]
+      var c = x[j + 2]
+      var d = x[j + 3]
+      s0 = s0 + a * buf[j] + b * buf[j + 1] + c * buf[j + 2] + d * buf[j + 3]
+      s1 =
+        s1 +
+        a * buf[off1 + j] +
+        b * buf[off1 + j + 1] +
+        c * buf[off1 + j + 2] +
+        d * buf[off1 + j + 3]
+      s2 =
+        s2 +
+        a * buf[off2 + j] +
+        b * buf[off2 + j + 1] +
+        c * buf[off2 + j + 2] +
+        d * buf[off2 + j + 3]
+      s3 =
+        s3 +
+        a * buf[off3 + j] +
+        b * buf[off3 + j + 1] +
+        c * buf[off3 + j + 2] +
+        d * buf[off3 + j + 3]
+    }
+    out[i] = s0
+    out[i + 1] = s1
+    out[i + 2] = s2
+    out[i + 3] = s3
+  }
+  for (var i = rows4; i < rows; i = i + 1) {
+    deqFunc(localU8, i * rowSize, buf, 0, cols, localI8)
+    var s = 0.0
+    for (var j = 0; j < cols4; j = j + 4) {
+      s =
+        s +
+        x[j] * buf[j] +
+        x[j + 1] * buf[j + 1] +
+        x[j + 2] * buf[j + 2] +
+        x[j + 3] * buf[j + 3]
+    }
+    out[i] = s
+  }
+}
+
+// K-quant batch matmul: dequantize 4 rows, then 3-batch sharing dot product
+function matmulKQuantLocalBatch(
+  outs,
+  xs,
+  localU8,
+  localI8,
+  rows,
+  cols,
+  rowSize,
+  batchSize,
+  deqFunc
+) {
+  var buf = matmulDeqBuf
+  var rows4 = rows & ~3
+  var off1 = cols
+  var off2 = cols + cols
+  var off3 = off2 + cols
+  var cols4 = cols & ~3
+  for (var i = 0; i < rows4; i = i + 4) {
+    // Dequantize 4 weight rows into the reusable Float64 buffer
+    var bo = i * rowSize
+    deqFunc(localU8, bo, buf, 0, cols, localI8)
+    deqFunc(localU8, bo + rowSize, buf, off1, cols, localI8)
+    deqFunc(localU8, bo + rowSize + rowSize, buf, off2, cols, localI8)
+    deqFunc(localU8, bo + rowSize + rowSize + rowSize, buf, off3, cols, localI8)
+    // Process 3 batch elements at a time, sharing buf reads (12 independent chains)
+    var batchTrips = batchSize - (batchSize % 3)
+    for (var batch = 0; batch < batchTrips; batch = batch + 3) {
+      var xA = xs[batch]
+      var xB = xs[batch + 1]
+      var xC = xs[batch + 2]
+      var s0 = 0.0
+      var s1 = 0.0
+      var s2 = 0.0
+      var s3 = 0.0
+      var t0 = 0.0
+      var t1 = 0.0
+      var t2 = 0.0
+      var t3 = 0.0
+      var u0 = 0.0
+      var u1 = 0.0
+      var u2 = 0.0
+      var u3 = 0.0
+      for (var j = 0; j < cols4; j = j + 4) {
+        var a = xA[j]
+        var b = xA[j + 1]
+        var c = xA[j + 2]
+        var d = xA[j + 3]
+        var e = xB[j]
+        var f = xB[j + 1]
+        var g = xB[j + 2]
+        var h = xB[j + 3]
+        var p = xC[j]
+        var q = xC[j + 1]
+        var r = xC[j + 2]
+        var v = xC[j + 3]
+        var w0 = buf[j]
+        var w1 = buf[j + 1]
+        var w2 = buf[j + 2]
+        var w3 = buf[j + 3]
+        s0 = s0 + a * w0 + b * w1 + c * w2 + d * w3
+        t0 = t0 + e * w0 + f * w1 + g * w2 + h * w3
+        u0 = u0 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off1 + j]
+        w1 = buf[off1 + j + 1]
+        w2 = buf[off1 + j + 2]
+        w3 = buf[off1 + j + 3]
+        s1 = s1 + a * w0 + b * w1 + c * w2 + d * w3
+        t1 = t1 + e * w0 + f * w1 + g * w2 + h * w3
+        u1 = u1 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off2 + j]
+        w1 = buf[off2 + j + 1]
+        w2 = buf[off2 + j + 2]
+        w3 = buf[off2 + j + 3]
+        s2 = s2 + a * w0 + b * w1 + c * w2 + d * w3
+        t2 = t2 + e * w0 + f * w1 + g * w2 + h * w3
+        u2 = u2 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off3 + j]
+        w1 = buf[off3 + j + 1]
+        w2 = buf[off3 + j + 2]
+        w3 = buf[off3 + j + 3]
+        s3 = s3 + a * w0 + b * w1 + c * w2 + d * w3
+        t3 = t3 + e * w0 + f * w1 + g * w2 + h * w3
+        u3 = u3 + p * w0 + q * w1 + r * w2 + v * w3
+      }
+      outs[batch][i] = s0
+      outs[batch][i + 1] = s1
+      outs[batch][i + 2] = s2
+      outs[batch][i + 3] = s3
+      outs[batch + 1][i] = t0
+      outs[batch + 1][i + 1] = t1
+      outs[batch + 1][i + 2] = t2
+      outs[batch + 1][i + 3] = t3
+      outs[batch + 2][i] = u0
+      outs[batch + 2][i + 1] = u1
+      outs[batch + 2][i + 2] = u2
+      outs[batch + 2][i + 3] = u3
+    }
+    // Handle remaining 1-2 batch elements one at a time
+    for (var batch = batchTrips; batch < batchSize; batch = batch + 1) {
+      var xArr = xs[batch]
+      var s0 = 0.0
+      var s1 = 0.0
+      var s2 = 0.0
+      var s3 = 0.0
+      for (var j = 0; j < cols4; j = j + 4) {
+        var a = xArr[j]
+        var b = xArr[j + 1]
+        var c = xArr[j + 2]
+        var d = xArr[j + 3]
+        s0 = s0 + a * buf[j] + b * buf[j + 1] + c * buf[j + 2] + d * buf[j + 3]
+        s1 =
+          s1 +
+          a * buf[off1 + j] +
+          b * buf[off1 + j + 1] +
+          c * buf[off1 + j + 2] +
+          d * buf[off1 + j + 3]
+        s2 =
+          s2 +
+          a * buf[off2 + j] +
+          b * buf[off2 + j + 1] +
+          c * buf[off2 + j + 2] +
+          d * buf[off2 + j + 3]
+        s3 =
+          s3 +
+          a * buf[off3 + j] +
+          b * buf[off3 + j + 1] +
+          c * buf[off3 + j + 2] +
+          d * buf[off3 + j + 3]
+      }
+      outs[batch][i] = s0
+      outs[batch][i + 1] = s1
+      outs[batch][i + 2] = s2
+      outs[batch][i + 3] = s3
+    }
+  }
+  // Handle remaining 1-3 rows
+  for (var i = rows4; i < rows; i = i + 1) {
+    deqFunc(localU8, i * rowSize, buf, 0, cols, localI8)
+    var batchTrips = batchSize - (batchSize % 3)
+    for (var batch = 0; batch < batchTrips; batch = batch + 3) {
+      var xA = xs[batch]
+      var xB = xs[batch + 1]
+      var xC = xs[batch + 2]
+      var s = 0.0
+      var t = 0.0
+      var u = 0.0
+      for (var j = 0; j < cols4; j = j + 4) {
+        var w0 = buf[j]
+        var w1 = buf[j + 1]
+        var w2 = buf[j + 2]
+        var w3 = buf[j + 3]
+        s = s + xA[j] * w0 + xA[j + 1] * w1 + xA[j + 2] * w2 + xA[j + 3] * w3
+        t = t + xB[j] * w0 + xB[j + 1] * w1 + xB[j + 2] * w2 + xB[j + 3] * w3
+        u = u + xC[j] * w0 + xC[j + 1] * w1 + xC[j + 2] * w2 + xC[j + 3] * w3
+      }
+      outs[batch][i] = s
+      outs[batch + 1][i] = t
+      outs[batch + 2][i] = u
+    }
+    for (var batch = batchTrips; batch < batchSize; batch = batch + 1) {
+      var xArr = xs[batch]
+      var s = 0.0
+      for (var j = 0; j < cols4; j = j + 4) {
+        s =
+          s +
+          xArr[j] * buf[j] +
+          xArr[j + 1] * buf[j + 1] +
+          xArr[j + 2] * buf[j + 2] +
+          xArr[j + 3] * buf[j + 3]
+      }
+      outs[batch][i] = s
+    }
   }
 }
 
@@ -3603,9 +4137,17 @@ function loadWeights(gguf) {
       rowSize: rs,
       dotFunc: getVecDotFunc(t.type),
       dotQ8Func: getVecDotQ8Func(t.type),
+      deqRowFunc: getDeqRowFunc(t.type),
     }
-    // Per-matrix typed array views for Q8_0 (helps V8 bounds check elimination)
-    if (t.type === GGML_TYPE.Q8_0) {
+    // Per-matrix typed array views for quantized types (helps V8 bounds check elimination)
+    if (
+      t.type === GGML_TYPE.Q8_0 ||
+      t.type === GGML_TYPE.Q2_K ||
+      t.type === GGML_TYPE.Q3_K ||
+      t.type === GGML_TYPE.Q4_K ||
+      t.type === GGML_TYPE.Q5_K ||
+      t.type === GGML_TYPE.Q6_K
+    ) {
       result.localU8 = new Uint8Array(ggufData, off, totalBytes)
       result.localI8 = new Int8Array(ggufData, off, totalBytes)
     }
@@ -3712,8 +4254,16 @@ function loadWeights(gguf) {
       rowSize: embRowSize,
       dotFunc: getVecDotFunc(embType),
       dotQ8Func: getVecDotQ8Func(embType),
+      deqRowFunc: getDeqRowFunc(embType),
     }
-    if (embType === GGML_TYPE.Q8_0) {
+    if (
+      embType === GGML_TYPE.Q8_0 ||
+      embType === GGML_TYPE.Q2_K ||
+      embType === GGML_TYPE.Q3_K ||
+      embType === GGML_TYPE.Q4_K ||
+      embType === GGML_TYPE.Q5_K ||
+      embType === GGML_TYPE.Q6_K
+    ) {
       w.wcls.localU8 = new Uint8Array(ggufData, embOff, embTotalBytes)
       w.wcls.localI8 = new Int8Array(ggufData, embOff, embTotalBytes)
     }
@@ -3973,7 +4523,14 @@ function transformerLlama(token, pos, computeLogits) {
     rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
 
     // QKV matmuls - quantize once, reuse (#1+2)
-    if (lw.wq.dotQ8Func && lw.wk.dotQ8Func && lw.wv.dotQ8Func) {
+    if (
+      lw.wq.dotQ8Func &&
+      !lw.wq.deqRowFunc &&
+      lw.wk.dotQ8Func &&
+      !lw.wk.deqRowFunc &&
+      lw.wv.dotQ8Func &&
+      !lw.wv.deqRowFunc
+    ) {
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(qArr, lw.wq)
       matmulQuantizedPreQ8(kArr, lw.wk)
@@ -4138,7 +4695,12 @@ function transformerLlama(token, pos, computeLogits) {
     var hb2Arr = s.hb2
 
     // FFN gate and up - quantize once, reuse (#1+2)
-    if (lw.w1.dotQ8Func && lw.w3.dotQ8Func) {
+    if (
+      lw.w1.dotQ8Func &&
+      !lw.w1.deqRowFunc &&
+      lw.w3.dotQ8Func &&
+      !lw.w3.deqRowFunc
+    ) {
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(hbArr, lw.w1)
       matmulQuantizedPreQ8(hb2Arr, lw.w3)
@@ -4486,7 +5048,14 @@ function transformerGemma(token, pos, computeLogits) {
     }
 
     // QKV matmuls - quantize once, reuse (#1+2)
-    if (lw.wq.dotQ8Func && lw.wk.dotQ8Func && lw.wv.dotQ8Func) {
+    if (
+      lw.wq.dotQ8Func &&
+      !lw.wq.deqRowFunc &&
+      lw.wk.dotQ8Func &&
+      !lw.wk.deqRowFunc &&
+      lw.wv.dotQ8Func &&
+      !lw.wv.deqRowFunc
+    ) {
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(qArr, lw.wq)
       matmulQuantizedPreQ8(kArr, lw.wk)
@@ -4649,7 +5218,12 @@ function transformerGemma(token, pos, computeLogits) {
     var hb2Arr = s.hb2
 
     // FFN gate and up - quantize once, reuse (#1+2)
-    if (lw.w1.dotQ8Func && lw.w3.dotQ8Func) {
+    if (
+      lw.w1.dotQ8Func &&
+      !lw.w1.deqRowFunc &&
+      lw.w3.dotQ8Func &&
+      !lw.w3.deqRowFunc
+    ) {
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(hbArr, lw.w1)
       matmulQuantizedPreQ8(hb2Arr, lw.w3)
