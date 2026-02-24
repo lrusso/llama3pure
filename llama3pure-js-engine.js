@@ -2842,8 +2842,81 @@ function matmulQ8_0LocalBatch(
       }
       bo = bo + rowSize
     }
-    // For each batch element, compute 4 flat dot products from the buffer
-    for (var batch = 0; batch < batchSize; batch = batch + 1) {
+    // Process 3 batch elements at a time, sharing buf reads (12 independent chains)
+    var batchTrips = batchSize - (batchSize % 3)
+    for (var batch = 0; batch < batchTrips; batch = batch + 3) {
+      var xA = xs[batch]
+      var xB = xs[batch + 1]
+      var xC = xs[batch + 2]
+      var s0 = 0.0
+      var s1 = 0.0
+      var s2 = 0.0
+      var s3 = 0.0
+      var t0 = 0.0
+      var t1 = 0.0
+      var t2 = 0.0
+      var t3 = 0.0
+      var u0 = 0.0
+      var u1 = 0.0
+      var u2 = 0.0
+      var u3 = 0.0
+      for (var j = 0; j < cols4; j = j + 4) {
+        var a = xA[j]
+        var b = xA[j + 1]
+        var c = xA[j + 2]
+        var d = xA[j + 3]
+        var e = xB[j]
+        var f = xB[j + 1]
+        var g = xB[j + 2]
+        var h = xB[j + 3]
+        var p = xC[j]
+        var q = xC[j + 1]
+        var r = xC[j + 2]
+        var v = xC[j + 3]
+        var w0 = buf[j]
+        var w1 = buf[j + 1]
+        var w2 = buf[j + 2]
+        var w3 = buf[j + 3]
+        s0 = s0 + a * w0 + b * w1 + c * w2 + d * w3
+        t0 = t0 + e * w0 + f * w1 + g * w2 + h * w3
+        u0 = u0 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off1 + j]
+        w1 = buf[off1 + j + 1]
+        w2 = buf[off1 + j + 2]
+        w3 = buf[off1 + j + 3]
+        s1 = s1 + a * w0 + b * w1 + c * w2 + d * w3
+        t1 = t1 + e * w0 + f * w1 + g * w2 + h * w3
+        u1 = u1 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off2 + j]
+        w1 = buf[off2 + j + 1]
+        w2 = buf[off2 + j + 2]
+        w3 = buf[off2 + j + 3]
+        s2 = s2 + a * w0 + b * w1 + c * w2 + d * w3
+        t2 = t2 + e * w0 + f * w1 + g * w2 + h * w3
+        u2 = u2 + p * w0 + q * w1 + r * w2 + v * w3
+        w0 = buf[off3 + j]
+        w1 = buf[off3 + j + 1]
+        w2 = buf[off3 + j + 2]
+        w3 = buf[off3 + j + 3]
+        s3 = s3 + a * w0 + b * w1 + c * w2 + d * w3
+        t3 = t3 + e * w0 + f * w1 + g * w2 + h * w3
+        u3 = u3 + p * w0 + q * w1 + r * w2 + v * w3
+      }
+      outs[batch][i] = s0
+      outs[batch][i + 1] = s1
+      outs[batch][i + 2] = s2
+      outs[batch][i + 3] = s3
+      outs[batch + 1][i] = t0
+      outs[batch + 1][i + 1] = t1
+      outs[batch + 1][i + 2] = t2
+      outs[batch + 1][i + 3] = t3
+      outs[batch + 2][i] = u0
+      outs[batch + 2][i + 1] = u1
+      outs[batch + 2][i + 2] = u2
+      outs[batch + 2][i + 3] = u3
+    }
+    // Handle remaining 1-2 batch elements one at a time
+    for (var batch = batchTrips; batch < batchSize; batch = batch + 1) {
       var xArr = xs[batch]
       var s0 = 0.0
       var s1 = 0.0
@@ -2874,77 +2947,10 @@ function matmulQ8_0LocalBatch(
           c * buf[off3 + j + 2] +
           d * buf[off3 + j + 3]
       }
-      for (var j = cols4; j < cols; j = j + 1) {
-        var xj = xArr[j]
-        s0 = s0 + xj * buf[j]
-        s1 = s1 + xj * buf[off1 + j]
-        s2 = s2 + xj * buf[off2 + j]
-        s3 = s3 + xj * buf[off3 + j]
-      }
       outs[batch][i] = s0
       outs[batch][i + 1] = s1
       outs[batch][i + 2] = s2
       outs[batch][i + 3] = s3
-    }
-  }
-  // Handle remaining rows (1-3) one at a time
-  for (var i = rows4; i < rows; i = i + 1) {
-    // Dequantize single row
-    var bo = i * rowSize
-    var idx = 0
-    for (var b = 0; b < nb; b = b + 1) {
-      var d = fp16Table[localU8[bo] | (localU8[bo + 1] << 8)]
-      var qo = bo + 2
-      buf[idx] = d * localI8[qo]
-      buf[idx + 1] = d * localI8[qo + 1]
-      buf[idx + 2] = d * localI8[qo + 2]
-      buf[idx + 3] = d * localI8[qo + 3]
-      buf[idx + 4] = d * localI8[qo + 4]
-      buf[idx + 5] = d * localI8[qo + 5]
-      buf[idx + 6] = d * localI8[qo + 6]
-      buf[idx + 7] = d * localI8[qo + 7]
-      buf[idx + 8] = d * localI8[qo + 8]
-      buf[idx + 9] = d * localI8[qo + 9]
-      buf[idx + 10] = d * localI8[qo + 10]
-      buf[idx + 11] = d * localI8[qo + 11]
-      buf[idx + 12] = d * localI8[qo + 12]
-      buf[idx + 13] = d * localI8[qo + 13]
-      buf[idx + 14] = d * localI8[qo + 14]
-      buf[idx + 15] = d * localI8[qo + 15]
-      buf[idx + 16] = d * localI8[qo + 16]
-      buf[idx + 17] = d * localI8[qo + 17]
-      buf[idx + 18] = d * localI8[qo + 18]
-      buf[idx + 19] = d * localI8[qo + 19]
-      buf[idx + 20] = d * localI8[qo + 20]
-      buf[idx + 21] = d * localI8[qo + 21]
-      buf[idx + 22] = d * localI8[qo + 22]
-      buf[idx + 23] = d * localI8[qo + 23]
-      buf[idx + 24] = d * localI8[qo + 24]
-      buf[idx + 25] = d * localI8[qo + 25]
-      buf[idx + 26] = d * localI8[qo + 26]
-      buf[idx + 27] = d * localI8[qo + 27]
-      buf[idx + 28] = d * localI8[qo + 28]
-      buf[idx + 29] = d * localI8[qo + 29]
-      buf[idx + 30] = d * localI8[qo + 30]
-      buf[idx + 31] = d * localI8[qo + 31]
-      bo = bo + 34
-      idx = idx + 32
-    }
-    for (var batch = 0; batch < batchSize; batch = batch + 1) {
-      var xArr = xs[batch]
-      var s = 0.0
-      for (var j = 0; j < cols4; j = j + 4) {
-        s =
-          s +
-          xArr[j] * buf[j] +
-          xArr[j + 1] * buf[j + 1] +
-          xArr[j + 2] * buf[j + 2] +
-          xArr[j + 3] * buf[j + 3]
-      }
-      for (var j = cols4; j < cols; j = j + 1) {
-        s = s + xArr[j] * buf[j]
-      }
-      outs[batch][i] = s
     }
   }
 }
@@ -3160,54 +3166,6 @@ function matmulQ8_0Local(out, x, localU8, localI8, rows, cols, rowSize) {
     out[i + 1] = sum1
     out[i + 2] = sum2
     out[i + 3] = sum3
-  }
-  // Handle remaining rows (1-3) one at a time
-  for (var i = rows4; i < rows; i = i + 1) {
-    var sum = 0.0
-    var bo = i * rowSize
-    var xb = 0
-    for (var b = 0; b < nb; b = b + 1) {
-      var d = fp16Table[localU8[bo] | (localU8[bo + 1] << 8)]
-      var qOff = bo + 2
-      sum =
-        sum +
-        d *
-          (x[xb] * localI8[qOff] +
-            x[xb + 1] * localI8[qOff + 1] +
-            x[xb + 2] * localI8[qOff + 2] +
-            x[xb + 3] * localI8[qOff + 3] +
-            x[xb + 4] * localI8[qOff + 4] +
-            x[xb + 5] * localI8[qOff + 5] +
-            x[xb + 6] * localI8[qOff + 6] +
-            x[xb + 7] * localI8[qOff + 7] +
-            x[xb + 8] * localI8[qOff + 8] +
-            x[xb + 9] * localI8[qOff + 9] +
-            x[xb + 10] * localI8[qOff + 10] +
-            x[xb + 11] * localI8[qOff + 11] +
-            x[xb + 12] * localI8[qOff + 12] +
-            x[xb + 13] * localI8[qOff + 13] +
-            x[xb + 14] * localI8[qOff + 14] +
-            x[xb + 15] * localI8[qOff + 15] +
-            x[xb + 16] * localI8[qOff + 16] +
-            x[xb + 17] * localI8[qOff + 17] +
-            x[xb + 18] * localI8[qOff + 18] +
-            x[xb + 19] * localI8[qOff + 19] +
-            x[xb + 20] * localI8[qOff + 20] +
-            x[xb + 21] * localI8[qOff + 21] +
-            x[xb + 22] * localI8[qOff + 22] +
-            x[xb + 23] * localI8[qOff + 23] +
-            x[xb + 24] * localI8[qOff + 24] +
-            x[xb + 25] * localI8[qOff + 25] +
-            x[xb + 26] * localI8[qOff + 26] +
-            x[xb + 27] * localI8[qOff + 27] +
-            x[xb + 28] * localI8[qOff + 28] +
-            x[xb + 29] * localI8[qOff + 29] +
-            x[xb + 30] * localI8[qOff + 30] +
-            x[xb + 31] * localI8[qOff + 31])
-      bo = bo + 34
-      xb = xb + 32
-    }
-    out[i] = sum
   }
 }
 
