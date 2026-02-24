@@ -373,16 +373,21 @@ void malloc_run_state(RunState* s, Config* p) {
             s->rope_sin_all[base + i] = sinf(val);
         }
     }
-    // Pre-compute SWA sin/cos for all positions
-    s->rope_cos_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
-    s->rope_sin_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
-    for (int pos = 0; pos < seq_len; pos++) {
-        int base = pos * rope_size;
-        for (int i = 0; i < rope_size; i++) {
-            float val = pos * s->rope_freqs_swa[i];
-            s->rope_cos_swa_all[base + i] = cosf(val);
-            s->rope_sin_swa_all[base + i] = sinf(val);
+    // Pre-compute SWA sin/cos for all positions (only for Gemma models)
+    if (p->is_gemma3) {
+        s->rope_cos_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+        s->rope_sin_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
+        for (int pos = 0; pos < seq_len; pos++) {
+            int base = pos * rope_size;
+            for (int i = 0; i < rope_size; i++) {
+                float val = pos * s->rope_freqs_swa[i];
+                s->rope_cos_swa_all[base + i] = cosf(val);
+                s->rope_sin_swa_all[base + i] = sinf(val);
+            }
         }
+    } else {
+        s->rope_cos_swa_all = s->rope_cos_all;
+        s->rope_sin_swa_all = s->rope_sin_all;
     }
 
     // Cache frequently used values
@@ -434,8 +439,7 @@ void malloc_run_state(RunState* s, Config* p) {
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
      || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
-     || !s->rope_cos_all || !s->rope_sin_all
-     || !s->rope_cos_swa_all || !s->rope_sin_swa_all
+     || !s->rope_cos_all || !s->rope_sin_all || !s->rope_cos_swa_all || !s->rope_sin_swa_all
      || !s->head_q_offsets || !s->head_att_offsets
      || !s->head_kv_indices || !s->head_kv_byte_offsets
      || !s->qQ8
@@ -462,8 +466,8 @@ void free_run_state(RunState* s) {
     free(s->rope_freqs_swa);
     free(s->rope_cos_all);
     free(s->rope_sin_all);
-    free(s->rope_cos_swa_all);
-    free(s->rope_sin_swa_all);
+    if (s->rope_cos_swa_all != s->rope_cos_all) free(s->rope_cos_swa_all);
+    if (s->rope_sin_swa_all != s->rope_sin_all) free(s->rope_sin_swa_all);
     free(s->head_q_offsets);
     free(s->head_att_offsets);
     free(s->head_kv_indices);
@@ -2447,27 +2451,30 @@ int load_gguf_tokenizer(GGUFFile* gguf, const char* filename) {
                     }
                 }
             } else {
-                // Skip other arrays
-                for (uint64_t j = 0; j < arr_len; j++) {
-                    switch (arr_type) {
-                        case GGUF_TYPE_UINT8:  fseek(f, sizeof(uint8_t), SEEK_CUR); break;
-                        case GGUF_TYPE_INT8:   fseek(f, sizeof(int8_t), SEEK_CUR); break;
-                        case GGUF_TYPE_UINT16: fseek(f, sizeof(uint16_t), SEEK_CUR); break;
-                        case GGUF_TYPE_INT16:  fseek(f, sizeof(int16_t), SEEK_CUR); break;
-                        case GGUF_TYPE_UINT32: fseek(f, sizeof(uint32_t), SEEK_CUR); break;
-                        case GGUF_TYPE_INT32:  fseek(f, sizeof(int32_t), SEEK_CUR); break;
-                        case GGUF_TYPE_UINT64: fseek(f, sizeof(uint64_t), SEEK_CUR); break;
-                        case GGUF_TYPE_INT64:  fseek(f, sizeof(int64_t), SEEK_CUR); break;
-                        case GGUF_TYPE_FLOAT32: fseek(f, sizeof(float), SEEK_CUR); break;
-                        case GGUF_TYPE_FLOAT64: fseek(f, sizeof(double), SEEK_CUR); break;
-                        case GGUF_TYPE_BOOL:   fseek(f, sizeof(bool), SEEK_CUR); break;
-                        case GGUF_TYPE_STRING: {
+                // Skip other arrays (batch-seek for fixed-size types)
+                switch (arr_type) {
+                    case GGUF_TYPE_UINT8:
+                    case GGUF_TYPE_INT8:
+                    case GGUF_TYPE_BOOL:
+                        fseek(f, arr_len * 1, SEEK_CUR); break;
+                    case GGUF_TYPE_UINT16:
+                    case GGUF_TYPE_INT16:
+                        fseek(f, arr_len * 2, SEEK_CUR); break;
+                    case GGUF_TYPE_UINT32:
+                    case GGUF_TYPE_INT32:
+                    case GGUF_TYPE_FLOAT32:
+                        fseek(f, arr_len * 4, SEEK_CUR); break;
+                    case GGUF_TYPE_UINT64:
+                    case GGUF_TYPE_INT64:
+                    case GGUF_TYPE_FLOAT64:
+                        fseek(f, arr_len * 8, SEEK_CUR); break;
+                    case GGUF_TYPE_STRING:
+                        for (uint64_t j = 0; j < arr_len; j++) {
                             char* s = read_gguf_string(f);
                             free(s);
-                            break;
                         }
-                        default: break;
-                    }
+                        break;
+                    default: break;
                 }
             }
         } else {
