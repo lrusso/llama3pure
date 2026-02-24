@@ -113,6 +113,7 @@ enum ggml_type {
 #define QK_K 256
 #define QK4_NL 32  // IQ4_NL block size
 #define Q8_0_BLOCK_SIZE 34  // 2 bytes FP16 scale + 32 bytes int8 quants
+#define PREFILL_BATCH_SIZE 32
 
 // Quantization block structures
 typedef struct {
@@ -312,6 +313,18 @@ typedef struct {
     // per-layer RoPE table pointers (avoid modulo check per layer)
     float** rope_cos_layer;   // (n_layers,) pointer to correct cos table + pos offset base
     float** rope_sin_layer;   // (n_layers,) pointer to correct sin table + pos offset base
+    // Batch buffers for prefill (flat arrays, stride = dimension)
+    float* batch_x;       // PREFILL_BATCH_SIZE * dim
+    float* batch_xb;      // PREFILL_BATCH_SIZE * max_dim
+    float* batch_xb2;     // PREFILL_BATCH_SIZE * dim
+    float* batch_q;       // PREFILL_BATCH_SIZE * q_dim
+    float* batch_k;       // PREFILL_BATCH_SIZE * kv_dim
+    float* batch_v;       // PREFILL_BATCH_SIZE * kv_dim
+    float* batch_hb;      // PREFILL_BATCH_SIZE * hidden_dim
+    float* batch_hb2;     // PREFILL_BATCH_SIZE * hidden_dim
+    block_q8_0* batch_q8; // PREFILL_BATCH_SIZE * max_q8_blocks
+    int batch_q8_stride;  // max_q8_blocks per batch element
+    int max_dim;          // max(dim, q_dim) - stride for batch_xb
 } RunState;
 
 // Global memory tracking for cleanup
@@ -436,6 +449,24 @@ void malloc_run_state(RunState* s, Config* p) {
         }
     }
 
+    // Batch buffers for prefill
+    s->max_dim = max_dim;
+
+    s->batch_x   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->dim, sizeof(float));
+    s->batch_xb  = (float*)calloc((size_t)PREFILL_BATCH_SIZE * max_dim, sizeof(float));
+    s->batch_xb2 = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->dim, sizeof(float));
+    s->batch_q   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * q_dim, sizeof(float));
+    s->batch_k   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * kv_dim, sizeof(float));
+    s->batch_v   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * kv_dim, sizeof(float));
+    s->batch_hb  = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->hidden_dim, sizeof(float));
+    s->batch_hb2 = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->hidden_dim, sizeof(float));
+
+    int max_cols = p->dim;
+    if (q_dim > max_cols) max_cols = q_dim;
+    if (p->hidden_dim > max_cols) max_cols = p->hidden_dim;
+    s->batch_q8_stride = (max_cols + QK8_0 - 1) / QK8_0;
+    s->batch_q8 = (block_q8_0*)calloc((size_t)PREFILL_BATCH_SIZE * s->batch_q8_stride, sizeof(block_q8_0));
+
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
      || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
@@ -475,6 +506,15 @@ void free_run_state(RunState* s) {
     free(s->qQ8);
     free(s->rope_cos_layer);
     free(s->rope_sin_layer);
+    free(s->batch_x);
+    free(s->batch_xb);
+    free(s->batch_xb2);
+    free(s->batch_q);
+    free(s->batch_k);
+    free(s->batch_v);
+    free(s->batch_hb);
+    free(s->batch_hb2);
+    free(s->batch_q8);
 }
 
 // ----------------------------------------------------------------------------
@@ -2059,6 +2099,43 @@ void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
     }
 }
 
+// Batched matmul: read each weight row once, compute dot products for all batch elements
+void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* qw,
+                            int batch_size, int in_stride, int out_stride,
+                            block_q8_0* q8_bufs, int q8_stride) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+
+    cached_q8_func q8_func = qw->q8_func;
+    if (q8_func) {
+        // Quantize all batch inputs to Q8_0
+        for (int b = 0; b < batch_size; b++) {
+            quantize_row_q8_0(x + b * in_stride, q8_bufs + b * q8_stride, n);
+        }
+        // Read each weight row once, compute all batch dot products
+        int i;
+        #pragma omp parallel for private(i)
+        for (i = 0; i < d; i++) {
+            const void* row = data + i * row_size;
+            for (int b = 0; b < batch_size; b++) {
+                xout[b * out_stride + i] = q8_func(q8_bufs + b * q8_stride, row, n);
+            }
+        }
+    } else {
+        cached_dot_func dot_func = qw->dot_func;
+        int i;
+        #pragma omp parallel for private(i)
+        for (i = 0; i < d; i++) {
+            const void* row = data + i * row_size;
+            for (int b = 0; b < batch_size; b++) {
+                xout[b * out_stride + i] = dot_func(x + b * in_stride, row, n);
+            }
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // GGUF parsing
 
@@ -3134,6 +3211,251 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
             }
         }
     }
+}
+
+// Batched prefill transformer: processes multiple prompt tokens per layer pass,
+// reading weight data once and reusing across all batch elements
+void transformer_prefill(int* tokens, int start_pos, int batch_size,
+                         Config* p, RunState* s, TransformerWeights* w) {
+    int dim = p->dim;
+    int hidden_dim = p->hidden_dim;
+    int head_size = s->head_size;
+    int kv_dim = s->kv_dim;
+    int q_dim = s->q_dim;
+    float eps = p->rms_norm_eps > 0 ? p->rms_norm_eps : 1e-5f;
+    float inv_dim = s->inv_dim;
+    float inv_head_size = s->inv_head_size;
+    int max_dim = s->max_dim;
+    int half = head_size / 2;
+    int kv_mul = s->kv_mul;
+    int head_q8_bytes = s->head_q8_bytes;
+    int head_seq_bytes = s->head_seq_bytes;
+    float attn_scale = s->attn_scale;
+
+    float* bx  = s->batch_x;
+    float* bxb = s->batch_xb;
+    float* bxb2 = s->batch_xb2;
+    float* bq  = s->batch_q;
+    float* bk  = s->batch_k;
+    float* bv  = s->batch_v;
+    float* bhb = s->batch_hb;
+    float* bhb2 = s->batch_hb2;
+    block_q8_0* bq8 = s->batch_q8;
+    int q8_stride = s->batch_q8_stride;
+
+    // Embed all tokens in batch
+    for (int b = 0; b < batch_size; b++) {
+        int tok = tokens[start_pos + b];
+        const char* emb_row = (const char*)w->token_embedding_data + tok * w->token_embedding_row_size;
+        dequantize_row(bx + b * dim, emb_row, dim, w->token_embedding_type);
+    }
+
+    // Forward all layers
+    for (int l = 0; l < p->n_layers; l++) {
+
+        // Batch rmsnorm
+        if (p->is_gemma3 && l == 0) {
+            for (int b = 0; b < batch_size; b++) {
+                rmsnorm_fused_scale(bxb + b * max_dim, bx + b * dim,
+                    w->rms_att_weight, dim, inv_dim, eps, s->embed_scale);
+            }
+        } else {
+            for (int b = 0; b < batch_size; b++) {
+                rmsnorm(bxb + b * max_dim, bx + b * dim,
+                    w->rms_att_weight + l * dim, dim, inv_dim, eps);
+            }
+        }
+
+        // Batch QKV matmuls - read weights once, compute for all batch elements
+        matmul_quantized_batch(bq, bxb, &w->wq[l], batch_size, max_dim, q_dim, bq8, q8_stride);
+        matmul_quantized_batch(bk, bxb, &w->wk[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
+        matmul_quantized_batch(bv, bxb, &w->wv[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
+
+        // Per-token: QK norms, RoPE, KV cache write, attention
+        int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
+        int loff = l * s->kv_cache_layer_size;
+
+        for (int b = 0; b < batch_size; b++) {
+            int pos = start_pos + b;
+            float* q_arr = bq + b * q_dim;
+            float* k_arr = bk + b * kv_dim;
+            float* v_arr = bv + b * kv_dim;
+            float* xb_arr = bxb + b * max_dim;
+
+            // Gemma3: per-head Q/K normalization
+            if (p->is_gemma3 && w->attn_q_norm && w->attn_k_norm) {
+                rmsnorm_per_head(q_arr, q_arr, w->attn_q_norm + l * head_size,
+                    p->n_heads, head_size, inv_head_size, eps);
+                rmsnorm_per_head(k_arr, k_arr, w->attn_k_norm + l * head_size,
+                    p->n_kv_heads, head_size, inv_head_size, eps);
+            }
+
+            // RoPE with fused attnScale on Q
+            int rope_base = pos * half;
+            float* rope_cos = s->rope_cos_layer[l] + rope_base;
+            float* rope_sin = s->rope_sin_layer[l] + rope_base;
+
+            if (p->is_gemma3) {
+                // Gemma NEOX RoPE: pairs (i, i+half)
+                for (int h = 0; h < p->n_heads; h++) {
+                    float* q_head = q_arr + h * head_size;
+                    for (int i = 0; i < half; i++) {
+                        float fcr = rope_cos[i];
+                        float fci = rope_sin[i];
+                        float v0 = q_head[i];
+                        float v1 = q_head[i + half];
+                        q_head[i]        = (v0 * fcr - v1 * fci) * attn_scale;
+                        q_head[i + half] = (v0 * fci + v1 * fcr) * attn_scale;
+                    }
+                }
+                for (int h = 0; h < p->n_kv_heads; h++) {
+                    float* k_head = k_arr + h * head_size;
+                    for (int i = 0; i < half; i++) {
+                        float fcr = rope_cos[i];
+                        float fci = rope_sin[i];
+                        float v0 = k_head[i];
+                        float v1 = k_head[i + half];
+                        k_head[i]        = v0 * fcr - v1 * fci;
+                        k_head[i + half] = v0 * fci + v1 * fcr;
+                    }
+                }
+            } else {
+                // Llama RoPE: consecutive pairs (i, i+1)
+                for (int i = 0; i < q_dim; i += 2) {
+                    int head_dim_idx = (i % head_size) / 2;
+                    float fcr = rope_cos[head_dim_idx];
+                    float fci = rope_sin[head_dim_idx];
+                    float v0 = q_arr[i];
+                    float v1 = q_arr[i + 1];
+                    q_arr[i]     = (v0 * fcr - v1 * fci) * attn_scale;
+                    q_arr[i + 1] = (v0 * fci + v1 * fcr) * attn_scale;
+                    if (i < kv_dim) {
+                        float k0 = k_arr[i];
+                        float k1 = k_arr[i + 1];
+                        k_arr[i]     = k0 * fcr - k1 * fci;
+                        k_arr[i + 1] = k0 * fci + k1 * fcr;
+                    }
+                }
+            }
+
+            // Per-head KV cache write
+            for (int kh = 0; kh < p->n_kv_heads; kh++) {
+                int cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
+                quantize_to_q8_0_cache(k_arr + kh * head_size, s->key_cache + cache_offset, head_size);
+                quantize_to_q8_0_cache(v_arr + kh * head_size, s->value_cache + cache_offset, head_size);
+            }
+
+            // Quantize all Q heads to Q8_0
+            quantize_to_q8_0_cache(q_arr, s->qQ8, q_dim);
+
+            memset(xb_arr, 0, q_dim * sizeof(float));
+
+            // SWA start position
+            int start_t = 0;
+            if (p->is_gemma3 && is_swa_layer && p->swa_window > 0) {
+                start_t = pos - p->swa_window + 1;
+                if (start_t < 0) start_t = 0;
+            }
+            int att_size = pos - start_t + 1;
+
+            // GQA-batched attention with Q8 scoring
+            for (int kvH = 0; kvH < p->n_kv_heads; kvH++) {
+                int kBase = loff + kvH * head_seq_bytes;
+
+                // Score all Q heads in this GQA group against all K positions
+                for (int t = start_t; t <= pos; t++) {
+                    int kOff = kBase + t * head_q8_bytes;
+                    const uint8_t* kQ8 = s->key_cache + kOff;
+                    const int8_t* kI8 = (const int8_t*)kQ8;
+                    for (int mh = 0; mh < kv_mul; mh++) {
+                        int h = kvH * kv_mul + mh;
+                        int qOff = h * head_q8_bytes;
+                        s->att[s->head_att_offsets[h] + t - start_t] =
+                            dot_q8_0_q8_0_cache(s->qQ8 + qOff, s->qQ8i8 + qOff,
+                                kQ8, kI8, head_size);
+                    }
+                }
+
+                // Softmax + value accumulation per Q head
+                for (int mh = 0; mh < kv_mul; mh++) {
+                    int h = kvH * kv_mul + mh;
+                    float* att = s->att + s->head_att_offsets[h];
+                    softmax(att, att_size);
+
+                    float* xb = xb_arr + s->head_q_offsets[h];
+                    for (int t = start_t; t <= pos; t++) {
+                        int vOff = kBase + t * head_q8_bytes;
+                        accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
+                    }
+                }
+            }
+        }
+
+        // Batch wo matmul
+        matmul_quantized_batch(bxb2, bxb, &w->wo[l], batch_size, max_dim, dim, bq8, q8_stride);
+
+        // Gemma3: post-attention norm
+        if (p->is_gemma3 && w->attn_post_norm) {
+            for (int b = 0; b < batch_size; b++) {
+                rmsnorm(bxb2 + b * dim, bxb2 + b * dim, w->attn_post_norm + l * dim, dim, inv_dim, eps);
+            }
+        }
+
+        // Batch residual add
+        for (int b = 0; b < batch_size; b++) {
+            accum(bx + b * dim, bxb2 + b * dim, dim);
+        }
+
+        // Batch FFN rmsnorm
+        for (int b = 0; b < batch_size; b++) {
+            rmsnorm(bxb + b * max_dim, bx + b * dim, w->rms_ffn_weight + l * dim, dim, inv_dim, eps);
+        }
+
+        // Batch FFN gate and up matmuls
+        matmul_quantized_batch(bhb, bxb, &w->w1[l], batch_size, max_dim, hidden_dim, bq8, q8_stride);
+        matmul_quantized_batch(bhb2, bxb, &w->w3[l], batch_size, max_dim, hidden_dim, bq8, q8_stride);
+
+        // Per-token activation
+        if (p->is_gemma3) {
+            // GeGLU: gelu(gate) * up
+            for (int b = 0; b < batch_size; b++) {
+                float* hb = bhb + b * hidden_dim;
+                float* hb2 = bhb2 + b * hidden_dim;
+                for (int i = 0; i < hidden_dim; i++) {
+                    float x = hb[i];
+                    float gelu_val = 0.5f * x * (1.0f + fast_tanhf(x * (0.7978845608f + 0.035677408137f * x * x)));
+                    hb[i] = gelu_val * hb2[i];
+                }
+            }
+        } else {
+            // SwiGLU: silu(gate) * up
+            for (int b = 0; b < batch_size; b++) {
+                float* hb = bhb + b * hidden_dim;
+                float* hb2 = bhb2 + b * hidden_dim;
+                for (int i = 0; i < hidden_dim; i++) {
+                    float val = hb[i];
+                    val = val * (1.0f / (1.0f + fast_expf(-val)));
+                    hb[i] = val * hb2[i];
+                }
+            }
+        }
+
+        // Batch FFN down matmul
+        matmul_quantized_batch(bxb, bhb, &w->w2[l], batch_size, hidden_dim, max_dim, bq8, q8_stride);
+
+        // Gemma3: post-FFN norm
+        if (p->is_gemma3 && w->ffn_post_norm) {
+            for (int b = 0; b < batch_size; b++) {
+                rmsnorm(bxb + b * max_dim, bxb + b * max_dim, w->ffn_post_norm + l * dim, dim, inv_dim, eps);
+            }
+        }
+
+        // Batch FFN residual add
+        for (int b = 0; b < batch_size; b++) {
+            accum(bx + b * dim, bxb + b * max_dim, dim);
+        }
+    }
+    // No final norm or logits - prefill only fills KV cache
 }
 
 // ----------------------------------------------------------------------------
@@ -4622,6 +4944,18 @@ int main(int argc, char *argv[]) {
     }
 
     long start = 0;
+
+    // Batched prefill: process all prompt tokens except the last in batches
+    if (num_prompt_tokens > 1) {
+        int prefill_end = num_prompt_tokens - 1;
+        while (pos < prefill_end) {
+            int bs = prefill_end - pos;
+            if (bs > PREFILL_BATCH_SIZE) bs = PREFILL_BATCH_SIZE;
+            transformer_prefill(prompt_tokens, pos, bs, &config, &state, &weights);
+            pos += bs;
+        }
+        token = prompt_tokens[pos];
+    }
 
     while (pos < max_tokens) {
         generate_token();
