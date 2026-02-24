@@ -474,7 +474,10 @@ void malloc_run_state(RunState* s, Config* p) {
      || !s->head_q_offsets || !s->head_att_offsets
      || !s->head_kv_indices || !s->head_kv_byte_offsets
      || !s->qQ8
-     || !s->rope_cos_layer || !s->rope_sin_layer) {
+     || !s->rope_cos_layer || !s->rope_sin_layer
+     || !s->batch_x || !s->batch_xb || !s->batch_xb2
+     || !s->batch_q || !s->batch_k || !s->batch_v
+     || !s->batch_hb || !s->batch_hb2 || !s->batch_q8) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
     }
