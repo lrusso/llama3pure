@@ -155,7 +155,9 @@ function readFloat64() {
 
 function readString() {
   var len = readUint64()
-  var bytes = new Uint8Array(ggufData, offset, len)
+  var bytes = ggufUint8
+    ? ggufUint8.subarray(offset, offset + len)
+    : new Uint8Array(ggufData, offset, len)
   offset = offset + len
   return ggufTextDecoder.decode(bytes)
 }
@@ -759,9 +761,7 @@ function dequantizeBF16(srcOffset, dst, dstOffset, count) {
 
 function dequantizeF32(srcOffset, dst, dstOffset, count) {
   var src = getFloat32ArrayAt(srcOffset, count)
-  for (var i = 0; i < count; i = i + 1) {
-    dst[dstOffset + i] = src[i]
-  }
+  dst.set(src, dstOffset)
 }
 
 function dequantizeQ4_0(srcOffset, dst, dstOffset, count) {
@@ -3051,6 +3051,17 @@ function readGGUFValue(type) {
         offset = offset + arrBytes
         return arr
       }
+      if (arrType === GGUF_TYPE.UINT32) {
+        var arrBytes = arrLen * 4
+        var arr
+        if (offset % 4 === 0) {
+          arr = new Uint32Array(ggufData, offset, arrLen)
+        } else {
+          arr = new Uint32Array(ggufData.slice(offset, offset + arrBytes))
+        }
+        offset = offset + arrBytes
+        return arr
+      }
       var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
         arr[i] = readGGUFValue(arrType)
@@ -3095,8 +3106,6 @@ function loadModel(arrayBuffer) {
   postMessage({
     type: "progress",
   })
-
-  var vocabTokens = meta["tokenizer.ggml.tokens"] || []
 
   // Limit context length to avoid massive KV cache allocations in browser
   var modelSeqLen = meta[keyPrefix + ".context_length"] || 2048
