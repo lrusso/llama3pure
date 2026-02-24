@@ -2949,7 +2949,7 @@ function matmulQ8_0LocalBatch(
   }
 }
 
-// Q8_0 matmul: 2 rows at a time, sharing x reads across rows
+// Q8_0 matmul: 4 rows at a time, sharing x reads across rows
 function matmulQ8_0Local(out, x, localU8, localI8, rows, cols, rowSize) {
   var nb = cols >> 5
   var rows4 = rows & ~3
