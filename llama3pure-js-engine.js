@@ -3040,9 +3040,20 @@ function readGGUFValue(type) {
     case GGUF_TYPE.ARRAY:
       var arrType = readUint32()
       var arrLen = readUint64()
-      var arr = []
+      if (arrType === GGUF_TYPE.FLOAT32) {
+        var arrBytes = arrLen * 4
+        var arr
+        if (offset % 4 === 0) {
+          arr = new Float32Array(ggufData, offset, arrLen)
+        } else {
+          arr = new Float32Array(ggufData.slice(offset, offset + arrBytes))
+        }
+        offset = offset + arrBytes
+        return arr
+      }
+      var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
-        arr.push(readGGUFValue(arrType))
+        arr[i] = readGGUFValue(arrType)
       }
       return arr
     default:
@@ -3301,31 +3312,48 @@ function createRunState(p) {
   var qDim = p.nHeads * headSize
   var maxDim = Math.max(p.dim, qDim)
 
-  // Pre-compute full RoPE sin/cos tables for all positions
+  // Pre-compute RoPE frequency table (once per frequency index)
   var ropeSize = headSize / 2
   var seqLen = p.seqLen
+  var ropeFreqs = new Array(ropeSize)
+  for (var i = 0; i < ropeSize; i = i + 1) {
+    ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, (i * 2) / headSize)
+  }
+
+  // Pre-compute full RoPE sin/cos tables for all positions
   var ropeCosAll = new Float32Array(seqLen * ropeSize)
   var ropeSinAll = new Float32Array(seqLen * ropeSize)
   for (var pos = 0; pos < seqLen; pos = pos + 1) {
     var base = pos * ropeSize
     for (var i = 0; i < ropeSize; i = i + 1) {
-      var val = pos / Math.pow(p.ropeTheta, (i * 2) / headSize)
+      var val = pos * ropeFreqs[i]
       ropeCosAll[base + i] = Math.cos(val)
       ropeSinAll[base + i] = Math.sin(val)
     }
   }
 
-  // Pre-compute SWA RoPE tables (for Gemma3 sliding window attention layers)
-  var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
-  var ropeCosSwaAll = new Float32Array(seqLen * ropeSize)
-  var ropeSinSwaAll = new Float32Array(seqLen * ropeSize)
-  for (var pos = 0; pos < seqLen; pos = pos + 1) {
-    var base = pos * ropeSize
+  // Pre-compute SWA RoPE tables (only for Gemma models)
+  var ropeCosSwaAll
+  var ropeSinSwaAll
+  if (p.isGemma) {
+    var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
+    var swaFreqs = new Array(ropeSize)
     for (var i = 0; i < ropeSize; i = i + 1) {
-      var val = pos / Math.pow(swaTheta, (i * 2) / headSize)
-      ropeCosSwaAll[base + i] = Math.cos(val)
-      ropeSinSwaAll[base + i] = Math.sin(val)
+      swaFreqs[i] = 1.0 / Math.pow(swaTheta, (i * 2) / headSize)
     }
+    ropeCosSwaAll = new Float32Array(seqLen * ropeSize)
+    ropeSinSwaAll = new Float32Array(seqLen * ropeSize)
+    for (var pos = 0; pos < seqLen; pos = pos + 1) {
+      var base = pos * ropeSize
+      for (var i = 0; i < ropeSize; i = i + 1) {
+        var val = pos * swaFreqs[i]
+        ropeCosSwaAll[base + i] = Math.cos(val)
+        ropeSinSwaAll[base + i] = Math.sin(val)
+      }
+    }
+  } else {
+    ropeCosSwaAll = ropeCosAll
+    ropeSinSwaAll = ropeSinAll
   }
 
   // Q8_0 KV cache: 34 bytes per 32 floats
