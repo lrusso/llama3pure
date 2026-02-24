@@ -2779,6 +2779,40 @@ function matmulQuantizedPreQ8(out, qw) {
   }
 }
 
+// Batched matmul: process multiple input vectors against same weight matrix
+// Weight data is read once per row and reused across all batch elements
+var PREFILL_BATCH_SIZE = 32
+
+function matmulQuantizedBatch(outs, xs, qw, batchSize) {
+  var rows = qw.rows
+  var cols = qw.cols
+  var baseOffset = qw.dataOffset
+  var rowSize = qw.rowSize
+  var dotQ8Func = qw.dotQ8Func
+
+  if (dotQ8Func) {
+    var bQ8 = state.batchQ8
+    var bQ8i8 = state.batchQ8i8
+    for (var b = 0; b < batchSize; b = b + 1) {
+      quantizeToQ8_0Cache(xs[b], 0, bQ8[b], bQ8i8[b], 0, cols)
+    }
+    for (var i = 0; i < rows; i = i + 1) {
+      var rowOff = baseOffset + i * rowSize
+      for (var b = 0; b < batchSize; b = b + 1) {
+        outs[b][i] = dotQ8Func(bQ8[b], bQ8i8[b], rowOff, cols)
+      }
+    }
+  } else {
+    var dotFunc = qw.dotFunc
+    for (var i = 0; i < rows; i = i + 1) {
+      var rowOff = baseOffset + i * rowSize
+      for (var b = 0; b < batchSize; b = b + 1) {
+        outs[b][i] = dotFunc(xs[b], rowOff, cols)
+      }
+    }
+  }
+}
+
 // ----------------------------------------------------------------------------
 // Math functions
 
@@ -3414,6 +3448,31 @@ function createRunState(p) {
     }
   }
 
+  // Batch buffers for prefill
+  var batchX = new Array(PREFILL_BATCH_SIZE)
+  var batchXb = new Array(PREFILL_BATCH_SIZE)
+  var batchXb2 = new Array(PREFILL_BATCH_SIZE)
+  var batchQ = new Array(PREFILL_BATCH_SIZE)
+  var batchK = new Array(PREFILL_BATCH_SIZE)
+  var batchV = new Array(PREFILL_BATCH_SIZE)
+  var batchHb = new Array(PREFILL_BATCH_SIZE)
+  var batchHb2 = new Array(PREFILL_BATCH_SIZE)
+  var batchQ8 = new Array(PREFILL_BATCH_SIZE)
+  var batchQ8i8 = new Array(PREFILL_BATCH_SIZE)
+  for (var b = 0; b < PREFILL_BATCH_SIZE; b = b + 1) {
+    batchX[b] = new Float32Array(p.dim)
+    batchXb[b] = new Float32Array(maxDim)
+    batchXb2[b] = new Float32Array(p.dim)
+    batchQ[b] = new Float32Array(qDim)
+    batchK[b] = new Float32Array(kvDim)
+    batchV[b] = new Float32Array(kvDim)
+    batchHb[b] = new Float32Array(p.hiddenDim)
+    batchHb2[b] = new Float32Array(p.hiddenDim)
+    var bQ8Buf = new ArrayBuffer(xQ8Size)
+    batchQ8[b] = new Uint8Array(bQ8Buf)
+    batchQ8i8[b] = new Int8Array(bQ8Buf)
+  }
+
   return {
     x: new Float32Array(p.dim),
     xb: new Float32Array(maxDim),
@@ -3478,6 +3537,17 @@ function createRunState(p) {
     headAttOffsets: headAttOffsets,
     headKvByteOffsets: headKvByteOffsets,
     headBytesQ8: headBytesQ8,
+    // Batch buffers for prefill
+    batchX: batchX,
+    batchXb: batchXb,
+    batchXb2: batchXb2,
+    batchQ: batchQ,
+    batchK: batchK,
+    batchV: batchV,
+    batchHb: batchHb,
+    batchHb2: batchHb2,
+    batchQ8: batchQ8,
+    batchQ8i8: batchQ8i8,
   }
 }
 
@@ -3729,6 +3799,256 @@ function transformerLlama(token, pos, computeLogits) {
   // Classifier into logits
   if (computeLogits !== false) {
     matmulQuantized(s.logits, xArr, w.wcls)
+  }
+}
+
+// Batched prefill transformer for Llama: processes multiple prompt tokens per
+// layer pass, reading weight data once and reusing across all batch elements
+function transformerPrefillLlama(allTokens, startPos, batchSize) {
+  var w = weights
+  var s = state
+  var dim = s.dim
+  var headSize = s.headSize
+  var kvDim = s.kvDim
+  var qDim = s.qDim
+  var hiddenDim = s.hiddenDim
+  var nLayers = s.nLayers
+  var nKvHeads = s.nKvHeads
+  var invDim = s.invDim
+  var kvMul = s.kvMul
+  var headBytesQ8 = s.headBytesQ8
+  var headSeqBytes = s.headSeqBytes
+  var attnScale = s.attnScale
+  var seqLen = s.seqLen
+
+  var keyCache = s.keyCache
+  var valueCache = s.valueCache
+  var keyCacheInt8 = s.keyCacheInt8
+  var valueCacheInt8 = s.valueCacheInt8
+  var qQ8 = s.qQ8
+  var qQ8i8 = s.qQ8i8
+  var sAtt = s.att
+
+  var bX = s.batchX
+  var bXb = s.batchXb
+  var bXb2 = s.batchXb2
+  var bQ = s.batchQ
+  var bK = s.batchK
+  var bV = s.batchV
+  var bHb = s.batchHb
+  var bHb2 = s.batchHb2
+
+  // Embed all tokens in batch
+  var emb = w.tokenEmbedding
+  for (var b = 0; b < batchSize; b = b + 1) {
+    dequantizeRow(
+      bX[b],
+      emb.dataOffset + allTokens[startPos + b] * emb.rowSize,
+      dim,
+      emb.type
+    )
+  }
+
+  for (var l = 0; l < nLayers; l = l + 1) {
+    var lw = w.layers[l]
+
+    // Batch rmsnorm
+    for (var b = 0; b < batchSize; b = b + 1) {
+      rmsnorm(bXb[b], bX[b], lw.rmsAttWeight, dim, invDim)
+    }
+
+    // Batch QKV matmuls - read weights once, compute for all batch elements
+    matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
+    matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
+
+    // Per-token: RoPE, KV cache write, attention
+    var half = headSize >> 1
+    var ropeCos = s.ropeCosLayer[l]
+    var ropeSin = s.ropeSinLayer[l]
+    var loff = l * s.kvCacheLayerSize
+
+    for (var b = 0; b < batchSize; b = b + 1) {
+      var pos = startPos + b
+      var qArr = bQ[b]
+      var kArr = bK[b]
+      var vArr = bV[b]
+      var xbArr = bXb[b]
+
+      // RoPE with fused attnScale on Q
+      var ropeBase = pos * s.ropeSize
+      var kvDim4 = kvDim & ~3
+      for (var i = 0; i < kvDim4; i = i + 4) {
+        var fi0 = (i >> 1) % half
+        var fi1 = ((i + 2) >> 1) % half
+        var fcr0 = ropeCos[ropeBase + fi0]
+        var fci0 = ropeSin[ropeBase + fi0]
+        var fcr1 = ropeCos[ropeBase + fi1]
+        var fci1 = ropeSin[ropeBase + fi1]
+        var qv0 = qArr[i]
+        var qv1 = qArr[i + 1]
+        qArr[i] = (qv0 * fcr0 - qv1 * fci0) * attnScale
+        qArr[i + 1] = (qv0 * fci0 + qv1 * fcr0) * attnScale
+        var qv2 = qArr[i + 2]
+        var qv3 = qArr[i + 3]
+        qArr[i + 2] = (qv2 * fcr1 - qv3 * fci1) * attnScale
+        qArr[i + 3] = (qv2 * fci1 + qv3 * fcr1) * attnScale
+        var kv0 = kArr[i]
+        var kv1 = kArr[i + 1]
+        kArr[i] = kv0 * fcr0 - kv1 * fci0
+        kArr[i + 1] = kv0 * fci0 + kv1 * fcr0
+        var kv2 = kArr[i + 2]
+        var kv3 = kArr[i + 3]
+        kArr[i + 2] = kv2 * fcr1 - kv3 * fci1
+        kArr[i + 3] = kv2 * fci1 + kv3 * fcr1
+      }
+      for (var i = kvDim4; i < kvDim; i = i + 2) {
+        var freqIdx = (i >> 1) % half
+        var fcr = ropeCos[ropeBase + freqIdx]
+        var fci = ropeSin[ropeBase + freqIdx]
+        var v0 = qArr[i]
+        var v1 = qArr[i + 1]
+        qArr[i] = (v0 * fcr - v1 * fci) * attnScale
+        qArr[i + 1] = (v0 * fci + v1 * fcr) * attnScale
+        v0 = kArr[i]
+        v1 = kArr[i + 1]
+        kArr[i] = v0 * fcr - v1 * fci
+        kArr[i + 1] = v0 * fci + v1 * fcr
+      }
+      for (var i = kvDim; i < qDim; i = i + 2) {
+        var freqIdx = (i >> 1) % half
+        var fcr = ropeCos[ropeBase + freqIdx]
+        var fci = ropeSin[ropeBase + freqIdx]
+        var v0 = qArr[i]
+        var v1 = qArr[i + 1]
+        qArr[i] = (v0 * fcr - v1 * fci) * attnScale
+        qArr[i + 1] = (v0 * fci + v1 * fcr) * attnScale
+      }
+
+      // Per-head KV cache write
+      for (var h = 0; h < nKvHeads; h = h + 1) {
+        var headOff = loff + h * headSeqBytes + pos * headBytesQ8
+        quantizeToQ8_0Cache(
+          kArr,
+          h * headSize,
+          keyCache,
+          keyCacheInt8,
+          headOff,
+          headSize
+        )
+        quantizeToQ8_0Cache(
+          vArr,
+          h * headSize,
+          valueCache,
+          valueCacheInt8,
+          headOff,
+          headSize
+        )
+      }
+
+      // Quantize all Q heads to Q8_0
+      quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
+
+      xbArr.fill(0, 0, qDim)
+
+      // GQA-batched attention with Q8 scoring
+      for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
+        var kBase = loff + kvH * headSeqBytes
+
+        for (var t = 0; t <= pos; t = t + 1) {
+          var kOff = kBase + t * headBytesQ8
+          for (var mh = 0; mh < kvMul; mh = mh + 1) {
+            var h = kvH * kvMul + mh
+            sAtt[h * seqLen + t] = dotQ8_0_Q8_0Cache(
+              qQ8,
+              qQ8i8,
+              h * headBytesQ8,
+              keyCache,
+              keyCacheInt8,
+              kOff,
+              headSize
+            )
+          }
+        }
+
+        for (var mh = 0; mh < kvMul; mh = mh + 1) {
+          var h = kvH * kvMul + mh
+          var attOffset = h * seqLen
+          var softmaxEnd = attOffset + pos
+          var maxVal = sAtt[attOffset]
+          for (var i = attOffset + 1; i <= softmaxEnd; i = i + 1) {
+            if (sAtt[i] > maxVal) {
+              maxVal = sAtt[i]
+            }
+          }
+          var expSum = 0.0
+          for (var i = attOffset; i <= softmaxEnd; i = i + 1) {
+            var e = Math.exp(sAtt[i] - maxVal)
+            sAtt[i] = e
+            expSum = expSum + e
+          }
+          var invSum = 1.0 / expSum
+          for (var i = attOffset; i <= softmaxEnd; i = i + 1) {
+            sAtt[i] = sAtt[i] * invSum
+          }
+
+          var xbOffset = h * headSize
+          for (var t = 0; t <= pos; t = t + 1) {
+            accumQ8_0Cache(
+              xbArr,
+              xbOffset,
+              valueCache,
+              valueCacheInt8,
+              kBase + t * headBytesQ8,
+              sAtt[attOffset + t],
+              headSize
+            )
+          }
+        }
+      }
+    }
+
+    // Batch wo matmul
+    matmulQuantizedBatch(bXb2, bXb, lw.wo, batchSize)
+    for (var b = 0; b < batchSize; b = b + 1) {
+      accum(bX[b], bXb2[b], dim)
+    }
+
+    // Batch FFN rmsnorm
+    for (var b = 0; b < batchSize; b = b + 1) {
+      rmsnorm(bXb[b], bX[b], lw.rmsFfnWeight, dim, invDim)
+    }
+
+    // Batch FFN matmuls
+    matmulQuantizedBatch(bHb, bXb, lw.w1, batchSize)
+    matmulQuantizedBatch(bHb2, bXb, lw.w3, batchSize)
+
+    // Per-token SiLU activation
+    var hd4 = hiddenDim & ~3
+    for (var b = 0; b < batchSize; b = b + 1) {
+      var hbArr = bHb[b]
+      var hb2Arr = bHb2[b]
+      for (var i = 0; i < hd4; i = i + 4) {
+        var v0 = hbArr[i]
+        var v1 = hbArr[i + 1]
+        var v2 = hbArr[i + 2]
+        var v3 = hbArr[i + 3]
+        hbArr[i] = 0.5 * v0 * (1.0 + fastTanh(0.5 * v0)) * hb2Arr[i]
+        hbArr[i + 1] = 0.5 * v1 * (1.0 + fastTanh(0.5 * v1)) * hb2Arr[i + 1]
+        hbArr[i + 2] = 0.5 * v2 * (1.0 + fastTanh(0.5 * v2)) * hb2Arr[i + 2]
+        hbArr[i + 3] = 0.5 * v3 * (1.0 + fastTanh(0.5 * v3)) * hb2Arr[i + 3]
+      }
+      for (var i = hd4; i < hiddenDim; i = i + 1) {
+        var val = hbArr[i]
+        hbArr[i] = 0.5 * val * (1.0 + fastTanh(0.5 * val)) * hb2Arr[i]
+      }
+    }
+
+    // Batch FFN down matmul
+    matmulQuantizedBatch(bXb, bHb, lw.w2, batchSize)
+    for (var b = 0; b < batchSize; b = b + 1) {
+      accum(bX[b], bXb[b], dim)
+    }
   }
 }
 
@@ -4013,12 +4333,329 @@ function transformerGemma(token, pos, computeLogits) {
   }
 }
 
+// Batched prefill transformer for Gemma: same batching strategy with
+// Gemma-specific features (QK norms, NEOX RoPE, SWA, GELU, post-norms)
+function transformerPrefillGemma(allTokens, startPos, batchSize) {
+  var w = weights
+  var s = state
+  var dim = s.dim
+  var headSize = s.headSize
+  var qDim = s.qDim
+  var hiddenDim = s.hiddenDim
+  var eps = s.rmsNormEps
+  var nLayers = s.nLayers
+  var nHeads = s.nHeads
+  var nKvHeads = s.nKvHeads
+  var invDim = s.invDim
+  var invHeadSize = s.invHeadSize
+  var kvMul = s.kvMul
+  var headBytesQ8 = s.headBytesQ8
+  var headSeqBytes = s.headSeqBytes
+  var attnScale = s.attnScale
+  var seqLen = s.seqLen
+
+  var keyCache = s.keyCache
+  var valueCache = s.valueCache
+  var keyCacheInt8 = s.keyCacheInt8
+  var valueCacheInt8 = s.valueCacheInt8
+  var qQ8 = s.qQ8
+  var qQ8i8 = s.qQ8i8
+  var sAtt = s.att
+
+  var bX = s.batchX
+  var bXb = s.batchXb
+  var bXb2 = s.batchXb2
+  var bQ = s.batchQ
+  var bK = s.batchK
+  var bV = s.batchV
+  var bHb = s.batchHb
+  var bHb2 = s.batchHb2
+
+  // Embed all tokens in batch (scaling fused into first rmsnorm)
+  var emb = w.tokenEmbedding
+  for (var b = 0; b < batchSize; b = b + 1) {
+    dequantizeRow(
+      bX[b],
+      emb.dataOffset + allTokens[startPos + b] * emb.rowSize,
+      dim,
+      emb.type
+    )
+  }
+
+  for (var l = 0; l < nLayers; l = l + 1) {
+    var lw = w.layers[l]
+
+    // Batch rmsnorm (fused embed scale for first layer)
+    if (l === 0) {
+      for (var b = 0; b < batchSize; b = b + 1) {
+        rmsnormGemmaFusedScale(
+          bXb[b],
+          bX[b],
+          lw.rmsAttWeight,
+          dim,
+          eps,
+          invDim,
+          s.embedScale
+        )
+      }
+    } else {
+      for (var b = 0; b < batchSize; b = b + 1) {
+        rmsnormGemma(bXb[b], bX[b], lw.rmsAttWeight, dim, eps, invDim)
+      }
+    }
+
+    // Batch QKV matmuls
+    matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
+    matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
+
+    // Per-token: QK norms, RoPE, KV cache write, attention
+    var half = headSize >> 1
+    var ropeCos = s.ropeCosLayer[l]
+    var ropeSin = s.ropeSinLayer[l]
+    var loff = l * s.kvCacheLayerSize
+
+    // SWA window enforcement
+    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
+
+    for (var b = 0; b < batchSize; b = b + 1) {
+      var pos = startPos + b
+      var qArr = bQ[b]
+      var kArr = bK[b]
+      var vArr = bV[b]
+      var xbArr = bXb[b]
+
+      // Gemma QK norms
+      if (lw.attnQNorm && lw.attnKNorm) {
+        for (var h = 0; h < nHeads; h = h + 1) {
+          rmsnormGemmaAt(
+            qArr,
+            h * headSize,
+            lw.attnQNorm,
+            headSize,
+            eps,
+            invHeadSize
+          )
+        }
+        for (var h = 0; h < nKvHeads; h = h + 1) {
+          rmsnormGemmaAt(
+            kArr,
+            h * headSize,
+            lw.attnKNorm,
+            headSize,
+            eps,
+            invHeadSize
+          )
+        }
+      }
+
+      // NEOX RoPE with fused attnScale on Q
+      var ropeBase = pos * s.ropeSize
+      for (var h = 0; h < nHeads; h = h + 1) {
+        var idx = h * headSize
+        for (var i = 0; i < half; i = i + 1) {
+          var fcr = ropeCos[ropeBase + i]
+          var fci = ropeSin[ropeBase + i]
+          var v0 = qArr[idx + i]
+          var v1 = qArr[idx + i + half]
+          qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
+          qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
+        }
+      }
+      for (var h = 0; h < nKvHeads; h = h + 1) {
+        var idx = h * headSize
+        for (var i = 0; i < half; i = i + 1) {
+          var fcr = ropeCos[ropeBase + i]
+          var fci = ropeSin[ropeBase + i]
+          var v0 = kArr[idx + i]
+          var v1 = kArr[idx + i + half]
+          kArr[idx + i] = v0 * fcr - v1 * fci
+          kArr[idx + i + half] = v0 * fci + v1 * fcr
+        }
+      }
+
+      // Per-head KV cache write
+      for (var h = 0; h < nKvHeads; h = h + 1) {
+        var headOff = loff + h * headSeqBytes + pos * headBytesQ8
+        quantizeToQ8_0Cache(
+          kArr,
+          h * headSize,
+          keyCache,
+          keyCacheInt8,
+          headOff,
+          headSize
+        )
+        quantizeToQ8_0Cache(
+          vArr,
+          h * headSize,
+          valueCache,
+          valueCacheInt8,
+          headOff,
+          headSize
+        )
+      }
+
+      // Quantize all Q heads to Q8_0
+      quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
+
+      xbArr.fill(0, 0, qDim)
+
+      // SWA start position
+      var startT =
+        isSwaLayer && config.swaWindow > 0
+          ? Math.max(0, pos - config.swaWindow + 1)
+          : 0
+
+      // GQA-batched attention with Q8 scoring
+      for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
+        var kBase = loff + kvH * headSeqBytes
+
+        for (var t = startT; t <= pos; t = t + 1) {
+          var kOff = kBase + t * headBytesQ8
+          for (var mh = 0; mh < kvMul; mh = mh + 1) {
+            var h = kvH * kvMul + mh
+            sAtt[h * seqLen + t] = dotQ8_0_Q8_0Cache(
+              qQ8,
+              qQ8i8,
+              h * headBytesQ8,
+              keyCache,
+              keyCacheInt8,
+              kOff,
+              headSize
+            )
+          }
+        }
+
+        for (var mh = 0; mh < kvMul; mh = mh + 1) {
+          var h = kvH * kvMul + mh
+          var attOffset = h * seqLen
+
+          var softmaxStart = attOffset + startT
+          var softmaxEnd = attOffset + pos
+          var maxVal = sAtt[softmaxStart]
+          for (var i = softmaxStart + 1; i <= softmaxEnd; i = i + 1) {
+            if (sAtt[i] > maxVal) {
+              maxVal = sAtt[i]
+            }
+          }
+          var expSum = 0.0
+          for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
+            var e = Math.exp(sAtt[i] - maxVal)
+            sAtt[i] = e
+            expSum = expSum + e
+          }
+          var invSum = 1.0 / expSum
+          for (var i = softmaxStart; i <= softmaxEnd; i = i + 1) {
+            sAtt[i] = sAtt[i] * invSum
+          }
+
+          var xbOffset = h * headSize
+          for (var t = startT; t <= pos; t = t + 1) {
+            accumQ8_0Cache(
+              xbArr,
+              xbOffset,
+              valueCache,
+              valueCacheInt8,
+              kBase + t * headBytesQ8,
+              sAtt[attOffset + t],
+              headSize
+            )
+          }
+        }
+      }
+    }
+
+    // Batch wo matmul
+    matmulQuantizedBatch(bXb2, bXb, lw.wo, batchSize)
+
+    // Post-attention norm (per-token)
+    if (lw.attnPostNorm) {
+      for (var b = 0; b < batchSize; b = b + 1) {
+        rmsnormGemma(bXb2[b], bXb2[b], lw.attnPostNorm, dim, eps, invDim)
+      }
+    }
+
+    for (var b = 0; b < batchSize; b = b + 1) {
+      accum(bX[b], bXb2[b], dim)
+    }
+
+    // Batch FFN rmsnorm
+    for (var b = 0; b < batchSize; b = b + 1) {
+      rmsnormGemma(bXb[b], bX[b], lw.rmsFfnWeight, dim, eps, invDim)
+    }
+
+    // Batch FFN matmuls
+    matmulQuantizedBatch(bHb, bXb, lw.w1, batchSize)
+    matmulQuantizedBatch(bHb2, bXb, lw.w3, batchSize)
+
+    // Per-token GELU activation
+    var hd4 = hiddenDim & ~3
+    var GELU_A = 0.7978845608
+    var GELU_B = 0.035677408137
+    for (var b = 0; b < batchSize; b = b + 1) {
+      var hbArr = bHb[b]
+      var hb2Arr = bHb2[b]
+      for (var i = 0; i < hd4; i = i + 4) {
+        var x0 = hbArr[i]
+        var x1 = hbArr[i + 1]
+        var x2 = hbArr[i + 2]
+        var x3 = hbArr[i + 3]
+        hbArr[i] =
+          0.5 * x0 * (1.0 + fastTanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
+        hbArr[i + 1] =
+          0.5 *
+          x1 *
+          (1.0 + fastTanh(x1 * (GELU_A + GELU_B * x1 * x1))) *
+          hb2Arr[i + 1]
+        hbArr[i + 2] =
+          0.5 *
+          x2 *
+          (1.0 + fastTanh(x2 * (GELU_A + GELU_B * x2 * x2))) *
+          hb2Arr[i + 2]
+        hbArr[i + 3] =
+          0.5 *
+          x3 *
+          (1.0 + fastTanh(x3 * (GELU_A + GELU_B * x3 * x3))) *
+          hb2Arr[i + 3]
+      }
+      for (var i = hd4; i < hiddenDim; i = i + 1) {
+        var x = hbArr[i]
+        hbArr[i] =
+          0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
+      }
+    }
+
+    // Batch FFN down matmul
+    matmulQuantizedBatch(bXb, bHb, lw.w2, batchSize)
+
+    // Post-FFN norm (per-token)
+    if (lw.ffnPostNorm) {
+      for (var b = 0; b < batchSize; b = b + 1) {
+        rmsnormGemma(bXb[b], bXb[b], lw.ffnPostNorm, dim, eps, invDim)
+      }
+    }
+
+    for (var b = 0; b < batchSize; b = b + 1) {
+      accum(bX[b], bXb[b], dim)
+    }
+  }
+}
+
 // Dispatch to model-specific transformer (#21)
 function transformer(token, pos, computeLogits) {
   if (state.isGemma) {
     transformerGemma(token, pos, computeLogits)
   } else {
     transformerLlama(token, pos, computeLogits)
+  }
+}
+
+// Dispatch to model-specific batched prefill
+function transformerPrefill(allTokens, startPos, batchSize) {
+  if (state.isGemma) {
+    transformerPrefillGemma(allTokens, startPos, batchSize)
+  } else {
+    transformerPrefillLlama(allTokens, startPos, batchSize)
   }
 }
 
@@ -4658,7 +5295,18 @@ function generate(chatHistory) {
     effectiveMaxTokens = config.seqLen
   }
 
-  for (var step = 0; step < effectiveMaxTokens; step = step + 1) {
+  // Batched prefill: process all prompt tokens except the last in batches
+  if (numPromptTokens > 1) {
+    var prefillEnd = numPromptTokens - 1
+    while (pos < prefillEnd) {
+      var bs = Math.min(PREFILL_BATCH_SIZE, prefillEnd - pos)
+      transformerPrefill(promptTokens, pos, bs)
+      pos = pos + bs
+    }
+    token = promptTokens[pos]
+  }
+
+  for (var step = pos; step < effectiveMaxTokens; step = step + 1) {
     transformer(token, pos, pos >= numPromptTokens - 1)
 
     var next
