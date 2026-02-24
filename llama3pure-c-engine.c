@@ -36,6 +36,7 @@ Supports GGUF file format with various quantization types.
     #define open    _open
     #define close   _close
     #define lseek   _lseeki64
+    #define ftell   _ftelli64
     #define strdup  _strdup
     typedef __int64 off_t;
 
@@ -2606,9 +2607,9 @@ GGUFFile* parse_gguf_file(const char* filename) {
     }
 
     // Calculate alignment and tensor data start
-    long header_end = ftell(f);
+    int64_t header_end = ftell(f);
     uint64_t alignment = get_gguf_int(gguf, "general.alignment", 32);
-    long tensor_data_offset = ((header_end + alignment - 1) / alignment) * alignment;
+    int64_t tensor_data_offset = ((header_end + alignment - 1) / alignment) * alignment;
 
     fclose(f);
 
@@ -5091,7 +5092,7 @@ int main(int argc, char *argv[]) {
             exit_code = 1; goto cleanup;
         }
         fseek(f, 0, SEEK_END);
-        long fsize = ftell(f);
+        int64_t fsize = ftell(f);
         fseek(f, 0, SEEK_SET);
         char* json = (char*)malloc(fsize + 1);
         fread(json, 1, fsize, f);
