@@ -305,8 +305,8 @@ typedef struct {
     int kv_dim;
     int q_dim;
     int kv_mul;
-    int head_seq_bytes;          // seq_len * head_q8_bytes (per-head KV stride)
-    int kv_cache_layer_size;  // n_kv_heads * head_seq_bytes (for layer offset calculation)
+    size_t head_seq_bytes;       // seq_len * head_q8_bytes (per-head KV stride)
+    size_t kv_cache_layer_size;  // n_kv_heads * head_seq_bytes (for layer offset calculation)
     int head_q8_bytes;        // bytes per head in Q8_0 format (precomputed)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
     float embed_scale;        // sqrt(dim) for Gemma3 embedding scaling
@@ -316,7 +316,7 @@ typedef struct {
     int* head_q_offsets;      // (n_heads,) h * head_size
     int* head_att_offsets;    // (n_heads,) h * seq_len
     int* head_kv_indices;     // (n_heads,) h / kv_mul (GQA mapping)
-    int* head_kv_byte_offsets; // (n_heads,) kv_head * head_seq_bytes
+    size_t* head_kv_byte_offsets; // (n_heads,) kv_head * head_seq_bytes
     // Q8_0 quantized query buffer for int8*int8 attention scoring
     uint8_t* qQ8;             // (n_heads * head_q8_bytes,) Q8_0 quantized query
     int8_t*  qQ8i8;           // int8 view of qQ8
@@ -367,8 +367,16 @@ void malloc_run_state(RunState* s, Config* p) {
     int head_q8_bytes_init = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
     int head_seq_bytes = p->seq_len * head_q8_bytes_init;
     int kv_cache_layer_bytes = p->n_kv_heads * head_seq_bytes;
-    s->key_cache = calloc((size_t)p->n_layers * kv_cache_layer_bytes, 1);
-    s->value_cache = calloc((size_t)p->n_layers * kv_cache_layer_bytes, 1);
+    size_t kv_cache_total = (size_t)p->n_layers * kv_cache_layer_bytes;
+    s->key_cache = calloc(kv_cache_total, 1);
+    s->value_cache = calloc(kv_cache_total, 1);
+    if (!s->key_cache || !s->value_cache) {
+        fprintf(stderr, "Failed to allocate KV cache (%.1f GB requested per cache, %.1f GB total)\n",
+                (double)kv_cache_total / (1024.0 * 1024.0 * 1024.0),
+                (double)kv_cache_total * 2.0 / (1024.0 * 1024.0 * 1024.0));
+        fprintf(stderr, "Try reducing with: -context_size 4096\n");
+        exit(1);
+    }
 
     // Pre-compute RoPE frequencies to avoid powf in hot loop
     int rope_size = head_size / 2;
@@ -437,7 +445,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->head_q_offsets = calloc(p->n_heads, sizeof(int));
     s->head_att_offsets = calloc(p->n_heads, sizeof(int));
     s->head_kv_indices = calloc(p->n_heads, sizeof(int));
-    s->head_kv_byte_offsets = calloc(p->n_heads, sizeof(int));
+    s->head_kv_byte_offsets = calloc(p->n_heads, sizeof(size_t));
     for (int h = 0; h < p->n_heads; h++) {
         s->head_q_offsets[h] = h * head_size;
         s->head_att_offsets[h] = h * p->seq_len;
@@ -2616,28 +2624,53 @@ GGUFFile* parse_gguf_file(const char* filename) {
 
     // Memory map the file for tensor data access
 #if defined _WIN32
-    int fd = open(filename, O_RDONLY | _O_BINARY);
+    {
+        HANDLE hFile = CreateFileA(filename, GENERIC_READ, FILE_SHARE_READ, NULL,
+                                   OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            fprintf(stderr, "Failed to open file for mmap\n");
+            return NULL;
+        }
+        LARGE_INTEGER file_size_li;
+        if (!GetFileSizeEx(hFile, &file_size_li)) {
+            fprintf(stderr, "Failed to get file size\n");
+            CloseHandle(hFile);
+            return NULL;
+        }
+        size_t file_size = (size_t)file_size_li.QuadPart;
+        HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        CloseHandle(hFile);
+        if (!hMapping) {
+            fprintf(stderr, "Failed to create file mapping\n");
+            return NULL;
+        }
+        mapped_data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+        CloseHandle(hMapping);
+        mapped_size = file_size;
+        if (!mapped_data) {
+            fprintf(stderr, "Failed to map view of file\n");
+            return NULL;
+        }
+    }
 #else
-    int fd = open(filename, O_RDONLY);
+    {
+        int fd = open(filename, O_RDONLY);
+        if (fd == -1) {
+            fprintf(stderr, "Failed to open file for mmap\n");
+            return NULL;
+        }
+        off_t file_size = lseek(fd, 0, SEEK_END);
+        lseek(fd, 0, SEEK_SET);
+        mapped_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+        mapped_size = file_size;
+        close(fd);
+        if (mapped_data == MAP_FAILED) {
+            fprintf(stderr, "Failed to mmap file\n");
+            mapped_data = NULL;
+            return NULL;
+        }
+    }
 #endif
-    if (fd == -1) {
-        fprintf(stderr, "Failed to open file for mmap\n");
-        return NULL;
-    }
-
-    // Get file size
-    off_t file_size = lseek(fd, 0, SEEK_END);
-    lseek(fd, 0, SEEK_SET);
-
-    mapped_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    mapped_size = file_size;
-    close(fd);
-
-    if (mapped_data == MAP_FAILED) {
-        fprintf(stderr, "Failed to mmap file\n");
-        mapped_data = NULL;
-        return NULL;
-    }
 
     gguf->tensor_data_start = (char*)mapped_data + tensor_data_offset;
 
@@ -3266,10 +3299,10 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // save key,value at this time step (pos) to our kv cache (Q8_0 quantized)
         // Per-head layout: [layer][kv_head][position][head_data]
         int head_q8_bytes = s->head_q8_bytes;
-        int head_seq_bytes = s->head_seq_bytes;
-        int loff = l * s->kv_cache_layer_size;
+        size_t head_seq_bytes = s->head_seq_bytes;
+        size_t loff = (size_t)l * s->kv_cache_layer_size;
         for (int kh = 0; kh < p->n_kv_heads; kh++) {
-            int cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
+            size_t cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
             quantize_to_q8_0_cache(s->k + kh * head_size, s->key_cache + cache_offset, head_size);
             quantize_to_q8_0_cache(s->v + kh * head_size, s->value_cache + cache_offset, head_size);
         }
@@ -3294,11 +3327,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         int kvH;
         #pragma omp parallel for private(kvH)
         for (kvH = 0; kvH < p->n_kv_heads; kvH++) {
-            int kBase = loff + kvH * head_seq_bytes;
+            size_t kBase = loff + kvH * head_seq_bytes;
 
             // Score all Q heads in this GQA group against all K positions
             for (int t = start_t; t <= pos; t++) {
-                int kOff = kBase + t * head_q8_bytes;
+                size_t kOff = kBase + t * head_q8_bytes;
                 const uint8_t* kQ8 = s->key_cache + kOff;
                 const int8_t* kI8 = (const int8_t*)kQ8;
                 for (int mh = 0; mh < kv_mul; mh++) {
@@ -3319,7 +3352,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 // Value accumulation - position-first for V cache locality
                 float* xb = s->xb + s->head_q_offsets[h];
                 for (int t = start_t; t <= pos; t++) {
-                    int vOff = kBase + t * head_q8_bytes;
+                    size_t vOff = kBase + t * head_q8_bytes;
                     accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
                 }
             }
@@ -3417,7 +3450,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
     int half = head_size / 2;
     int kv_mul = s->kv_mul;
     int head_q8_bytes = s->head_q8_bytes;
-    int head_seq_bytes = s->head_seq_bytes;
+    size_t head_seq_bytes = s->head_seq_bytes;
     float attn_scale = s->attn_scale;
 
     float* bx  = s->batch_x;
@@ -3461,7 +3494,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
         // Per-token: QK norms, RoPE, KV cache write, attention
         int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
-        int loff = l * s->kv_cache_layer_size;
+        size_t loff = (size_t)l * s->kv_cache_layer_size;
 
         for (int b = 0; b < batch_size; b++) {
             int pos = start_pos + b;
@@ -3528,7 +3561,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
             // Per-head KV cache write
             for (int kh = 0; kh < p->n_kv_heads; kh++) {
-                int cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
+                size_t cache_offset = loff + kh * head_seq_bytes + (size_t)pos * head_q8_bytes;
                 quantize_to_q8_0_cache(k_arr + kh * head_size, s->key_cache + cache_offset, head_size);
                 quantize_to_q8_0_cache(v_arr + kh * head_size, s->value_cache + cache_offset, head_size);
             }
@@ -3548,11 +3581,11 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
             // GQA-batched attention with Q8 scoring
             for (int kvH = 0; kvH < p->n_kv_heads; kvH++) {
-                int kBase = loff + kvH * head_seq_bytes;
+                size_t kBase = loff + kvH * head_seq_bytes;
 
                 // Score all Q heads in this GQA group against all K positions
                 for (int t = start_t; t <= pos; t++) {
-                    int kOff = kBase + t * head_q8_bytes;
+                    size_t kOff = kBase + t * head_q8_bytes;
                     const uint8_t* kQ8 = s->key_cache + kOff;
                     const int8_t* kI8 = (const int8_t*)kQ8;
                     for (int mh = 0; mh < kv_mul; mh++) {
@@ -3572,7 +3605,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
                     float* xb = xb_arr + s->head_q_offsets[h];
                     for (int t = start_t; t <= pos; t++) {
-                        int vOff = kBase + t * head_q8_bytes;
+                        size_t vOff = kBase + (size_t)t * head_q8_bytes;
                         accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
                     }
                 }
