@@ -37,6 +37,7 @@ Supports GGUF file format with various quantization types.
     #define close   _close
     #define lseek   _lseeki64
     #define ftell   _ftelli64
+    #define fseek   _fseeki64
     #define strdup  _strdup
     typedef __int64 off_t;
 
