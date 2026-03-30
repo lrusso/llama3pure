@@ -1,7 +1,6 @@
 import llama3pure from "./llama3pure-js-engine.js"
 import { execSync } from "child_process"
 import { fileURLToPath } from "url"
-import { existsSync } from "fs"
 import path from "path"
 import fs from "fs"
 
@@ -9,7 +8,13 @@ const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 
 if (!process.execArgv.includes("--max-old-space-size=16384")) {
-  execSync("node --max-old-space-size=16384 " + __filename, { stdio: "inherit" })
+  execSync(
+    "node --max-old-space-size=16384 " +
+      __filename +
+      " " +
+      process.argv.slice(2).join(" "),
+    { stdio: "inherit" }
+  )
   process.exit()
 }
 
@@ -115,20 +120,88 @@ const testModelUsingNode = (model) => {
   process.stdout.write("\n")
 }
 
-console.log("\x1b[1mRunning C tests...\x1b[0m")
+const testPerformance = () => {
+  const t0 = performance.now()
+  const modelPathPerf = path.resolve(__dirname, "gemma-3-1b-it-Q8_0.gguf")
 
-models.forEach(function (model) {
-  if (existsSync(model)) {
-    console.log("\x1b[1m" + model + "\x1b[0m")
-    testModelUsingC(model)
-  }
-})
+  const buf = readFileAsArrayBuffer(modelPathPerf)
 
-console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
+  const t1 = performance.now()
 
-models.forEach(function (model) {
-  if (existsSync(model)) {
-    console.log("\x1b[1m" + model + "\x1b[0m")
-    testModelUsingNode(model)
-  }
-})
+  let tokenCount = 0
+
+  llama3pure({
+    type: "load",
+    model: buf,
+    cbRender: (token) => {
+      tokenCount++
+      process.stdout.write(token)
+    },
+    systemPrompt: "You are a helpful assistant.",
+    maxTokens: 256,
+    contextSize: 2048,
+    temperature: 0.9,
+    topP: 0.9,
+    topK: 40,
+  })
+
+  const t2 = performance.now()
+
+  llama3pure({
+    type: "generate",
+    chatHistory: [
+      { role: "user", content: "Tell me in 1 line what is Microsoft." },
+      {
+        role: "assistant",
+        content:
+          "Microsoft is a global technology leader known for its innovative products and services.",
+      },
+      { role: "user", content: "Tell me in 1 line the names of the founders." },
+    ],
+  })
+
+  const t3 = performance.now()
+
+  process.stdout.write("\n")
+
+  console.log(
+    "\nRead: " +
+      (t1 - t0).toFixed(0) +
+      " ms | Load: " +
+      (t2 - t1).toFixed(0) +
+      " ms | Generate: " +
+      (t3 - t2).toFixed(0) +
+      " ms | Total: " +
+      (t3 - t0).toFixed(0) +
+      " ms | Tokens: " +
+      tokenCount +
+      " | ms/token: " +
+      ((t3 - t2) / tokenCount).toFixed(0)
+  )
+}
+
+const testAllModels = () => {
+  console.log("\x1b[1mRunning C tests...\x1b[0m")
+
+  models.forEach(function (model) {
+    if (fs.existsSync(model)) {
+      console.log("\x1b[1m" + model + "\x1b[0m")
+      testModelUsingC(model)
+    }
+  })
+
+  console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
+
+  models.forEach(function (model) {
+    if (fs.existsSync(model)) {
+      console.log("\x1b[1m" + model + "\x1b[0m")
+      testModelUsingNode(model)
+    }
+  })
+}
+
+if (process.argv[2] === "perf") {
+  testPerformance()
+} else {
+  testAllModels()
+}
