@@ -184,7 +184,10 @@ const testAllModels = () => {
   console.log("\x1b[1mRunning C tests...\x1b[0m")
 
   models.forEach(function (model) {
-    if (fs.existsSync(model)) {
+    if (
+      fs.existsSync(model) &&
+      (fs.existsSync("llama3pure") || fs.existsSync("llama3pure.exe"))
+    ) {
       console.log("\x1b[1m" + model + "\x1b[0m")
       testModelUsingC(model)
     }
