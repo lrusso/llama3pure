@@ -181,26 +181,31 @@ const testPerformance = () => {
 }
 
 const testAllModels = () => {
-  console.log("\x1b[1mRunning C tests...\x1b[0m")
+  const availableModels = models.filter((model) => fs.existsSync(model))
 
-  models.forEach(function (model) {
-    if (
-      fs.existsSync(model) &&
-      (fs.existsSync("llama3pure") || fs.existsSync("llama3pure.exe"))
-    ) {
+  const jsBuildExists = fs.existsSync("llama3pure-js-engine.js")
+  const nativeBuildExists =
+    fs.existsSync("llama3pure") || fs.existsSync("llama3pure.exe")
+
+  if (nativeBuildExists && availableModels.length > 0) {
+    console.log("\x1b[1mRunning C tests...\x1b[0m")
+
+    availableModels.forEach(function (model) {
       console.log("\x1b[1m" + model + "\x1b[0m")
       testModelUsingC(model)
-    }
-  })
+    })
+  }
 
-  console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
+  if (jsBuildExists && availableModels.length > 0) {
+    console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
 
-  models.forEach(function (model) {
-    if (fs.existsSync(model)) {
-      console.log("\x1b[1m" + model + "\x1b[0m")
-      testModelUsingNode(model)
-    }
-  })
+    models.forEach(function (model) {
+      if (fs.existsSync(model)) {
+        console.log("\x1b[1m" + model + "\x1b[0m")
+        testModelUsingNode(model)
+      }
+    })
+  }
 }
 
 if (process.argv[2] === "perf") {
