@@ -153,7 +153,6 @@
       var replies = []
       var selectedReply = 0
       var useAutoScroll = false
-      var nearBottom = true
 
       var MAX_TOKENS = -1
       var CONTEXT_SIZE = 2048
@@ -367,9 +366,7 @@
         var content = document.querySelector(".content")
         var message = createComponent("span", className, innerHTML)
         content.appendChild(message)
-        if (nearBottom && useAutoScroll) {
-          scrollToBottom()
-        }
+        scrollToBottom()
         return message
       }
 
@@ -377,9 +374,7 @@
         var temp = document.createElement("div")
         temp.innerHTML = newHTML
         reconcileChildren(target, temp)
-        if (nearBottom && useAutoScroll) {
-          scrollToBottom()
-        }
+        scrollToBottom()
       }
 
       function reconcileChildren(existing, updated) {
@@ -628,21 +623,21 @@
           pointerElement.remove()
         }
 
-        if (nearBottom && useAutoScroll) {
+        if (useAutoScroll) {
           scrollToBottom()
         }
 
         rendering = false
       }
 
-      function scrollToBottom() {
+      function scrollToBottom(forcedScroll) {
         var totalHeight = document.documentElement.scrollHeight
         var viewportHeight = window.innerHeight
         var scrollYPosition = window.scrollY
         var pixelsLeft = totalHeight - (scrollYPosition + viewportHeight)
         var finalDistance = Math.max(0, pixelsLeft)
 
-        if (finalDistance > 0) {
+        if (finalDistance > 0 && (useAutoScroll || forcedScroll)) {
           window.scrollTo({
             top: document.body.scrollHeight,
           })
@@ -802,7 +797,7 @@
           //
         }
 
-        scrollToBottom()
+        scrollToBottom(true)
       }
 
       function sendPrompt(prompt) {
@@ -996,24 +991,6 @@
 
           if (customTopK && /^\d+$/.test(customTopK) && parseInt(customTopK) > 0) {
             TOP_K = parseInt(customTopK)
-          }
-
-          if (useAutoScroll) {
-            window.addEventListener("scroll", function () {
-              var lineHeight = parseFloat(getComputedStyle(content).lineHeight) || 24
-              var inputContainerStyle = getComputedStyle(inputContainer)
-              var inputContainerTotalHeight =
-                inputContainer.offsetHeight +
-                parseFloat(inputContainerStyle.marginTop) +
-                parseFloat(inputContainerStyle.marginBottom) +
-                parseFloat(inputContainerStyle.paddingTop) +
-                parseFloat(inputContainerStyle.paddingBottom)
-              var pixelsLeft =
-                document.documentElement.scrollHeight -
-                inputContainerTotalHeight -
-                (window.scrollY + window.innerHeight)
-              nearBottom = pixelsLeft <= lineHeight * 1.5
-            })
           }
 
           pleaseWait.style.display = "none"
