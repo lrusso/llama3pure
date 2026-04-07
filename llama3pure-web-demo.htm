@@ -206,6 +206,7 @@
               var uploader = document.querySelector('input[type="file"]')
               var labelDisclaimer = document.querySelector(".disclaimer")
 
+              labelDisclaimer.style.display = "block"
               labelDisclaimer.innerText = t("disclaimer")
 
               while (content.firstChild) {
@@ -856,8 +857,12 @@
           var inputContainer = document.querySelector(".input_container")
           var inputTextbox = document.querySelector(".input_textbox")
           var inputSend = document.querySelector(".input_send")
+          var labelDisclaimer = document.querySelector(".disclaimer")
 
           headerName.innerText = t("title")
+
+          labelDisclaimer.style.display = "none"
+
           while (content.firstChild) {
             content.removeChild(content.firstChild)
           }
