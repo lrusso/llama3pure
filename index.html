@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8">
-    <title>Llama</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llama3pure</title>
     <link
       rel="icon"
       sizes="16x16"
@@ -11,85 +12,398 @@
     >
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }
-      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #222; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
-      .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.10); max-width: 560px; width: 100%; padding: 40px 36px; }
-      h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 8px; }
-      .subtitle { color: #666; font-size: 0.95rem; margin-bottom: 32px; }
-      .step { display: flex; gap: 16px; margin-bottom: 28px; }
-      .step:last-child { margin-bottom: 0; }
-      .step-number { flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%; background: #1a73e8; color: #fff; font-weight: 700; font-size: 1rem; display: flex; align-items: center; justify-content: center; }
-      .step-content { padding-top: 6px; }
-      .step-content p { font-size: 0.95rem; line-height: 1.6; color: #333; }
-      a { color: #1a73e8; text-decoration: none; word-break: break-all; }
-      a:hover { text-decoration: underline; }
-      .divider { border: none; border-top: 1px solid #eee; margin: 32px 0; }
+
+      :root {
+        --blue: #1a73e8;
+        --blue-dark: #1558b0;
+        --text: #1a1a2e;
+        --muted: #5f6368;
+        --bg: #f8f9ff;
+        --card: #ffffff;
+        --border: #e8eaf6;
+      }
+
+      body {
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        line-height: 1.6;
+      }
+
+      /* NAV */
+      nav {
+        position: sticky;
+        top: 0;
+        background: rgba(248,249,255,0.92);
+        backdrop-filter: blur(10px);
+        border-bottom: 1px solid var(--border);
+        padding: 14px 32px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        z-index: 100;
+      }
+      .nav-logo { font-size: 1.1rem; font-weight: 800; letter-spacing: -0.5px; color: var(--blue); }
+      .nav-cta {
+        background: var(--blue);
+        color: #fff;
+        border: none;
+        border-radius: 8px;
+        padding: 8px 18px;
+        font-size: 0.88rem;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: none;
+        transition: background 0.15s;
+      }
+      .nav-cta:hover { background: var(--blue-dark); }
+
+      /* HERO */
+      .hero {
+        text-align: center;
+        padding: 80px 24px 72px;
+        max-width: 740px;
+        margin: 0 auto;
+      }
+      .hero-badge {
+        display: inline-block;
+        background: #e8f0fe;
+        color: var(--blue);
+        font-size: 0.8rem;
+        font-weight: 600;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        padding: 5px 14px;
+        border-radius: 100px;
+        margin-bottom: 24px;
+      }
+      .hero h1 {
+        font-size: clamp(2rem, 5vw, 3.2rem);
+        font-weight: 800;
+        letter-spacing: -1px;
+        line-height: 1.15;
+        margin-bottom: 20px;
+        color: var(--text);
+      }
+      .hero h1 span { color: var(--blue); }
+      .hero-sub {
+        font-size: 1.1rem;
+        color: var(--muted);
+        max-width: 560px;
+        margin: 0 auto 36px;
+        line-height: 1.75;
+      }
+      .hero-actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+      .btn-primary {
+        background: var(--blue);
+        color: #fff;
+        border: none;
+        border-radius: 10px;
+        padding: 14px 28px;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: none;
+        transition: background 0.15s, transform 0.1s;
+      }
+      .btn-primary:hover { background: var(--blue-dark); transform: translateY(-1px); }
+      .btn-secondary {
+        background: transparent;
+        color: var(--blue);
+        border: 2px solid var(--blue);
+        border-radius: 10px;
+        padding: 13px 28px;
+        font-size: 1rem;
+        font-weight: 600;
+        cursor: pointer;
+        text-decoration: none;
+        transition: background 0.15s;
+      }
+      .btn-secondary:hover { background: #e8f0fe; }
+
+      /* SECTIONS */
+      .section { padding: 72px 24px; max-width: 1040px; margin: 0 auto; }
+      .section-label {
+        text-align: center;
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        color: var(--blue);
+        margin-bottom: 12px;
+      }
+      .section-title {
+        text-align: center;
+        font-size: clamp(1.5rem, 3vw, 2rem);
+        font-weight: 800;
+        letter-spacing: -0.5px;
+        margin-bottom: 48px;
+        color: var(--text);
+      }
+
+      /* FEATURES */
+      .features-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 20px;
+      }
+      .feature-card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 28px 24px;
+        transition: box-shadow 0.2s;
+      }
+      .feature-card:hover { box-shadow: 0 8px 32px rgba(26,115,232,0.10); }
+      .feature-icon { font-size: 1.8rem; margin-bottom: 14px; display: block; }
+      .feature-card h3 { font-size: 1rem; font-weight: 700; margin-bottom: 8px; }
+      .feature-card p { font-size: 0.9rem; color: var(--muted); line-height: 1.6; }
+
+      /* STEPS */
+      .steps-section { background: #fff; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+      .steps-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+        gap: 32px;
+        counter-reset: steps;
+      }
+      .step { counter-increment: steps; position: relative; padding-top: 16px; }
+      .step::before {
+        content: counter(steps);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: var(--blue);
+        color: #fff;
+        font-weight: 800;
+        font-size: 1rem;
+        margin-bottom: 16px;
+      }
+      .step h3 { font-size: 0.95rem; font-weight: 700; margin-bottom: 8px; }
+      .step p { font-size: 0.88rem; color: var(--muted); line-height: 1.65; }
+      .step a { color: var(--blue); word-break: break-all; }
+      .step a:hover { text-decoration: underline; }
+
+      /* FOOTER */
+      footer {
+        text-align: center;
+        padding: 40px 24px;
+        font-size: 0.85rem;
+        color: var(--muted);
+        border-top: 1px solid var(--border);
+      }
+      footer a { color: var(--blue); text-decoration: none; }
+      footer a:hover { text-decoration: underline; }
+
+      @media (max-width: 520px) {
+        nav { padding: 12px 16px; }
+        .hero { padding: 52px 16px 48px; }
+        .section { padding: 52px 16px; }
+      }
     </style>
   </head>
   <body>
-    <div class="card">
-      <h1 id="title">&nbsp;</h1>
-      <p class="subtitle" id="subtitle"></p>
-      <hr class="divider">
-      <div class="step">
-        <div class="step-number">1</div>
-        <div class="step-content"><p id="step1"></p></div>
+    <!-- NAV -->
+    <nav>
+      <span class="nav-logo">llama3pure</span>
+      <a class="nav-cta" id="nav-cta" href="#how-it-works"></a>
+    </nav>
+
+    <!-- HERO -->
+    <section class="hero">
+      <div class="hero-badge" id="hero-badge"></div>
+      <h1 id="hero-title"></h1>
+      <p class="hero-sub" id="hero-sub"></p>
+      <div class="hero-actions">
+        <a
+          class="btn-primary"
+          id="hero-btn1"
+          href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm"
+        ></a>
+        <a
+          class="btn-secondary"
+          id="hero-btn2"
+          href="https://github.com/lrusso/llama3pure"
+          target="_blank"
+          rel="noopener"
+        ></a>
       </div>
-      <div class="step">
-        <div class="step-number">2</div>
-        <div class="step-content"><p id="step2"></p></div>
+    </section>
+
+    <!-- FEATURES -->
+    <section class="section">
+      <p class="section-label" id="feat-label"></p>
+      <h2 class="section-title" id="feat-title"></h2>
+      <div class="features-grid" id="features-grid"></div>
+    </section>
+
+    <!-- STEPS -->
+    <section class="steps-section">
+      <div class="section" id="how-it-works">
+        <p class="section-label" id="steps-label"></p>
+        <h2 class="section-title" id="steps-title"></h2>
+        <div class="steps-grid" id="steps-grid"></div>
       </div>
-      <div class="step">
-        <div class="step-number">3</div>
-        <div class="step-content"><p id="step3"></p></div>
-      </div>
-      <div class="step">
-        <div class="step-number">4</div>
-        <div class="step-content"><p id="step4"></p></div>
-      </div>
-    </div>
+    </section>
+
+    <!-- FOOTER -->
+    <footer>
+      <p id="footer-text"></p>
+    </footer>
+
     <script>
       var APP_STRINGS = {
         es: {
-          title: "llama3pure",
-          subtitle:
-            "Esta herramienta de IA funciona como un programa de chat (similar a WhatsApp) que vive dentro del navegador de internet (Chrome, Firefox o Safari). Para utilizarla, estos los pasos a seguir:",
-          step1:
-            'Descarga el motor: Ingresa al siguiente link para descargar el motor que ejecuta el modelo de IA: <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a>',
-          step2:
-            'Descarga el "cerebro": Descarga el modelo de IA de Google llamado Gemma 3 1B desde <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
-          step3:
-            'Abre el archivo descargado en el primer paso (se abrirá en Chrome, Firefox o Safari), hacer click en "Seleccionar archivo GGUF" y seleccionar el archivo descargado en el segundo paso.',
-          step4:
-            "¡Listo para chatear! Aguarda a que el modelo se cargue y luego escribir un mensaje en el campo de texto para comenzar a chatear.",
+          navCta: "Cómo empezar",
+          heroBadge: "100% en el navegador · Sin servidor · Sin instalación",
+          heroTitle: "IA local, privada y <span>gratuita</span>",
+          heroSub:
+            "llama3pure ejecuta modelos de lenguaje directamente en tu navegador, sin servidores, sin conexión a internet y sin instalar nada. Compatible con Chrome, Firefox y Safari — incluso en iPhone.",
+          heroBtn1: "Descargar motor",
+          heroBtn2: "Ver en GitHub",
+          featLabel: "Por qué llama3pure",
+          featTitle: "IA que respeta tu privacidad",
+          features: [
+            {
+              icon: "🔒",
+              title: "100% privado",
+              desc: "Tus conversaciones nunca salen de tu dispositivo. Sin nubes, sin servidores, sin telemetría.",
+            },
+            {
+              icon: "🌐",
+              title: "Sin instalación",
+              desc: "Abre un archivo .htm en tu navegador. No requiere Node.js, Python ni ningún programa adicional.",
+            },
+            {
+              icon: "📱",
+              title: "Compatible con iOS",
+              desc: "Funciona en Safari para iPhone e iPad, incluso en dispositivos con poca RAM.",
+            },
+            {
+              icon: "⚡",
+              title: "JavaScript puro",
+              desc: "Motor de inferencia escrito desde cero en JS nativo, sin WebAssembly ni dependencias externas.",
+            },
+          ],
+          stepsLabel: "Guía rápida",
+          stepsTitle: "Listo en 3 pasos",
+          steps: [
+            {
+              title: "Descarga el motor",
+              desc: 'Descarga el archivo <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a> desde GitHub Releases.',
+            },
+            {
+              title: "Descarga el modelo",
+              desc: 'Descarga el modelo Gemma 3 1B de Google: <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
+            },
+            {
+              title: "Abre y chatea",
+              desc: 'Abre el archivo .htm en tu navegador, haz clic en "Seleccionar archivo GGUF", elige el modelo descargado y ¡empieza a chatear!',
+            },
+          ],
+          footer:
+            'llama3pure — <a href="https://github.com/lrusso/llama3pure" target="_blank" rel="noopener">GitHub</a> · Código abierto · Por Leonardo Javier Russo',
         },
         en: {
-          title: "llama3pure",
-          subtitle:
-            "The tool works like a chat application (similar to WhatsApp) that runs entirely inside your web browser (Chrome, Firefox or Safari). To use it, here are the steps to follow:",
-          step1:
-            'Download the engine: Visit the following link to download the engine that runs the AI model: <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a>',
-          step2:
-            'Download the "brain": Download Google\'s Gemma 3 1B AI model from <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
-          step3:
-            'Open the file downloaded in step one (it will open in Chrome, Firefox or Safari), click "Select GGUF file" and choose the file downloaded in step two.',
-          step4:
-            "Start chatting! Wait for the model to finish loading, then type a message in the text field to begin the conversation.",
+          navCta: "Get started",
+          heroBadge: "100% in-browser · No server · No install",
+          heroTitle: "Local, private, <span>free</span> AI",
+          heroSub:
+            "llama3pure runs large language models directly inside your browser — no servers, no internet connection required, nothing to install. Works in Chrome, Firefox and Safari, even on iPhone.",
+          heroBtn1: "Download engine",
+          heroBtn2: "View on GitHub",
+          featLabel: "Why llama3pure",
+          featTitle: "AI that respects your privacy",
+          features: [
+            {
+              icon: "🔒",
+              title: "100% private",
+              desc: "Your conversations never leave your device. No cloud, no servers, no telemetry.",
+            },
+            {
+              icon: "🌐",
+              title: "Zero install",
+              desc: "Open a single .htm file in your browser. No Node.js, no Python, no extra software.",
+            },
+            {
+              icon: "📱",
+              title: "iOS compatible",
+              desc: "Runs in Safari on iPhone and iPad, even on devices with limited RAM.",
+            },
+            {
+              icon: "⚡",
+              title: "Pure JavaScript",
+              desc: "Inference engine written from scratch in native JS, with no WebAssembly or external dependencies.",
+            },
+          ],
+          stepsLabel: "Quick start",
+          stepsTitle: "Up and running in 3 steps",
+          steps: [
+            {
+              title: "Download the engine",
+              desc: 'Download <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a> from GitHub Releases.',
+            },
+            {
+              title: "Download the model",
+              desc: 'Download Google\'s Gemma 3 1B model: <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
+            },
+            {
+              title: "Open and chat",
+              desc: 'Open the .htm file in your browser, click "Select GGUF file", choose the downloaded model, and start chatting!',
+            },
+          ],
+          footer:
+            'llama3pure — <a href="https://github.com/lrusso/llama3pure" target="_blank" rel="noopener">GitHub</a> · Open source · By Leonardo Javier Russo',
         },
       }
 
-      var USER_LANG = window.navigator.language.substring(0, 2).toLowerCase()
-      var GET_APP_STRING = APP_STRINGS[USER_LANG] || APP_STRINGS["en"]
+      var lang = (window.navigator.language || "en").substring(0, 2).toLowerCase()
+      var s = APP_STRINGS[lang] || APP_STRINGS["en"]
 
-      function t(stringName) {
-        return GET_APP_STRING[stringName] || ""
+      function set(id, html) {
+        var el = document.getElementById(id)
+        if (el) {
+          el.innerHTML = html
+        }
       }
 
-      document.getElementById("title").textContent = t("title")
-      document.getElementById("subtitle").textContent = t("subtitle")
-      document.getElementById("step1").innerHTML = t("step1")
-      document.getElementById("step2").innerHTML = t("step2")
-      document.getElementById("step3").innerHTML = t("step3")
-      document.getElementById("step4").innerHTML = t("step4")
+      set("nav-cta", s.navCta)
+      set("hero-badge", s.heroBadge)
+      set("hero-title", s.heroTitle)
+      set("hero-sub", s.heroSub)
+      set("hero-btn1", s.heroBtn1)
+      set("hero-btn2", s.heroBtn2)
+      set("feat-label", s.featLabel)
+      set("feat-title", s.featTitle)
+      set("steps-label", s.stepsLabel)
+      set("steps-title", s.stepsTitle)
+      set("footer-text", s.footer)
+
+      var fg = document.getElementById("features-grid")
+      s.features.forEach(function (f) {
+        var card = document.createElement("div")
+        card.className = "feature-card"
+        card.innerHTML =
+          '<span class="feature-icon">' +
+          f.icon +
+          "</span><h3>" +
+          f.title +
+          "</h3><p>" +
+          f.desc +
+          "</p>"
+        fg.appendChild(card)
+      })
+
+      var sg = document.getElementById("steps-grid")
+      s.steps.forEach(function (step) {
+        var el = document.createElement("div")
+        el.className = "step"
+        el.innerHTML = "<h3>" + step.title + "</h3><p>" + step.desc + "</p>"
+        sg.appendChild(el)
+      })
     </script>
   </body>
 </html>
