@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>Llama</title>
+    <link
+      rel="icon"
+      sizes="16x16"
+      type="image/png"
+      href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAMAAAAoLQ9TAAAAAXNSR0IB2cksfwAAAAlwSFlzAAALEwAACxMBAJqcGAAAAX1QTFRFAAAA////+/z9/f7+/f79/f7+/fz8/v//////////////Q1dl/v7+TV5u/////f39naWqR1tpKDlIxcjM/P39/f39lp6jFig4+vv8/P396+7xBRYlvsPH////+/3+ChYjhpaiub/Fs7vCaXqHDhoo/////P39c4SSXWRtbKS9ga3DV19mi56u/f39/f39+Pz7fomXjpadgqzAaZWpn6iveoeX/v/+/f39/f39//z7HoOhFis6rL7Di6GqEB8vMoil///+/f39/f39XG98Tlpiq8PNrcHJQE1VdYeS/f79/f39/P39+/r8dn2GdYOOLDY7OENIaneBhYyV/v7//v/9/f39/P39aHB5WWdxQk5VUl5kSVZgdX2E/P39kJmhMTpFSVdgRlVgNUNRoqy0////l6CnFhkhDRgpDxgmExYer7vC/////f39LDE5FCU0GSY0KS42sLvG/f39jpmiOj5CIiQqLC4yTlJYpLC5jpmiKCovJCcuMTQ5NztBmaWwg7HrngAAAH90Uk5TAC+t4/7836Yewv////+t7//////Y//////////+a/////////xat////////geP//////////9X+///////////9/P/////////73////////////86m////////df///////wv///////+B2P//////uv///////4HV/fvOdbvEOaEAAADWSURBVHicY2QAAkYo+AFiAzEnI+N/JoZ/zH9ZPoEF+H+zMf4EinMwfud6AxTg5PnKA1T+UYCR8R03x2NGRok/X0UgRjxj4GYQYFR7z/D9nyxY4B4TJ4sIo97rP19VobZc4WZQYrR4+OerPlTgFDeDDqPTZaAWSzD/kP0ZBlNG73MMH51gLjvKYMMYdvjP93++YO46+wsMLowcgkCBELDAcvszLN6MDHzs3/9FgwUW2J8Jmwp0es6Cf5FcIIGZ9pp9YM/Jvs0Eq5iUOBXiWwZViBnP5gDZAI29Pzsdbru6AAAAAElFTkSuQmCC"
+    >
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f5f5; color: #222; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+      .card { background: #fff; border-radius: 16px; box-shadow: 0 4px 24px rgba(0,0,0,0.10); max-width: 560px; width: 100%; padding: 40px 36px; }
+      h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 8px; }
+      .subtitle { color: #666; font-size: 0.95rem; margin-bottom: 32px; }
+      .step { display: flex; gap: 16px; margin-bottom: 28px; }
+      .step:last-child { margin-bottom: 0; }
+      .step-number { flex-shrink: 0; width: 36px; height: 36px; border-radius: 50%; background: #1a73e8; color: #fff; font-weight: 700; font-size: 1rem; display: flex; align-items: center; justify-content: center; }
+      .step-content { padding-top: 6px; }
+      .step-content p { font-size: 0.95rem; line-height: 1.6; color: #333; }
+      a { color: #1a73e8; text-decoration: none; word-break: break-all; }
+      a:hover { text-decoration: underline; }
+      .divider { border: none; border-top: 1px solid #eee; margin: 32px 0; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1 id="title">&nbsp;</h1>
+      <p class="subtitle" id="subtitle"></p>
+      <hr class="divider">
+      <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content"><p id="step1"></p></div>
+      </div>
+      <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content"><p id="step2"></p></div>
+      </div>
+      <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content"><p id="step3"></p></div>
+      </div>
+      <div class="step">
+        <div class="step-number">4</div>
+        <div class="step-content"><p id="step4"></p></div>
+      </div>
+    </div>
+    <script>
+      var APP_STRINGS = {
+        es: {
+          title: "llama3pure",
+          subtitle:
+            "Esta herramienta de IA funciona como un programa de chat (similar a WhatsApp) que vive dentro del navegador de internet (Chrome, Firefox o Safari). Para utilizarla, estos los pasos a seguir:",
+          step1:
+            'Descarga el motor: Ingresa al siguiente link para descargar el motor que ejecuta el modelo de IA: <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a>',
+          step2:
+            'Descarga el "cerebro": Descarga el modelo de IA de Google llamado Gemma 3 1B desde <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
+          step3:
+            'Abre el archivo descargado en el primer paso (se abrirá en Chrome, Firefox o Safari), hacer click en "Seleccionar archivo GGUF" y seleccionar el archivo descargado en el segundo paso.',
+          step4:
+            "¡Listo para chatear! Aguarda a que el modelo se cargue y luego escribir un mensaje en el campo de texto para comenzar a chatear.",
+        },
+        en: {
+          title: "llama3pure",
+          subtitle:
+            "The tool works like a chat application (similar to WhatsApp) that runs entirely inside your web browser (Chrome, Firefox or Safari). To use it, here are the steps to follow:",
+          step1:
+            'Download the engine: Visit the following link to download the engine that runs the AI model: <a href="https://github.com/lrusso/llama3pure/releases/download/1.0.0/llama3pure-web-standalone.htm">llama3pure-web-standalone.htm</a>',
+          step2:
+            'Download the "brain": Download Google\'s Gemma 3 1B AI model from <a href="https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q8_0.gguf?download=true">gemma-3-1b-it-Q8_0.gguf</a>',
+          step3:
+            'Open the file downloaded in step one (it will open in Chrome, Firefox or Safari), click "Select GGUF file" and choose the file downloaded in step two.',
+          step4:
+            "Start chatting! Wait for the model to finish loading, then type a message in the text field to begin the conversation.",
+        },
+      }
+
+      var USER_LANG = window.navigator.language.substring(0, 2).toLowerCase()
+      var GET_APP_STRING = APP_STRINGS[USER_LANG] || APP_STRINGS["en"]
+
+      function t(stringName) {
+        return GET_APP_STRING[stringName] || ""
+      }
+
+      document.getElementById("title").textContent = t("title")
+      document.getElementById("subtitle").textContent = t("subtitle")
+      document.getElementById("step1").innerHTML = t("step1")
+      document.getElementById("step2").innerHTML = t("step2")
+      document.getElementById("step3").innerHTML = t("step3")
+      document.getElementById("step4").innerHTML = t("step4")
+    </script>
+  </body>
+</html>
