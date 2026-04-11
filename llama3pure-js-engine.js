@@ -123,7 +123,7 @@ function decodeUTF8(bytes) {
 function createStreamingUTF8Decoder() {
   var pendingBytes = []
   return {
-    decode: function (bytes, stream) {
+    decode: function decode(bytes, stream) {
       var i
       var j
       var b0
@@ -3998,6 +3998,103 @@ function accum(a, b, size) {
 // ----------------------------------------------------------------------------
 // GGUF parsing
 
+// Metadata keys confirmed unused by the engine. Skipping them avoids decoding
+// large string arrays (e.g. tokenizer.ggml.merges has ~280K strings in Llama models).
+var SKIP_METADATA_KEYS = {
+  "tokenizer.ggml.merges": true,
+  "tokenizer.ggml.pre": true,
+  "tokenizer.chat_template": true,
+  "general.name": true,
+  "general.description": true,
+  "general.author": true,
+  "general.license": true,
+  "general.url": true,
+  "general.version": true,
+  "general.type": true,
+  "general.tags": true,
+  "general.languages": true,
+  "general.datasets": true,
+  "general.finetune": true,
+  "general.source.url": true,
+  "general.source.huggingface.repository": true,
+}
+
+// Advance offset past a value without building any JS objects.
+// Used for metadata keys that the engine doesn't read.
+function skipGGUFValue(type) {
+  var arrType
+  var arrLen
+  var slen
+  var u8
+  var i
+  switch (type) {
+    case GGUF_TYPE.UINT8:
+    case GGUF_TYPE.INT8:
+    case GGUF_TYPE.BOOL:
+      offset = offset + 1
+      break
+    case GGUF_TYPE.UINT16:
+    case GGUF_TYPE.INT16:
+      offset = offset + 2
+      break
+    case GGUF_TYPE.UINT32:
+    case GGUF_TYPE.INT32:
+    case GGUF_TYPE.FLOAT32:
+      offset = offset + 4
+      break
+    case GGUF_TYPE.UINT64:
+    case GGUF_TYPE.INT64:
+    case GGUF_TYPE.FLOAT64:
+      offset = offset + 8
+      break
+    case GGUF_TYPE.STRING:
+      // Read low 4 bytes of uint64 length (high 4 bytes are always 0 for strings)
+      slen =
+        ggufUint8[offset] |
+        (ggufUint8[offset + 1] << 8) |
+        (ggufUint8[offset + 2] << 16) |
+        (ggufUint8[offset + 3] << 24)
+      offset = offset + 8 + slen
+      break
+    case GGUF_TYPE.ARRAY:
+      arrType = readUint32()
+      arrLen = readUint64()
+      if (
+        arrType === GGUF_TYPE.UINT8 ||
+        arrType === GGUF_TYPE.INT8 ||
+        arrType === GGUF_TYPE.BOOL
+      ) {
+        offset = offset + arrLen
+      } else if (arrType === GGUF_TYPE.UINT16 || arrType === GGUF_TYPE.INT16) {
+        offset = offset + arrLen * 2
+      } else if (
+        arrType === GGUF_TYPE.UINT32 ||
+        arrType === GGUF_TYPE.INT32 ||
+        arrType === GGUF_TYPE.FLOAT32
+      ) {
+        offset = offset + arrLen * 4
+      } else if (
+        arrType === GGUF_TYPE.UINT64 ||
+        arrType === GGUF_TYPE.INT64 ||
+        arrType === GGUF_TYPE.FLOAT64
+      ) {
+        offset = offset + arrLen * 8
+      } else if (arrType === GGUF_TYPE.STRING) {
+        // Scan through variable-length strings without decoding them
+        u8 = ggufUint8
+        for (i = 0; i < arrLen; i = i + 1) {
+          slen =
+            u8[offset] |
+            (u8[offset + 1] << 8) |
+            (u8[offset + 2] << 16) |
+            (u8[offset + 3] << 24)
+          offset = offset + 8 + slen
+        }
+      }
+      break
+  }
+}
+
 function parseGGUF(arrayBuffer) {
   ggufData = arrayBuffer
   dataView = new DataView(arrayBuffer)
@@ -4025,7 +4122,11 @@ function parseGGUF(arrayBuffer) {
   for (i = 0; i < nKV; i = i + 1) {
     key = readString()
     valueType = readUint32()
-    metadata[key] = readGGUFValue(valueType)
+    if (SKIP_METADATA_KEYS[key]) {
+      skipGGUFValue(valueType)
+    } else {
+      metadata[key] = readGGUFValue(valueType)
+    }
   }
 
   var tensors = {}
@@ -4114,6 +4215,22 @@ function readGGUFValue(type) {
           arr = new Uint32Array(ggufData.slice(offset, offset + arrBytes))
         }
         offset = offset + arrBytes
+        return arr
+      }
+      if (arrType === GGUF_TYPE.STRING) {
+        // Fast-path: read length directly from ggufUint8 with a local position variable.
+        // Eliminates ~3 function-call frames and 2 DataView reads per element vs. the
+        // generic loop. The high 4 bytes of each uint64 length are always 0 for strings.
+        var arr = new Array(arrLen)
+        var u8 = ggufUint8
+        var p = offset
+        for (var i = 0; i < arrLen; i = i + 1) {
+          var slen = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | (u8[p + 3] << 24)
+          p = p + 8
+          arr[i] = decodeUTF8(u8.subarray(p, p + slen))
+          p = p + slen
+        }
+        offset = p
         return arr
       }
       var arr = new Array(arrLen)
