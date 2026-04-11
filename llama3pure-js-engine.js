@@ -69,6 +69,137 @@ var kvalues_iq4nl = [
 ]
 
 // ----------------------------------------------------------------------------
+// UTF-8 decoding
+
+function decodeUTF8(bytes) {
+  var str = ""
+  var i = 0
+  var len = bytes.length
+  while (i < len) {
+    var b0 = bytes[i]
+    if (b0 < 0x80) {
+      str = str + String.fromCharCode(b0)
+      i = i + 1
+    } else if ((b0 & 0xe0) === 0xc0) {
+      if (i + 1 < len) {
+        str = str + String.fromCharCode(((b0 & 0x1f) << 6) | (bytes[i + 1] & 0x3f))
+        i = i + 2
+      } else {
+        i = i + 1
+      }
+    } else if ((b0 & 0xf0) === 0xe0) {
+      if (i + 2 < len) {
+        str =
+          str +
+          String.fromCharCode(
+            ((b0 & 0x0f) << 12) |
+              ((bytes[i + 1] & 0x3f) << 6) |
+              (bytes[i + 2] & 0x3f)
+          )
+        i = i + 3
+      } else {
+        i = i + 1
+      }
+    } else if ((b0 & 0xf8) === 0xf0) {
+      if (i + 3 < len) {
+        var cp =
+          ((b0 & 0x07) << 18) |
+          ((bytes[i + 1] & 0x3f) << 12) |
+          ((bytes[i + 2] & 0x3f) << 6) |
+          (bytes[i + 3] & 0x3f)
+        cp = cp - 0x10000
+        str = str + String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff))
+        i = i + 4
+      } else {
+        i = i + 1
+      }
+    } else {
+      i = i + 1
+    }
+  }
+  return str
+}
+
+function createStreamingUTF8Decoder() {
+  var pendingBytes = []
+  return {
+    decode: function (bytes, stream) {
+      var i
+      var j
+      var b0
+      var seqLen
+      var cp
+      var combined
+      if (!bytes) {
+        bytes = new Uint8Array(0)
+      }
+      if (pendingBytes.length > 0) {
+        combined = new Uint8Array(pendingBytes.length + bytes.length)
+        for (i = 0; i < pendingBytes.length; i++) {
+          combined[i] = pendingBytes[i]
+        }
+        for (j = 0; j < bytes.length; j++) {
+          combined[pendingBytes.length + j] = bytes[j]
+        }
+        pendingBytes = []
+      } else {
+        combined = bytes
+      }
+      var str = ""
+      var len = combined.length
+      i = 0
+      while (i < len) {
+        b0 = combined[i]
+        if (b0 < 0x80) {
+          seqLen = 1
+        } else if ((b0 & 0xe0) === 0xc0) {
+          seqLen = 2
+        } else if ((b0 & 0xf0) === 0xe0) {
+          seqLen = 3
+        } else if ((b0 & 0xf8) === 0xf0) {
+          seqLen = 4
+        } else {
+          i = i + 1
+          continue
+        }
+        if (i + seqLen > len) {
+          if (stream) {
+            for (j = i; j < len; j++) {
+              pendingBytes.push(combined[j])
+            }
+          }
+          break
+        }
+        if (seqLen === 1) {
+          str = str + String.fromCharCode(b0)
+        } else if (seqLen === 2) {
+          str =
+            str + String.fromCharCode(((b0 & 0x1f) << 6) | (combined[i + 1] & 0x3f))
+        } else if (seqLen === 3) {
+          str =
+            str +
+            String.fromCharCode(
+              ((b0 & 0x0f) << 12) |
+                ((combined[i + 1] & 0x3f) << 6) |
+                (combined[i + 2] & 0x3f)
+            )
+        } else {
+          cp =
+            ((b0 & 0x07) << 18) |
+            ((combined[i + 1] & 0x3f) << 12) |
+            ((combined[i + 2] & 0x3f) << 6) |
+            (combined[i + 3] & 0x3f)
+          cp = cp - 0x10000
+          str = str + String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff))
+        }
+        i = i + seqLen
+      }
+      return str
+    },
+  }
+}
+
+// ----------------------------------------------------------------------------
 // State
 
 var config = null
@@ -77,7 +208,6 @@ var state = null
 var tokenizer = null
 var ggufData = null
 var dataView = null
-var ggufTextDecoder = new TextDecoder("utf-8")
 var offset = 0
 
 // Q8_0 buffers for quantizing x vector in matmulQuantized
@@ -160,7 +290,7 @@ function readString() {
     ? ggufUint8.subarray(offset, offset + len)
     : new Uint8Array(ggufData, offset, len)
   offset = offset + len
-  return ggufTextDecoder.decode(bytes)
+  return decodeUTF8(bytes)
 }
 
 // Cached full-buffer typed array views (initialized on model load)
@@ -214,7 +344,7 @@ var fp16Table = new Float32Array(65536)
         exp = exp - 1
       }
       exp = exp + 1
-      mant &= ~0x400
+      mant = mant & ~0x400
     } else if (exp === 31) {
       fp16Table[h] = mant === 0 ? (sign ? -Infinity : Infinity) : NaN
       continue
@@ -3911,7 +4041,7 @@ function parseGGUF(arrayBuffer) {
 
     var nElements = 1
     for (var d = 0; d < dims.length; d = d + 1) {
-      nElements *= dims[d]
+      nElements = nElements * dims[d]
     }
 
     tensors[name] = {
@@ -4620,7 +4750,9 @@ function transformerLlama(token, pos, computeLogits) {
     // Quantize all Q heads to Q8_0 in one batch call (#15)
     quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-    xbArr.fill(0, 0, qDim)
+    for (var _zfi = 0; _zfi < qDim; _zfi = _zfi + 1) {
+      xbArr[_zfi] = 0
+    }
 
     // GQA-batched attention (#16) with Q8 scoring (#15)
     // Loop reordered: position-first for K/V cache locality (#1)
@@ -4887,7 +5019,9 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
       // Quantize all Q heads to Q8_0
       quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-      xbArr.fill(0, 0, qDim)
+      for (var _zfi = 0; _zfi < qDim; _zfi = _zfi + 1) {
+        xbArr[_zfi] = 0
+      }
 
       // GQA-batched attention with Q8 scoring
       for (var kvH = 0; kvH < nKvHeads; kvH = kvH + 1) {
@@ -5130,7 +5264,9 @@ function transformerGemma(token, pos, computeLogits) {
     // Quantize all Q heads to Q8_0 in one batch call (#15)
     quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-    xbArr.fill(0, 0, qDim)
+    for (var _zfi = 0; _zfi < qDim; _zfi = _zfi + 1) {
+      xbArr[_zfi] = 0
+    }
 
     // SWA window enforcement
     var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
@@ -5448,7 +5584,9 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
       // Quantize all Q heads to Q8_0
       quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-      xbArr.fill(0, 0, qDim)
+      for (var _zfi = 0; _zfi < qDim; _zfi = _zfi + 1) {
+        xbArr[_zfi] = 0
+      }
 
       // SWA start position
       var startT =
@@ -5882,8 +6020,7 @@ function textToSentencePiece(text) {
   return parts.join("")
 }
 
-// Streaming UTF-8 decoder for Llama tokens
-var utf8Decoder = new TextDecoder("utf-8")
+// Streaming UTF-8 decoder for Llama tokens (created per inference run)
 
 // Build tiktoken unicode-to-byte mapping (inverse of bytes_to_unicode)
 var tiktokenUnicodeToByte = null
@@ -6006,9 +6143,9 @@ function decodeToken(token) {
     return piece.replace(/\u2581/g, " ")
   }
 
-  // For Llama (tiktoken), use TextDecoder for proper UTF-8 handling
+  // For Llama (tiktoken), decode UTF-8 bytes to string
   var bytes = tokenToBytes(token)
-  return utf8Decoder.decode(bytes)
+  return decodeUTF8(bytes)
 }
 
 function bpeEncode(text) {
@@ -6235,10 +6372,8 @@ function generate(chatHistory) {
   // Token stream for repeat detection (avoids string search on growing output)
   var generatedTokens = []
 
-  // Use streaming TextDecoder for Llama to handle UTF-8 across token boundaries
-  var streamDecoder = config.isGemma
-    ? null
-    : new TextDecoder("utf-8", { fatal: false })
+  // Use streaming UTF-8 decoder for Llama to handle multi-byte sequences across token boundaries
+  var streamDecoder = config.isGemma ? null : createStreamingUTF8Decoder()
 
   var effectiveMaxTokens = maxTokens
   if (effectiveMaxTokens <= 0 || effectiveMaxTokens > config.seqLen) {
@@ -6285,7 +6420,7 @@ function generate(chatHistory) {
       } else {
         // For Llama, use streaming decoder to handle multi-byte UTF-8 across tokens
         var bytes = tokenToBytes(next)
-        decoded = streamDecoder.decode(bytes, { stream: true })
+        decoded = streamDecoder.decode(bytes, true)
       }
 
       // Buffer newlines - only output if followed by non-end token
@@ -6423,4 +6558,6 @@ if (typeof self !== "undefined" && typeof self.postMessage === "function") {
   }
 }
 
-export default llama3pure
+if (typeof module !== "undefined") {
+  module.exports = llama3pure
+}
