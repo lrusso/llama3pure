@@ -3961,63 +3961,151 @@ char* text_to_sentencepiece(const char* text) {
     return result;
 }
 
-// Build trie for O(max_token_len) longest-match lookup
-typedef struct TrieNode {
-    struct TrieNode* children[256];  // byte-indexed children
-    int id;   // token id (-1 if not a terminal)
-    int len;  // token length (valid when id >= 0)
-} TrieNode;
+// Flat CSR byte trie for longest-match vocab lookup. The old
+// `TrieNode { TrieNode* children[256]; int id; int len; }` was 2056 bytes
+// per node × ~1.6M nodes on Gemma's 262k-token vocab ≈ 3 GB virtual /
+// 1.28 GB dirty, because each node carried a 256-pointer fan-out array.
+//
+// CSR layout:
+//   trie_node_id[N]      : int32, token id for terminal nodes, -1 otherwise
+//   trie_child_start[N+1]: int32, per-node CSR offset into edge arrays
+//                          (children of n are at [child_start[n], child_start[n+1]))
+//   trie_edge_char[E]    : uint8, byte value of each edge (sorted per parent)
+//   trie_edge_target[E]  : int32, target node index of each edge
+// Totals ~19 MB instead of 1.28 GB for Gemma — same data structure the JS
+// engine uses (see llama3pure-js-engine.js `trieChildStart`/`trieEdgeChar`).
+static int32_t* trie_node_id = NULL;
+static int32_t* trie_child_start = NULL;
+static uint8_t* trie_edge_char = NULL;
+static int32_t* trie_edge_target = NULL;
+static int trie_built = 0;
 
-static TrieNode* vocab_trie = NULL;
-static TrieNode* trie_pool = NULL;  // single allocation for all nodes
-static int trie_pool_used = 0;
-static int trie_pool_cap = 0;
-// O(1) single-byte token lookup (fallback when trie misses)
-static int single_char_token[256];  // token id for each byte, -1 if none
+// O(1) single-byte token lookup (fallback when trie walk misses)
+static int single_char_token[256];
 
-TrieNode* alloc_trie_node(void) {
-    if (trie_pool_used >= trie_pool_cap) {
-        // Should not happen if we sized the pool correctly
-        return calloc(1, sizeof(TrieNode));
-    }
-    TrieNode* node = &trie_pool[trie_pool_used++];
-    memset(node, 0, sizeof(TrieNode));
-    node->id = -1;
-    return node;
+// qsort comparator state: the vocab pointer is set transiently around the
+// sort call (no reentrancy, single-threaded load).
+static char** __sort_vocab = NULL;
+static int __sort_cmp_vocab(const void* a, const void* b) {
+    int ia = *(const int*)a;
+    int ib = *(const int*)b;
+    return strcmp(__sort_vocab[ia], __sort_vocab[ib]);
 }
 
 void build_sorted_vocab(char** vocab, int vocab_size) {
-    if (vocab_trie) return;  // Already built
+    if (trie_built) return;
+    trie_built = 1;
 
-    // Count total characters to estimate pool size (nodes needed <= total chars + 1)
-    int total_chars = 1;  // +1 for root
+    // Collect indices of non-empty tokens; record max length for path[] stack
+    int count = 0;
+    int max_len = 0;
     for (int i = 0; i < vocab_size; i++) {
         if (vocab[i] && vocab[i][0]) {
-            total_chars += (int)strlen(vocab[i]);
+            count++;
+            int L = (int)strlen(vocab[i]);
+            if (L > max_len) max_len = L;
         }
     }
-    trie_pool_cap = total_chars;
-    trie_pool = calloc(trie_pool_cap, sizeof(TrieNode));
+    if (count == 0) return;
 
-    vocab_trie = alloc_trie_node();
-
+    int* indices = malloc((size_t)count * sizeof(int));
+    int w = 0;
     for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && vocab[i][0]) {
-            TrieNode* node = vocab_trie;
-            int len = (int)strlen(vocab[i]);
-            for (int j = 0; j < len; j++) {
-                unsigned char ch = (unsigned char)vocab[i][j];
-                if (!node->children[ch]) {
-                    node->children[ch] = alloc_trie_node();
-                }
-                node = node->children[ch];
-            }
-            node->id = i;
-            node->len = len;
-        }
+        if (vocab[i] && vocab[i][0]) indices[w++] = i;
     }
 
-    // Build O(1) single-byte token lookup for fallback
+    // Sort indices by byte-wise string comparison so identical prefixes end
+    // up adjacent — enables O(totalBytes) LCP-based trie build.
+    __sort_vocab = vocab;
+    qsort(indices, (size_t)count, sizeof(int), __sort_cmp_vocab);
+    __sort_vocab = NULL;
+
+    // Pass 1: count the total unique trie nodes via prev-token LCP.
+    int total_nodes = 1;  // root
+    const char* prev = "";
+    int prev_len = 0;
+    for (int m = 0; m < count; m++) {
+        const char* s = vocab[indices[m]];
+        int s_len = (int)strlen(s);
+        int min_len = prev_len < s_len ? prev_len : s_len;
+        int lcp = 0;
+        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
+        total_nodes += s_len - lcp;
+        prev = s;
+        prev_len = s_len;
+    }
+    int total_edges = total_nodes - 1;
+
+    // Allocate exact-size CSR arrays. child_start is used as a per-node
+    // child *count* during pass 2 (via child_start[parent+1]++), then
+    // prefix-summed into real start offsets.
+    trie_node_id = malloc((size_t)total_nodes * sizeof(int32_t));
+    for (int i = 0; i < total_nodes; i++) trie_node_id[i] = -1;
+    trie_child_start = calloc((size_t)total_nodes + 1, sizeof(int32_t));
+    trie_edge_char = malloc((size_t)total_edges);
+    trie_edge_target = malloc((size_t)total_edges * sizeof(int32_t));
+
+    int* path = malloc((size_t)(max_len + 1) * sizeof(int));
+    path[0] = 0;
+
+    // Pass 2: assign node ids and count children per node.
+    int node_idx = 1;
+    prev = "";
+    prev_len = 0;
+    for (int m = 0; m < count; m++) {
+        const char* s = vocab[indices[m]];
+        int s_len = (int)strlen(s);
+        int min_len = prev_len < s_len ? prev_len : s_len;
+        int lcp = 0;
+        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
+        for (int j = lcp; j < s_len; j++) {
+            int parent = path[j];
+            trie_child_start[parent + 1]++;
+            int new_node = node_idx++;
+            path[j + 1] = new_node;
+        }
+        prev = s;
+        prev_len = s_len;
+    }
+
+    // Prefix-sum counts into cumulative start offsets.
+    for (int n = 1; n <= total_nodes; n++) {
+        trie_child_start[n] += trie_child_start[n - 1];
+    }
+
+    // Pass 3: fill edges. Tokens are sorted lex by byte, so children at each
+    // parent are emitted in ascending byte order — matches CSR layout.
+    int* write_cursor = malloc((size_t)total_nodes * sizeof(int));
+    for (int i = 0; i < total_nodes; i++) write_cursor[i] = trie_child_start[i];
+    path[0] = 0;
+    node_idx = 1;
+    prev = "";
+    prev_len = 0;
+    for (int m = 0; m < count; m++) {
+        int tok_id = indices[m];
+        const char* s = vocab[tok_id];
+        int s_len = (int)strlen(s);
+        int min_len = prev_len < s_len ? prev_len : s_len;
+        int lcp = 0;
+        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
+        for (int j = lcp; j < s_len; j++) {
+            int parent = path[j];
+            int new_node = node_idx++;
+            int wi = write_cursor[parent]++;
+            trie_edge_char[wi] = (unsigned char)s[j];
+            trie_edge_target[wi] = new_node;
+            path[j + 1] = new_node;
+        }
+        trie_node_id[path[s_len]] = tok_id;
+        prev = s;
+        prev_len = s_len;
+    }
+
+    free(write_cursor);
+    free(path);
+    free(indices);
+
+    // Build O(1) single-byte token lookup for bpe_encode fallback.
     memset(single_char_token, -1, sizeof(single_char_token));
     for (int i = 0; i < vocab_size; i++) {
         if (vocab[i] && vocab[i][0] && vocab[i][1] == '\0') {
@@ -4055,17 +4143,24 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
     size_t pos = 0;
 
     while (pos < text_len) {
-        // Walk trie for longest match at current position
-        TrieNode* node = vocab_trie;
+        // Walk CSR byte trie for longest match at current position.
+        int32_t node = 0;  // root
         int best_id = -1;
         int best_len = 0;
         for (size_t j = pos; j < text_len; j++) {
             unsigned char ch = (unsigned char)encoded_text[j];
-            node = node->children[ch];
-            if (!node) break;
-            if (node->id >= 0) {
-                best_id = node->id;
-                best_len = node->len;
+            int32_t cs = trie_child_start[node];
+            int32_t ce = trie_child_start[node + 1];
+            int32_t next = -1;
+            for (int32_t k = cs; k < ce; k++) {
+                if (trie_edge_char[k] == ch) { next = trie_edge_target[k]; break; }
+            }
+            if (next < 0) break;
+            node = next;
+            int32_t nid = trie_node_id[node];
+            if (nid >= 0) {
+                best_id = (int)nid;
+                best_len = (int)(j - pos + 1);
             }
         }
 
@@ -4201,17 +4296,25 @@ int argmax(float* v, int n) {
 #define GEMMA3_START_TURN 106        // <start_of_turn>
 #define GEMMA3_END_TURN 107          // <end_of_turn>
 
-// Helper to find a special token in vocabulary by its string representation
+// Helper to find a special token in vocabulary by its string representation.
 int find_special_token(const char* token_str) {
-    if (vocab_trie) {
-        // Use trie for O(token_len) exact lookup
-        TrieNode* node = vocab_trie;
+    if (trie_built) {
+        // CSR trie walk — O(token_len × avg_children_per_node). For the few
+        // short ASCII special-token lookups at load + per generate, well
+        // under 1 ms on a 262k-entry vocab.
+        int32_t node = 0;
         for (int i = 0; token_str[i]; i++) {
             unsigned char ch = (unsigned char)token_str[i];
-            node = node->children[ch];
-            if (!node) return -1;
+            int32_t cs = trie_child_start[node];
+            int32_t ce = trie_child_start[node + 1];
+            int32_t next = -1;
+            for (int32_t k = cs; k < ce; k++) {
+                if (trie_edge_char[k] == ch) { next = trie_edge_target[k]; break; }
+            }
+            if (next < 0) return -1;
+            node = next;
         }
-        return node->id;
+        return (int)trie_node_id[node];
     }
     // Fallback: linear scan (trie not built yet)
     for (int i = 0; i < tokenizer.vocab_size; i++) {
@@ -5219,7 +5322,10 @@ cleanup:
     free(q8_buf);
     free(deq_buf);
     free_tokenizer();
-    free(trie_pool);
+    free(trie_node_id);
+    free(trie_child_start);
+    free(trie_edge_char);
+    free(trie_edge_target);
 
     free(prompt_tokens);
     free(generated_tokens);
