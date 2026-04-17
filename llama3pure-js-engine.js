@@ -4619,8 +4619,10 @@ function createRunState(p) {
   // advances (capped at seqLen). Most inference runs touch only a fraction of
   // the configured seqLen — sizing for the full window up front wastes ~27 MB
   // on gemma-3-1b with contextSize=2048 for a typical ~70-position chat turn.
+  // The initial cap trades a handful of doubling copies during prefill
+  // (each O(bytes-already-written), sub-millisecond) for lower sustained RAM.
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-  var initialCap = seqLen < 128 ? seqLen : 128
+  var initialCap = seqLen < 32 ? seqLen : 32
   var headSeqBytes = initialCap * headBytesQ8
   var kvCacheLayerBytes = p.nKvHeads * headSeqBytes
   var kvCacheTotalBytes = p.nLayers * kvCacheLayerBytes
