@@ -4242,25 +4242,35 @@ function readGGUFValue(type) {
         return arr
       }
       if (arrType === GGUF_TYPE.STRING) {
-        // Compact storage: one Uint32Array of cumulative byte offsets into
-        // ggufUint8 — cumOffsets[i] is where token i's bytes start, and its
-        // length is cumOffsets[i+1] - cumOffsets[i] - 8 (the 8-byte length
-        // prefix between adjacent tokens). One combined array of length N+1
-        // replaces the prior offsets+lengths pair (4+2 bytes/entry → 4), saving
-        // ~0.5 MB arraybuf on a 262k-token vocab. Decoding is deferred to the
-        // few call sites that actually need a JS string (see vocabString()).
-        var cumOffsets = new Uint32Array(arrLen + 1)
+        // Storing full cumulative offsets as Uint32Array[N+1] costs ~1 MB on a
+        // 262k-token vocab. Token byte lengths stay small (Gemma ≤48, Llama
+        // ≤256) so we keep Uint16 lengths + a sparse cumulative-offset
+        // checkpoint every SPARSE_STEP entries. Random access reconstructs
+        // the absolute offset by adding at most SPARSE_STEP-1 byte lengths
+        // from the nearest checkpoint — O(SPARSE_STEP) worst-case for
+        // vocabString (called only during token decode, a handful of times
+        // per generate), O(1) amortized when iterating sequentially.
+        var SPARSE_STEP = 256
+        var lengths = new Uint16Array(arrLen)
+        var sparseCum = new Uint32Array(((arrLen - 1) >> 8) + 1)
         var u8 = ggufUint8
         var p = offset
         for (var i = 0; i < arrLen; i = i + 1) {
           var slen = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | (u8[p + 3] << 24)
           p = p + 8
-          cumOffsets[i] = p
+          if ((i & (SPARSE_STEP - 1)) === 0) {
+            sparseCum[i >> 8] = p
+          }
+          lengths[i] = slen
           p = p + slen
         }
-        cumOffsets[arrLen] = p + 8
         offset = p
-        return { __stringRefs: true, cumOffsets: cumOffsets }
+        return {
+          __stringRefs: true,
+          vocabLengths: lengths,
+          vocabSparseCum: sparseCum,
+          vocabSparseStep: SPARSE_STEP,
+        }
       }
       var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
@@ -4340,13 +4350,18 @@ function loadModel(arrayBuffer) {
   }
 
   var vocabRefs = meta["tokenizer.ggml.tokens"]
-  var vocabCumOffsets
+  var vocabLengths
+  var vocabSparseCum
+  var vocabSparseStep = 256
   var vocabSize
   if (vocabRefs && vocabRefs.__stringRefs) {
-    vocabCumOffsets = vocabRefs.cumOffsets
-    vocabSize = vocabCumOffsets.length - 1
+    vocabLengths = vocabRefs.vocabLengths
+    vocabSparseCum = vocabRefs.vocabSparseCum
+    vocabSparseStep = vocabRefs.vocabSparseStep
+    vocabSize = vocabLengths.length
   } else {
-    vocabCumOffsets = new Uint32Array(1)
+    vocabLengths = new Uint16Array(0)
+    vocabSparseCum = new Uint32Array(1)
     vocabSize = 0
   }
 
@@ -4355,7 +4370,9 @@ function loadModel(arrayBuffer) {
   }
 
   tokenizer = {
-    vocabCumOffsets: vocabCumOffsets,
+    vocabLengths: vocabLengths,
+    vocabSparseCum: vocabSparseCum,
+    vocabSparseStep: vocabSparseStep,
     vocabSize: vocabSize,
     bosToken: meta["tokenizer.ggml.bos_token_id"] || 1,
     eosToken: meta["tokenizer.ggml.eos_token_id"] || 2,
@@ -6250,19 +6267,30 @@ function sample(logits, temp) {
 // on demand. The number of actual decodes is tiny (a few per generated token +
 // one-shot at trie build), so the cost is negligible while the heap savings
 // relative to holding 262k decoded JS strings are substantial.
+// Reconstruct the absolute ggufUint8 offset of token i from the sparse
+// checkpoints + dense lengths array. Worst case 255 byte adds (sparse step
+// is 256 entries; the rebuild loop in buildSortedVocab uses the same shift).
+function vocabOffsetOf(i) {
+  var bucket = i >> 8
+  var base = tokenizer.vocabSparseCum[bucket]
+  var lengths = tokenizer.vocabLengths
+  var bucketStart = bucket << 8
+  for (var k = bucketStart; k < i; k = k + 1) {
+    base = base + lengths[k] + 8
+  }
+  return base
+}
+
 function vocabString(i) {
   var n = tokenizer.vocabSize
   if (i < 0 || i >= n) {
     return ""
   }
-  var cum = tokenizer.vocabCumOffsets
-  var off = cum[i]
-  // Length derived from next token's offset (minus the 8-byte GGUF string
-  // length prefix between them); the sentinel at cum[n] includes that +8.
-  var len = cum[i + 1] - off - 8
-  if (len <= 0) {
+  var len = tokenizer.vocabLengths[i]
+  if (len === 0) {
     return ""
   }
+  var off = vocabOffsetOf(i)
   return decodeUTF8(ggufUint8.subarray(off, off + len))
 }
 
@@ -6329,16 +6357,25 @@ function buildSortedVocab() {
   }
 
   var vocabLen = tokenizer.vocabSize
-  var offsets = tokenizer.vocabCumOffsets
+  var lengths = tokenizer.vocabLengths
   var u8 = ggufUint8
 
-  // Derive per-token length from the cumulative offsets once (transient,
-  // freed when this function returns). Having lengths in a flat typed array
-  // keeps the hot sort comparator simple. offsets[i] === cum[i] already
-  // gives the start offset — no separate offsets array needed.
-  var lengths = new Uint16Array(vocabLen)
-  for (var i = 0; i < vocabLen; i = i + 1) {
-    lengths[i] = offsets[i + 1] - offsets[i] - 8
+  // Expand the sparse cumulative-offset checkpoints into a full offsets
+  // array for the duration of trie construction. Peak heap is temporarily
+  // ~1 MB higher (262k × 4 B) during build, released when this function
+  // returns; the permanent storage stays at ~516 KB (lengths + sparse).
+  var offsets = new Uint32Array(vocabLen)
+  var sparseCum = tokenizer.vocabSparseCum
+  for (var b = 0; b < sparseCum.length; b = b + 1) {
+    var acc = sparseCum[b]
+    var end = (b + 1) << 8
+    if (end > vocabLen) {
+      end = vocabLen
+    }
+    for (var i = b << 8; i < end; i = i + 1) {
+      offsets[i] = acc
+      acc = acc + lengths[i] + 8
+    }
   }
 
   // Collect indices of non-empty tokens. We sort these lex by UTF-8 byte value
@@ -6548,28 +6585,31 @@ function findSpecialToken(tokenStr) {
   var target = encodeStringToUTF8(tokenStr)
   var tLen = target.length
   var u8 = ggufUint8
-  var cum = tokenizer.vocabCumOffsets
+  var lengths = tokenizer.vocabLengths
+  var sparseCum = tokenizer.vocabSparseCum
   var vocabSize = tokenizer.vocabSize
-  // Length filter derived from cumulative offsets: len(i) = cum[i+1] - cum[i]
-  // - 8 (next token's 8-byte length prefix). The required tLen is constant
-  // for this call, so we compare against the raw offset gap directly to
-  // skip the subtraction in the inner loop.
-  var gapTarget = tLen + 8
+  // Iterate linearly, maintaining the running offset ourselves. `off` is
+  // anchored at each sparse-bucket boundary from sparseCum (256-entry step,
+  // hardcoded to the shift below) to stay in sync with buildSortedVocab.
+  var off = 0
   for (var i = 0; i < vocabSize; i = i + 1) {
-    if (cum[i + 1] - cum[i] !== gapTarget) {
-      continue
+    if ((i & 255) === 0) {
+      off = sparseCum[i >> 8]
     }
-    var off = cum[i]
-    var match = true
-    for (var k = 0; k < tLen; k = k + 1) {
-      if (u8[off + k] !== target[k]) {
-        match = false
-        break
+    var li = lengths[i]
+    if (li === tLen) {
+      var match = true
+      for (var k = 0; k < tLen; k = k + 1) {
+        if (u8[off + k] !== target[k]) {
+          match = false
+          break
+        }
+      }
+      if (match) {
+        return i
       }
     }
-    if (match) {
-      return i
-    }
+    off = off + li + 8
   }
   return -1
 }
