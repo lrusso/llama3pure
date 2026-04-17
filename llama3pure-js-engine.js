@@ -4253,10 +4253,9 @@ function readGGUFValue(type) {
 function loadModel(arrayBuffer) {
   // Reset vocab cache when loading a new model
   trieNodeId = null
-  trieNodeFirstChild = null
+  trieChildStart = null
   trieEdgeChar = null
   trieEdgeTarget = null
-  trieEdgeNext = null
 
   // Initialize cached buffer views for fast matmul access
   ggufUint8 = new Uint8Array(arrayBuffer)
@@ -6033,15 +6032,62 @@ function vocabString(i) {
   return decodeUTF8(ggufUint8.subarray(off, off + len))
 }
 
-// Flat typed-array trie for vocabulary lookup (memory-efficient replacement
-// for nested-object trie; ~10-20x smaller for 262k-token Gemma vocabularies).
-// Per node: token id (or -1) and head of a linked list of child edges.
-// Per edge: char code, target node, next-sibling edge index.
+// Flat typed-array trie for vocabulary lookup, keyed by UTF-8 bytes. The build
+// walks ggufUint8 directly — no per-token string decode, no Uint16 char codes —
+// which avoids the ~35 MB transient heap spike that decoding 262k vocab
+// strings used to cause. Edges are stored in CSR form (contiguous per parent,
+// sorted by byte value thanks to the lex-sorted token order) so we can drop
+// the edgeNext pointer entirely.
+// Per node: token id (or -1), and childStart offset into the edge arrays.
+//           Children of node n are at [childStart[n], childStart[n+1]).
+// Per edge: byte value (0-255) and target node index.
 var trieNodeId = null
-var trieNodeFirstChild = null
+var trieChildStart = null
 var trieEdgeChar = null
 var trieEdgeTarget = null
-var trieEdgeNext = null
+
+// Encode a JS string to UTF-8 bytes. Used when walking the byte trie with
+// input produced by textToSentencePiece / textToTiktoken / special-token
+// lookups. Worst-case buffer is len*3 (any surrogate pair produces 4 bytes but
+// consumes 2 code units, so *3 bounds both paths).
+function encodeStringToUTF8(str) {
+  var len = str.length
+  var bytes = new Uint8Array(len * 3 + 1)
+  var bi = 0
+  for (var i = 0; i < len; i = i + 1) {
+    var c = str.charCodeAt(i)
+    if (c < 0x80) {
+      bytes[bi] = c
+      bi = bi + 1
+    } else if (c < 0x800) {
+      bytes[bi] = 0xc0 | (c >> 6)
+      bytes[bi + 1] = 0x80 | (c & 0x3f)
+      bi = bi + 2
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
+      var low = str.charCodeAt(i + 1)
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        var cp = 0x10000 + ((c - 0xd800) << 10) + (low - 0xdc00)
+        bytes[bi] = 0xf0 | (cp >> 18)
+        bytes[bi + 1] = 0x80 | ((cp >> 12) & 0x3f)
+        bytes[bi + 2] = 0x80 | ((cp >> 6) & 0x3f)
+        bytes[bi + 3] = 0x80 | (cp & 0x3f)
+        bi = bi + 4
+        i = i + 1
+      } else {
+        bytes[bi] = 0xe0 | (c >> 12)
+        bytes[bi + 1] = 0x80 | ((c >> 6) & 0x3f)
+        bytes[bi + 2] = 0x80 | (c & 0x3f)
+        bi = bi + 3
+      }
+    } else {
+      bytes[bi] = 0xe0 | (c >> 12)
+      bytes[bi + 1] = 0x80 | ((c >> 6) & 0x3f)
+      bytes[bi + 2] = 0x80 | (c & 0x3f)
+      bi = bi + 3
+    }
+  }
+  return bytes.subarray(0, bi)
+}
 
 function buildSortedVocab() {
   if (trieNodeId) {
@@ -6049,154 +6095,178 @@ function buildSortedVocab() {
   }
 
   var vocabLen = tokenizer.vocabSize
+  var offsets = tokenizer.vocabOffsets
   var lengths = tokenizer.vocabLengths
+  var u8 = ggufUint8
 
-  // Decode each non-empty token once into a local array. Freed on function
-  // return — this is a transient working buffer for trie construction, not
-  // retained storage. Skipping decode entirely would require a byte-indexed
-  // trie plus UTF-8 conversion of all input text at tokenize time; keeping
-  // the trie UTF-16-keyed matches what bpeEncode walks with.
+  // Collect indices of non-empty tokens. We sort these lex by UTF-8 byte value
+  // so the trie can be built in O(totalBytes) via prev-token LCP — no per-char
+  // child scan, and no string decoding.
   var count = 0
-  for (var i = 0; i < vocabLen; i = i + 1) {
-    if (lengths[i] > 0) {
-      count = count + 1
-    }
-  }
-  var indices = new Array(count)
-  var strings = new Array(count)
-  var w = 0
   var maxLen = 0
   for (var i = 0; i < vocabLen; i = i + 1) {
-    if (lengths[i] > 0) {
-      var s = vocabString(i)
-      indices[w] = i
-      strings[w] = s
-      w = w + 1
-      if (s.length > maxLen) {
-        maxLen = s.length
+    var li = lengths[i]
+    if (li > 0) {
+      count = count + 1
+      if (li > maxLen) {
+        maxLen = li
       }
     }
   }
-
-  // Lex-sort by token string. After sorting, walking in order means each token
-  // shares a common prefix with the previous one — no per-char child scan needed
-  // during build, giving O(totalChars) construction instead of O(edges^2). We
-  // sort `strings` and `indices` together via an index-permutation sort so that
-  // `strings[m]` stays aligned with `indices[m]` post-sort.
-  var order = new Array(count)
-  for (var i = 0; i < count; i = i + 1) {
-    order[i] = i
+  var indices = new Int32Array(count)
+  var w = 0
+  for (var i = 0; i < vocabLen; i = i + 1) {
+    if (lengths[i] > 0) {
+      indices[w] = i
+      w = w + 1
+    }
   }
-  order.sort(function (a, b) {
-    var sa = strings[a]
-    var sb = strings[b]
-    if (sa < sb) {
-      return -1
+
+  // Byte-wise sort over ggufUint8 ranges — no allocations per comparison.
+  // Array.prototype.sort on an Int32Array is supported since ES2015 but acorn
+  // in ES5 mode is fine with method call, and the runtime (iOS Safari ≥ 10)
+  // supports it. To stay within ES5 value types we copy to a plain Array.
+  var idxArr = new Array(count)
+  for (var i = 0; i < count; i = i + 1) {
+    idxArr[i] = indices[i]
+  }
+  idxArr.sort(function (a, b) {
+    var oa = offsets[a]
+    var la = lengths[a]
+    var ob = offsets[b]
+    var lb = lengths[b]
+    var ml = la < lb ? la : lb
+    for (var k = 0; k < ml; k = k + 1) {
+      var d = u8[oa + k] - u8[ob + k]
+      if (d !== 0) {
+        return d
+      }
     }
-    if (sa > sb) {
-      return 1
-    }
-    return 0
+    return la - lb
   })
-  var sortedStrings = new Array(count)
-  var sortedIndices = new Array(count)
-  for (var i = 0; i < count; i = i + 1) {
-    var k = order[i]
-    sortedStrings[i] = strings[k]
-    sortedIndices[i] = indices[k]
-  }
-  strings = sortedStrings
-  indices = sortedIndices
-  order = null
-  sortedStrings = null
-  sortedIndices = null
 
-  // Pass 1: count unique trie nodes (root + char beyond LCP with prev)
+  // Pass 1: count unique trie nodes (root + bytes beyond LCP with prev token).
   var totalNodes = 1
-  var prevStr = ""
+  var prevOff = 0
+  var prevLen = 0
   for (var m = 0; m < count; m = m + 1) {
-    var s = strings[m]
-    var sLen = s.length
-    var prevLen = prevStr.length
+    var idx = idxArr[m]
+    var off = offsets[idx]
+    var sLen = lengths[idx]
     var minLen = prevLen < sLen ? prevLen : sLen
     var lcp = 0
-    while (lcp < minLen && prevStr.charCodeAt(lcp) === s.charCodeAt(lcp)) {
+    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
       lcp = lcp + 1
     }
     totalNodes = totalNodes + (sLen - lcp)
-    prevStr = s
+    prevOff = off
+    prevLen = sLen
   }
   var totalEdges = totalNodes - 1
 
-  // Allocate exact-size flat arrays
+  // Allocate CSR structure. `childStart[n+1]` is first used as a child counter
+  // for node n, then prefix-summed into start offsets. edgeChar is Uint8.
   var nodeId = new Int32Array(totalNodes)
-  var nodeFirstChild = new Int32Array(totalNodes)
   for (var i = 0; i < totalNodes; i = i + 1) {
     nodeId[i] = -1
-    nodeFirstChild[i] = -1
   }
-  var edgeChar = new Uint16Array(totalEdges)
+  var childStart = new Int32Array(totalNodes + 1)
+  var edgeChar = new Uint8Array(totalEdges)
   var edgeTarget = new Int32Array(totalEdges)
-  var edgeNext = new Int32Array(totalEdges)
 
-  // Pass 2: build trie. Path[d] = node index at depth d on current walk.
+  // Pass 2: assign node ids via simulated walk (identical to Pass 3 ordering)
+  // and count children per node into childStart[parent+1].
   var path = new Int32Array(maxLen + 1)
   path[0] = 0
   var nodeIdx = 1
-  var edgeIdx = 0
-  prevStr = ""
+  prevOff = 0
+  prevLen = 0
   for (var m = 0; m < count; m = m + 1) {
-    var tokId = indices[m]
-    var s = strings[m]
-    var sLen = s.length
-    var prevLen = prevStr.length
+    var idx = idxArr[m]
+    var off = offsets[idx]
+    var sLen = lengths[idx]
     var minLen = prevLen < sLen ? prevLen : sLen
     var lcp = 0
-    while (lcp < minLen && prevStr.charCodeAt(lcp) === s.charCodeAt(lcp)) {
+    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
+      lcp = lcp + 1
+    }
+    for (var j = lcp; j < sLen; j = j + 1) {
+      var parent = path[j]
+      childStart[parent + 1] = childStart[parent + 1] + 1
+      var newNode = nodeIdx
+      nodeIdx = nodeIdx + 1
+      path[j + 1] = newNode
+    }
+    prevOff = off
+    prevLen = sLen
+  }
+
+  // Prefix-sum counts into cumulative start offsets.
+  for (var n = 1; n <= totalNodes; n = n + 1) {
+    childStart[n] = childStart[n] + childStart[n - 1]
+  }
+
+  // Pass 3: fill edges. Since tokens are sorted lex by byte, children at each
+  // parent are emitted in ascending byte order, which matches the CSR layout.
+  // A per-node write cursor tracks the next free slot within [childStart[n]..].
+  var writeCursor = new Int32Array(totalNodes)
+  for (var i = 0; i < totalNodes; i = i + 1) {
+    writeCursor[i] = childStart[i]
+  }
+  path[0] = 0
+  nodeIdx = 1
+  prevOff = 0
+  prevLen = 0
+  for (var m = 0; m < count; m = m + 1) {
+    var idx = idxArr[m]
+    var off = offsets[idx]
+    var sLen = lengths[idx]
+    var minLen = prevLen < sLen ? prevLen : sLen
+    var lcp = 0
+    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
       lcp = lcp + 1
     }
     for (var j = lcp; j < sLen; j = j + 1) {
       var parent = path[j]
       var newNode = nodeIdx
       nodeIdx = nodeIdx + 1
-      edgeChar[edgeIdx] = s.charCodeAt(j)
-      edgeTarget[edgeIdx] = newNode
-      edgeNext[edgeIdx] = nodeFirstChild[parent]
-      nodeFirstChild[parent] = edgeIdx
-      edgeIdx = edgeIdx + 1
+      var w = writeCursor[parent]
+      writeCursor[parent] = w + 1
+      edgeChar[w] = u8[off + j]
+      edgeTarget[w] = newNode
       path[j + 1] = newNode
     }
-    nodeId[path[sLen]] = tokId
-    prevStr = s
+    nodeId[path[sLen]] = idx
+    prevOff = off
+    prevLen = sLen
   }
 
   trieNodeId = nodeId
-  trieNodeFirstChild = nodeFirstChild
+  trieChildStart = childStart
   trieEdgeChar = edgeChar
   trieEdgeTarget = edgeTarget
-  trieEdgeNext = edgeNext
 }
 
 function trieFindExact(tokenStr) {
   if (!trieNodeId) {
     buildSortedVocab()
   }
+  var bytes = encodeStringToUTF8(tokenStr)
+  var len = bytes.length
   var node = 0
-  var len = tokenStr.length
-  var firstChild = trieNodeFirstChild
+  var cStart = trieChildStart
   var eChar = trieEdgeChar
   var eTarget = trieEdgeTarget
-  var eNext = trieEdgeNext
   for (var i = 0; i < len; i = i + 1) {
-    var ch = tokenStr.charCodeAt(i)
-    var e = firstChild[node]
+    var ch = bytes[i]
+    var s = cStart[node]
+    var e = cStart[node + 1]
     var found = -1
-    while (e !== -1) {
-      if (eChar[e] === ch) {
-        found = eTarget[e]
+    for (var k = s; k < e; k = k + 1) {
+      if (eChar[k] === ch) {
+        found = eTarget[k]
         break
       }
-      e = eNext[e]
     }
     if (found === -1) {
       return -1
@@ -6453,37 +6523,33 @@ function bpeEncode(text) {
   }
 
   var tokens = []
-  var pos = 0
-  var textLen = encodedText.length
 
-  // Pre-convert to char codes for faster trie traversal
-  var codes = new Uint16Array(textLen)
-  for (var i = 0; i < textLen; i = i + 1) {
-    codes[i] = encodedText.charCodeAt(i)
-  }
+  // Convert encodedText to UTF-8 bytes — the trie is byte-keyed.
+  var bytes = encodeStringToUTF8(encodedText)
+  var byteLen = bytes.length
+  var pos = 0
 
   // Hoist trie arrays into locals to help V8 bounds-check elimination
   var tNodeId = trieNodeId
-  var tFirstChild = trieNodeFirstChild
+  var tChildStart = trieChildStart
   var tEdgeChar = trieEdgeChar
   var tEdgeTarget = trieEdgeTarget
-  var tEdgeNext = trieEdgeNext
 
-  while (pos < textLen) {
-    // Walk trie for longest match at current position
+  while (pos < byteLen) {
+    // Walk trie for longest byte-prefix match at current position
     var node = 0
     var bestId = -1
     var bestLen = 0
-    for (var j = pos; j < textLen; j = j + 1) {
-      var ch = codes[j]
-      var e = tFirstChild[node]
+    for (var j = pos; j < byteLen; j = j + 1) {
+      var ch = bytes[j]
+      var s = tChildStart[node]
+      var e = tChildStart[node + 1]
       var next = -1
-      while (e !== -1) {
-        if (tEdgeChar[e] === ch) {
-          next = tEdgeTarget[e]
+      for (var k = s; k < e; k = k + 1) {
+        if (tEdgeChar[k] === ch) {
+          next = tEdgeTarget[k]
           break
         }
-        e = tEdgeNext[e]
       }
       if (next === -1) {
         break
@@ -6500,7 +6566,7 @@ function bpeEncode(text) {
       tokens.push(bestId)
       pos = pos + bestLen
     } else {
-      // No prefix match - skip this character
+      // No prefix match - skip this byte
       pos = pos + 1
     }
   }
