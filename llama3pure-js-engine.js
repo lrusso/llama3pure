@@ -4401,7 +4401,16 @@ function loadWeights(gguf) {
     if (!t) {
       return null
     }
-    return dequantizeTensor(baseOffset + t.offset, t.nElements, t.type)
+    var off = baseOffset + t.offset
+    // Fast path: an F32 tensor stored at a 4-byte-aligned offset in the GGUF
+    // buffer can be exposed as a zero-copy Float32Array view. Gemma and Llama
+    // norms are F32 and align to the 32-byte GGUF tensor alignment, so this
+    // eliminates the per-layer 1152-float copy (~520 KB total on gemma-3-1b)
+    // while behaving identically to the dequantized path for readers.
+    if (t.type === GGML_TYPE.F32 && (off & 3) === 0) {
+      return new Float32Array(ggufData, off, t.nElements)
+    }
+    return dequantizeTensor(off, t.nElements, t.type)
   }
 
   // Load tensor keeping it quantized (for large weight matrices)
@@ -4627,8 +4636,10 @@ function createRunState(p) {
   xQ8Buf = new Uint8Array(xQ8Buffer)
   xQ8Int8Buf = new Int8Array(xQ8Buffer)
 
-  // Reusable buffer for batch dequantize-then-dot: 4 rows × maxCols (~192KB)
-  matmulDeqBuf = new Float64Array(4 * maxCols)
+  // matmulDeqBuf (4 rows × maxCols Float64, ~216 KB) is used only by the
+  // batch-matmul path during prefill. Leave it null here and let
+  // ensureBatchBuffers allocate it alongside the other prefill scratch
+  // buffers; freeBatchBuffers releases it after prefill.
 
   // Q8_0 buffer for quantized Q heads (for Q8 attention scoring)
   var qQ8TotalBytes = p.nHeads * headBytesQ8
@@ -4697,6 +4708,7 @@ function createRunState(p) {
     _batchKvDim: kvDim,
     _batchHiddenDim: p.hiddenDim,
     _batchXQ8Size: xQ8Size,
+    _batchMatmulDeqCols: maxCols,
     _batchBuffersReady: false,
     // Q8_0 KV cache - Uint8 view for reading FP16 scale
     keyCache: new Uint8Array(keyCacheBuffer),
@@ -4800,6 +4812,9 @@ function ensureBatchBuffers(s) {
     s.batchQ8[b] = new Uint8Array(bQ8Buf)
     s.batchQ8i8[b] = new Int8Array(bQ8Buf)
   }
+  // matmulDeqBuf is a global read by the batch-matmul kernels; allocate it
+  // here since it's only needed during prefill.
+  matmulDeqBuf = new Float64Array(4 * s._batchMatmulDeqCols)
   s._batchBuffersReady = true
 }
 
@@ -4824,6 +4839,7 @@ function freeBatchBuffers(s) {
     s.batchQ8[b] = null
     s.batchQ8i8[b] = null
   }
+  matmulDeqBuf = null
   s._batchBuffersReady = false
 }
 
