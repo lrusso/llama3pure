@@ -4782,6 +4782,30 @@ function ensureBatchBuffers(s) {
   s._batchBuffersReady = true
 }
 
+// Release the prefill batch buffers after a generate call finishes prefill.
+// Single-token generation doesn't read any of them, so they just sit until
+// the next generate reallocates via ensureBatchBuffers — tradeoff is a <1 ms
+// alloc cost per generate for 2.5 MB of RAM reclaimed between calls.
+function freeBatchBuffers(s) {
+  if (!s._batchBuffersReady) {
+    return
+  }
+  var n = PREFILL_BATCH_SIZE
+  for (var b = 0; b < n; b = b + 1) {
+    s.batchX[b] = null
+    s.batchXb[b] = null
+    s.batchXb2[b] = null
+    s.batchQ[b] = null
+    s.batchK[b] = null
+    s.batchV[b] = null
+    s.batchHb[b] = null
+    s.batchHb2[b] = null
+    s.batchQ8[b] = null
+    s.batchQ8i8[b] = null
+  }
+  s._batchBuffersReady = false
+}
+
 // Allocate the vocabSize-sized logits buffer lazily on the first forward pass
 // that actually needs it. 1 MB for Gemma's 262k vocab.
 function ensureLogits(s) {
@@ -6984,6 +7008,10 @@ function generate(chatHistory) {
     token = promptTokens[pos]
   }
 
+  // Prefill is over — single-token generation doesn't touch the batch
+  // buffers, so release ~2.5 MB for the generation phase.
+  freeBatchBuffers(state)
+
   for (var step = pos; step < effectiveMaxTokens; step = step + 1) {
     transformer(token, pos, pos >= numPromptTokens - 1)
 
@@ -7072,6 +7100,11 @@ function generate(chatHistory) {
       postMessage({ type: "token", token: remaining })
     }
   }
+
+  // Release the vocab-sized logits buffer between generate calls. ensureLogits
+  // re-allocates it on the next forward pass for <1 ms, freeing ~1 MB of
+  // Float32Array backing memory while the engine is idle between turns.
+  state.logits = null
 
   postMessage({ type: "complete", output: output })
 
