@@ -4598,7 +4598,6 @@ function createRunState(p) {
   // forward pass (1 position for single-token gen, up to PREFILL_BATCH_SIZE
   // positions for prefill), into the ropeCosAll/ropeSinAll/… buffers below.
   var ropeSize = headSize / 2
-  var seqLen = p.seqLen
   var ropeFreqs = new Float32Array(ropeSize)
   for (var i = 0; i < ropeSize; i = i + 1) {
     ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, (i * 2) / headSize)
@@ -6373,13 +6372,13 @@ function buildSortedVocab() {
   // returns; the permanent storage stays at ~516 KB (lengths + sparse).
   var offsets = new Uint32Array(vocabLen)
   var sparseCum = tokenizer.vocabSparseCum
-  for (var b = 0; b < sparseCum.length; b = b + 1) {
-    var acc = sparseCum[b]
-    var end = (b + 1) << 8
+  for (var bk = 0; bk < sparseCum.length; bk = bk + 1) {
+    var acc = sparseCum[bk]
+    var end = (bk + 1) << 8
     if (end > vocabLen) {
       end = vocabLen
     }
-    for (var i = b << 8; i < end; i = i + 1) {
+    for (var i = bk << 8; i < end; i = i + 1) {
       offsets[i] = acc
       acc = acc + lengths[i] + 8
     }
@@ -6552,35 +6551,6 @@ function buildSortedVocab() {
   trieChildStart = childStart
   trieEdgeChar = edgeChar
   trieEdgeTarget = edgeTarget
-}
-
-function trieFindExact(tokenStr) {
-  if (!trieNodeId) {
-    buildSortedVocab()
-  }
-  var bytes = encodeStringToUTF8(tokenStr)
-  var len = bytes.length
-  var node = 0
-  var cStart = trieChildStart
-  var eChar = trieEdgeChar
-  var eTarget = trieEdgeTarget
-  for (var i = 0; i < len; i = i + 1) {
-    var ch = bytes[i]
-    var s = cStart[node]
-    var e = cStart[node + 1]
-    var found = -1
-    for (var k = s; k < e; k = k + 1) {
-      if (eChar[k] === ch) {
-        found = eTarget[k]
-        break
-      }
-    }
-    if (found === -1) {
-      return -1
-    }
-    node = found
-  }
-  return trieNodeId[node]
 }
 
 // Linear byte-scan over the vocab. Avoids triggering buildSortedVocab() —
