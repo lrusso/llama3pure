@@ -4639,10 +4639,15 @@ function createRunState(p) {
   // The initial cap trades a handful of doubling copies during prefill
   // (each O(bytes-already-written), sub-millisecond) for lower sustained RAM.
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-  var initialCap = seqLen < 32 ? seqLen : 32
-  var headSeqBytes = initialCap * headBytesQ8
-  var kvCacheLayerBytes = p.nKvHeads * headSeqBytes
-  var kvCacheTotalBytes = p.nLayers * kvCacheLayerBytes
+  // Initial KV cache is empty — `ensureKvCapacity` allocates at the top of
+  // the first forward pass, which would happen anyway to cover the first
+  // prefill batch. Starting at capacity 0 removes the load-time KV alloc
+  // entirely (~430 KB on gemma-3-1b) without shifting any work onto the
+  // generation path (same grow that would happen on batch 1).
+  var initialCap = 0
+  var headSeqBytes = 0
+  var kvCacheLayerBytes = 0
+  var kvCacheTotalBytes = 0
 
   // Create ArrayBuffer for KV caches with both Uint8 and Int8 views
   var keyCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
@@ -4884,7 +4889,9 @@ function ensureKvCapacity(s, needed) {
     return
   }
   var maxCap = s.seqLen
-  var newCap = cap
+  // Start at cap (common case after the first allocation) or 1 so the
+  // doubling loop can reach `needed` from zero on the first forward pass.
+  var newCap = cap > 0 ? cap : 1
   while (newCap < needed) {
     newCap = newCap * 2
   }
