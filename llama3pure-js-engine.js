@@ -4640,7 +4640,10 @@ function createRunState(p) {
     }
   }
 
-  // Batch buffers for prefill
+  // Batch buffers for prefill are allocated lazily on first prefill call (via
+  // ensureBatchBuffers). For sessions that never prefill more than a single
+  // token at a time this saves ~2.5 MB permanently. Placeholders are left as
+  // empty arrays so the state shape stays stable.
   var batchX = new Array(PREFILL_BATCH_SIZE)
   var batchXb = new Array(PREFILL_BATCH_SIZE)
   var batchXb2 = new Array(PREFILL_BATCH_SIZE)
@@ -4651,19 +4654,6 @@ function createRunState(p) {
   var batchHb2 = new Array(PREFILL_BATCH_SIZE)
   var batchQ8 = new Array(PREFILL_BATCH_SIZE)
   var batchQ8i8 = new Array(PREFILL_BATCH_SIZE)
-  for (var b = 0; b < PREFILL_BATCH_SIZE; b = b + 1) {
-    batchX[b] = new Float32Array(p.dim)
-    batchXb[b] = new Float32Array(maxDim)
-    batchXb2[b] = new Float32Array(p.dim)
-    batchQ[b] = new Float32Array(qDim)
-    batchK[b] = new Float32Array(kvDim)
-    batchV[b] = new Float32Array(kvDim)
-    batchHb[b] = new Float32Array(p.hiddenDim)
-    batchHb2[b] = new Float32Array(p.hiddenDim)
-    var bQ8Buf = new ArrayBuffer(xQ8Size)
-    batchQ8[b] = new Uint8Array(bQ8Buf)
-    batchQ8i8[b] = new Int8Array(bQ8Buf)
-  }
 
   return {
     x: new Float32Array(p.dim),
@@ -4675,7 +4665,18 @@ function createRunState(p) {
     k: new Float32Array(kvDim),
     v: new Float32Array(kvDim),
     att: new Float32Array(p.nHeads * p.seqLen),
-    logits: new Float32Array(p.vocabSize),
+    // logits is allocated lazily on first forward pass that needs it (see
+    // ensureLogits()). Saves 1 MB of zeroed arraybuf between load and
+    // generate for large vocabularies (Gemma: 262k × 4 B = 1 MB).
+    logits: null,
+    // Sizes for lazy batch-buffer allocation (ensureBatchBuffers).
+    _batchDim: p.dim,
+    _batchMaxDim: maxDim,
+    _batchQDim: qDim,
+    _batchKvDim: kvDim,
+    _batchHiddenDim: p.hiddenDim,
+    _batchXQ8Size: xQ8Size,
+    _batchBuffersReady: false,
     // Q8_0 KV cache - Uint8 view for reading FP16 scale
     keyCache: new Uint8Array(keyCacheBuffer),
     valueCache: new Uint8Array(valueCacheBuffer),
@@ -4750,6 +4751,44 @@ function createRunState(p) {
 
 // ----------------------------------------------------------------------------
 // Transformer forward pass
+
+// Allocate the prefill batch buffers the first time prefill is called. For
+// single-token-only workloads (or before the first prefill) these 2.5 MB of
+// Float32/Uint8 arrays sit idle otherwise.
+function ensureBatchBuffers(s) {
+  if (s._batchBuffersReady) {
+    return
+  }
+  var n = PREFILL_BATCH_SIZE
+  var dim = s._batchDim
+  var maxDim = s._batchMaxDim
+  var qDim = s._batchQDim
+  var kvDim = s._batchKvDim
+  var hiddenDim = s._batchHiddenDim
+  var xQ8Size = s._batchXQ8Size
+  for (var b = 0; b < n; b = b + 1) {
+    s.batchX[b] = new Float32Array(dim)
+    s.batchXb[b] = new Float32Array(maxDim)
+    s.batchXb2[b] = new Float32Array(dim)
+    s.batchQ[b] = new Float32Array(qDim)
+    s.batchK[b] = new Float32Array(kvDim)
+    s.batchV[b] = new Float32Array(kvDim)
+    s.batchHb[b] = new Float32Array(hiddenDim)
+    s.batchHb2[b] = new Float32Array(hiddenDim)
+    var bQ8Buf = new ArrayBuffer(xQ8Size)
+    s.batchQ8[b] = new Uint8Array(bQ8Buf)
+    s.batchQ8i8[b] = new Int8Array(bQ8Buf)
+  }
+  s._batchBuffersReady = true
+}
+
+// Allocate the vocabSize-sized logits buffer lazily on the first forward pass
+// that actually needs it. 1 MB for Gemma's 262k vocab.
+function ensureLogits(s) {
+  if (s.logits === null) {
+    s.logits = new Float32Array(s.vocabSize)
+  }
+}
 
 // Grow the KV cache buffers in place when the next forward pass would index
 // past the currently-allocated capacity. Doubles capacity each grow (capped
@@ -5114,6 +5153,7 @@ function transformerLlama(token, pos, computeLogits) {
 
   // Classifier into logits
   if (computeLogits !== false) {
+    ensureLogits(s)
     matmulQuantized(s.logits, xArr, w.wcls)
   }
 }
@@ -5124,6 +5164,7 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
   var w = weights
   var s = state
   ensureKvCapacity(s, startPos + batchSize)
+  ensureBatchBuffers(s)
   var dim = s.dim
   var headSize = s.headSize
   var kvDim = s.kvDim
@@ -5662,6 +5703,7 @@ function transformerGemma(token, pos, computeLogits) {
 
   // Classifier into logits
   if (computeLogits !== false) {
+    ensureLogits(s)
     matmulQuantized(s.logits, xArr, w.wcls)
 
     if (config.finalLogitSoftcapping > 0) {
@@ -5680,6 +5722,7 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
   var w = weights
   var s = state
   ensureKvCapacity(s, startPos + batchSize)
+  ensureBatchBuffers(s)
   var dim = s.dim
   var headSize = s.headSize
   var qDim = s.qDim
