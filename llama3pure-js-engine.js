@@ -6943,6 +6943,15 @@ function generate(chatHistory) {
     promptTokens = encodeLlama3Chat(chatHistory, systemPrompt)
   }
 
+  // Release the vocab trie — it's only needed while turning text into token
+  // IDs. The transformer and sampler work on IDs alone, so we can free ~7-8 MB
+  // of typed arrays before the long generation phase starts. The next
+  // generate() call will lazy-rebuild via buildSortedVocab on first bpeEncode.
+  trieNodeId = null
+  trieChildStart = null
+  trieEdgeChar = null
+  trieEdgeTarget = null
+
   if (promptTokens.length === 0) {
     promptTokens = [tokenizer.bosToken]
   }
