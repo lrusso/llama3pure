@@ -4218,20 +4218,24 @@ function readGGUFValue(type) {
         return arr
       }
       if (arrType === GGUF_TYPE.STRING) {
-        // Fast-path: read length directly from ggufUint8 with a local position variable.
-        // Eliminates ~3 function-call frames and 2 DataView reads per element vs. the
-        // generic loop. The high 4 bytes of each uint64 length are always 0 for strings.
-        var arr = new Array(arrLen)
+        // Compact storage: keep byte offsets+lengths into ggufUint8. Decoding is
+        // deferred to the few call sites that actually need a JS string, saving
+        // ~5-6 MB of heap for a 262k-token vocab (no per-string header overhead,
+        // no UTF-16 copy). The backing GGUF ArrayBuffer is retained for model
+        // weights anyway, so the refs never dangle.
+        var offsets = new Uint32Array(arrLen)
+        var lengths = new Uint16Array(arrLen)
         var u8 = ggufUint8
         var p = offset
         for (var i = 0; i < arrLen; i = i + 1) {
           var slen = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | (u8[p + 3] << 24)
           p = p + 8
-          arr[i] = decodeUTF8(u8.subarray(p, p + slen))
+          offsets[i] = p
+          lengths[i] = slen
           p = p + slen
         }
         offset = p
-        return arr
+        return { __stringRefs: true, offsets: offsets, lengths: lengths }
       }
       var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
@@ -4311,17 +4315,28 @@ function loadModel(arrayBuffer) {
     config.headDim = (config.dim / config.nHeads) | 0
   }
 
-  var vocabTokens = meta["tokenizer.ggml.tokens"] || []
-  var vocabScores = meta["tokenizer.ggml.scores"] || []
+  var vocabRefs = meta["tokenizer.ggml.tokens"]
+  var vocabOffsets
+  var vocabLengths
+  var vocabSize
+  if (vocabRefs && vocabRefs.__stringRefs) {
+    vocabOffsets = vocabRefs.offsets
+    vocabLengths = vocabRefs.lengths
+    vocabSize = vocabOffsets.length
+  } else {
+    vocabOffsets = new Uint32Array(0)
+    vocabLengths = new Uint16Array(0)
+    vocabSize = 0
+  }
 
-  if (vocabTokens.length > 0) {
-    config.vocabSize = vocabTokens.length
+  if (vocabSize > 0) {
+    config.vocabSize = vocabSize
   }
 
   tokenizer = {
-    vocab: vocabTokens,
-    scores: vocabScores,
-    vocabSize: config.vocabSize,
+    vocabOffsets: vocabOffsets,
+    vocabLengths: vocabLengths,
+    vocabSize: vocabSize,
     bosToken: meta["tokenizer.ggml.bos_token_id"] || 1,
     eosToken: meta["tokenizer.ggml.eos_token_id"] || 2,
     eotToken: -1,
@@ -6001,6 +6016,23 @@ function sample(logits, temp) {
 // ----------------------------------------------------------------------------
 // Tokenizer
 
+// Vocab strings are stored as byte offsets + lengths into ggufUint8 and decoded
+// on demand. The number of actual decodes is tiny (a few per generated token +
+// one-shot at trie build), so the cost is negligible while the heap savings
+// relative to holding 262k decoded JS strings are substantial.
+function vocabString(i) {
+  var n = tokenizer.vocabSize
+  if (i < 0 || i >= n) {
+    return ""
+  }
+  var len = tokenizer.vocabLengths[i]
+  if (len === 0) {
+    return ""
+  }
+  var off = tokenizer.vocabOffsets[i]
+  return decodeUTF8(ggufUint8.subarray(off, off + len))
+}
+
 // Flat typed-array trie for vocabulary lookup (memory-efficient replacement
 // for nested-object trie; ~10-20x smaller for 262k-token Gemma vocabularies).
 // Per node: token id (or -1) and head of a linked list of child edges.
@@ -6016,37 +6048,48 @@ function buildSortedVocab() {
     return
   }
 
-  var vocab = tokenizer.vocab
-  var vocabLen = vocab.length
+  var vocabLen = tokenizer.vocabSize
+  var lengths = tokenizer.vocabLengths
 
-  // Collect non-empty token indices
+  // Decode each non-empty token once into a local array. Freed on function
+  // return — this is a transient working buffer for trie construction, not
+  // retained storage. Skipping decode entirely would require a byte-indexed
+  // trie plus UTF-8 conversion of all input text at tokenize time; keeping
+  // the trie UTF-16-keyed matches what bpeEncode walks with.
   var count = 0
   for (var i = 0; i < vocabLen; i = i + 1) {
-    var t = vocab[i]
-    if (t && t.length > 0) {
+    if (lengths[i] > 0) {
       count = count + 1
     }
   }
   var indices = new Array(count)
+  var strings = new Array(count)
   var w = 0
   var maxLen = 0
   for (var i = 0; i < vocabLen; i = i + 1) {
-    var t = vocab[i]
-    if (t && t.length > 0) {
+    if (lengths[i] > 0) {
+      var s = vocabString(i)
       indices[w] = i
+      strings[w] = s
       w = w + 1
-      if (t.length > maxLen) {
-        maxLen = t.length
+      if (s.length > maxLen) {
+        maxLen = s.length
       }
     }
   }
 
-  // Lex-sort indices by vocab string. After sorting, walking in order means each
-  // token shares a common prefix with the previous one — no per-char child scan
-  // needed during build, giving O(totalChars) construction instead of O(edges^2).
-  indices.sort(function (a, b) {
-    var sa = vocab[a]
-    var sb = vocab[b]
+  // Lex-sort by token string. After sorting, walking in order means each token
+  // shares a common prefix with the previous one — no per-char child scan needed
+  // during build, giving O(totalChars) construction instead of O(edges^2). We
+  // sort `strings` and `indices` together via an index-permutation sort so that
+  // `strings[m]` stays aligned with `indices[m]` post-sort.
+  var order = new Array(count)
+  for (var i = 0; i < count; i = i + 1) {
+    order[i] = i
+  }
+  order.sort(function (a, b) {
+    var sa = strings[a]
+    var sb = strings[b]
     if (sa < sb) {
       return -1
     }
@@ -6055,12 +6098,24 @@ function buildSortedVocab() {
     }
     return 0
   })
+  var sortedStrings = new Array(count)
+  var sortedIndices = new Array(count)
+  for (var i = 0; i < count; i = i + 1) {
+    var k = order[i]
+    sortedStrings[i] = strings[k]
+    sortedIndices[i] = indices[k]
+  }
+  strings = sortedStrings
+  indices = sortedIndices
+  order = null
+  sortedStrings = null
+  sortedIndices = null
 
   // Pass 1: count unique trie nodes (root + char beyond LCP with prev)
   var totalNodes = 1
   var prevStr = ""
   for (var m = 0; m < count; m = m + 1) {
-    var s = vocab[indices[m]]
+    var s = strings[m]
     var sLen = s.length
     var prevLen = prevStr.length
     var minLen = prevLen < sLen ? prevLen : sLen
@@ -6092,7 +6147,7 @@ function buildSortedVocab() {
   prevStr = ""
   for (var m = 0; m < count; m = m + 1) {
     var tokId = indices[m]
-    var s = vocab[tokId]
+    var s = strings[m]
     var sLen = s.length
     var prevLen = prevStr.length
     var minLen = prevLen < sLen ? prevLen : sLen
@@ -6152,14 +6207,10 @@ function trieFindExact(tokenStr) {
 }
 
 function findSpecialToken(tokenStr) {
-  var id = trieFindExact(tokenStr)
-  if (id < 0) {
-    return -1
-  }
-  if (tokenizer.vocab[id].length !== tokenStr.length) {
-    return -1
-  }
-  return id
+  // trieFindExact returns the id only when the walk consumes every char of
+  // tokenStr and lands on a terminal node; the token at that node therefore
+  // has the same length as tokenStr, so no separate length check is needed.
+  return trieFindExact(tokenStr)
 }
 
 // Build tiktoken byte-to-unicode mapping (OpenAI's bytes_to_unicode)
@@ -6291,10 +6342,10 @@ function buildTiktokenMap() {
 }
 
 function tokenToBytes(token) {
-  if (token < 0 || token >= tokenizer.vocab.length) {
+  if (token < 0 || token >= tokenizer.vocabSize) {
     return new Uint8Array(0)
   }
-  var piece = tokenizer.vocab[token]
+  var piece = vocabString(token)
   if (!piece) {
     return new Uint8Array(0)
   }
@@ -6360,10 +6411,10 @@ function tokenToBytes(token) {
 }
 
 function decodeToken(token) {
-  if (token < 0 || token >= tokenizer.vocab.length) {
+  if (token < 0 || token >= tokenizer.vocabSize) {
     return ""
   }
-  var piece = tokenizer.vocab[token]
+  var piece = vocabString(token)
   if (!piece) {
     return ""
   }
