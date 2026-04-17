@@ -357,20 +357,30 @@ var fp16Table = new Float32Array(65536)
   }
 })()
 
-// Pre-computed BF16 to FP32 lookup table (256KB)
-var bf16Table = new Float32Array(65536)
-;(function () {
+// BF16 to FP32 lookup table — 256 KB, lazily populated since most loaded
+// models (Q8_0, Q4_K, etc.) never touch a BF16 tensor. Filled on first
+// bf16ToFp32 call via ensureBf16Table().
+var bf16Table = null
+
+function ensureBf16Table() {
+  if (bf16Table !== null) {
+    return
+  }
+  bf16Table = new Float32Array(65536)
   for (var h = 0; h < 65536; h = h + 1) {
     convInt[0] = h << 16
     bf16Table[h] = convFloat[0]
   }
-})()
+}
 
 function fp16ToFp32(h) {
   return fp16Table[h]
 }
 
 function bf16ToFp32(h) {
+  if (bf16Table === null) {
+    ensureBf16Table()
+  }
   return bf16Table[h]
 }
 
@@ -2430,6 +2440,7 @@ function getVecDotFunc(type) {
       return vecDotF16
     case GGML_TYPE.BF16:
     case 30:
+      ensureBf16Table()
       return vecDotBF16
     case GGML_TYPE.F32:
       return vecDotF32
@@ -4003,6 +4014,13 @@ function accum(a, b, size) {
 var SKIP_METADATA_KEYS = {
   "tokenizer.ggml.merges": true,
   "tokenizer.ggml.pre": true,
+  "tokenizer.ggml.scores": true,
+  "tokenizer.ggml.token_type": true,
+  "tokenizer.ggml.add_bos_token": true,
+  "tokenizer.ggml.add_eos_token": true,
+  "tokenizer.ggml.add_space_prefix": true,
+  "tokenizer.ggml.padding_token_id": true,
+  "tokenizer.ggml.unknown_token_id": true,
   "tokenizer.chat_template": true,
   "general.name": true,
   "general.description": true,
@@ -4017,6 +4035,12 @@ var SKIP_METADATA_KEYS = {
   "general.finetune": true,
   "general.source.url": true,
   "general.source.huggingface.repository": true,
+  "general.quantization_version": true,
+  "general.file_type": true,
+  "general.base_model.count": true,
+  "general.organization": true,
+  "general.basename": true,
+  "general.size_label": true,
 }
 
 // Advance offset past a value without building any JS objects.
@@ -4218,24 +4242,25 @@ function readGGUFValue(type) {
         return arr
       }
       if (arrType === GGUF_TYPE.STRING) {
-        // Compact storage: keep byte offsets+lengths into ggufUint8. Decoding is
-        // deferred to the few call sites that actually need a JS string, saving
-        // ~5-6 MB of heap for a 262k-token vocab (no per-string header overhead,
-        // no UTF-16 copy). The backing GGUF ArrayBuffer is retained for model
-        // weights anyway, so the refs never dangle.
-        var offsets = new Uint32Array(arrLen)
-        var lengths = new Uint16Array(arrLen)
+        // Compact storage: one Uint32Array of cumulative byte offsets into
+        // ggufUint8 — cumOffsets[i] is where token i's bytes start, and its
+        // length is cumOffsets[i+1] - cumOffsets[i] - 8 (the 8-byte length
+        // prefix between adjacent tokens). One combined array of length N+1
+        // replaces the prior offsets+lengths pair (4+2 bytes/entry → 4), saving
+        // ~0.5 MB arraybuf on a 262k-token vocab. Decoding is deferred to the
+        // few call sites that actually need a JS string (see vocabString()).
+        var cumOffsets = new Uint32Array(arrLen + 1)
         var u8 = ggufUint8
         var p = offset
         for (var i = 0; i < arrLen; i = i + 1) {
           var slen = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | (u8[p + 3] << 24)
           p = p + 8
-          offsets[i] = p
-          lengths[i] = slen
+          cumOffsets[i] = p
           p = p + slen
         }
+        cumOffsets[arrLen] = p + 8
         offset = p
-        return { __stringRefs: true, offsets: offsets, lengths: lengths }
+        return { __stringRefs: true, cumOffsets: cumOffsets }
       }
       var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
@@ -4315,16 +4340,13 @@ function loadModel(arrayBuffer) {
   }
 
   var vocabRefs = meta["tokenizer.ggml.tokens"]
-  var vocabOffsets
-  var vocabLengths
+  var vocabCumOffsets
   var vocabSize
   if (vocabRefs && vocabRefs.__stringRefs) {
-    vocabOffsets = vocabRefs.offsets
-    vocabLengths = vocabRefs.lengths
-    vocabSize = vocabOffsets.length
+    vocabCumOffsets = vocabRefs.cumOffsets
+    vocabSize = vocabCumOffsets.length - 1
   } else {
-    vocabOffsets = new Uint32Array(0)
-    vocabLengths = new Uint16Array(0)
+    vocabCumOffsets = new Uint32Array(1)
     vocabSize = 0
   }
 
@@ -4333,8 +4355,7 @@ function loadModel(arrayBuffer) {
   }
 
   tokenizer = {
-    vocabOffsets: vocabOffsets,
-    vocabLengths: vocabLengths,
+    vocabCumOffsets: vocabCumOffsets,
     vocabSize: vocabSize,
     bosToken: meta["tokenizer.ggml.bos_token_id"] || 1,
     eosToken: meta["tokenizer.ggml.eos_token_id"] || 2,
@@ -6216,11 +6237,14 @@ function vocabString(i) {
   if (i < 0 || i >= n) {
     return ""
   }
-  var len = tokenizer.vocabLengths[i]
-  if (len === 0) {
+  var cum = tokenizer.vocabCumOffsets
+  var off = cum[i]
+  // Length derived from next token's offset (minus the 8-byte GGUF string
+  // length prefix between them); the sentinel at cum[n] includes that +8.
+  var len = cum[i + 1] - off - 8
+  if (len <= 0) {
     return ""
   }
-  var off = tokenizer.vocabOffsets[i]
   return decodeUTF8(ggufUint8.subarray(off, off + len))
 }
 
@@ -6287,9 +6311,17 @@ function buildSortedVocab() {
   }
 
   var vocabLen = tokenizer.vocabSize
-  var offsets = tokenizer.vocabOffsets
-  var lengths = tokenizer.vocabLengths
+  var offsets = tokenizer.vocabCumOffsets
   var u8 = ggufUint8
+
+  // Derive per-token length from the cumulative offsets once (transient,
+  // freed when this function returns). Having lengths in a flat typed array
+  // keeps the hot sort comparator simple. offsets[i] === cum[i] already
+  // gives the start offset — no separate offsets array needed.
+  var lengths = new Uint16Array(vocabLen)
+  for (var i = 0; i < vocabLen; i = i + 1) {
+    lengths[i] = offsets[i + 1] - offsets[i] - 8
+  }
 
   // Collect indices of non-empty tokens. We sort these lex by UTF-8 byte value
   // so the trie can be built in O(totalBytes) via prev-token LCP — no per-char
@@ -6498,14 +6530,18 @@ function findSpecialToken(tokenStr) {
   var target = encodeStringToUTF8(tokenStr)
   var tLen = target.length
   var u8 = ggufUint8
-  var offsets = tokenizer.vocabOffsets
-  var lengths = tokenizer.vocabLengths
+  var cum = tokenizer.vocabCumOffsets
   var vocabSize = tokenizer.vocabSize
+  // Length filter derived from cumulative offsets: len(i) = cum[i+1] - cum[i]
+  // - 8 (next token's 8-byte length prefix). The required tLen is constant
+  // for this call, so we compare against the raw offset gap directly to
+  // skip the subtraction in the inner loop.
+  var gapTarget = tLen + 8
   for (var i = 0; i < vocabSize; i = i + 1) {
-    if (lengths[i] !== tLen) {
+    if (cum[i + 1] - cum[i] !== gapTarget) {
       continue
     }
-    var off = offsets[i]
+    var off = cum[i]
     var match = true
     for (var k = 0; k < tLen; k = k + 1) {
       if (u8[off + k] !== target[k]) {
