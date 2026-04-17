@@ -4542,45 +4542,41 @@ function createRunState(p) {
   var qDim = p.nHeads * headSize
   var maxDim = Math.max(p.dim, qDim)
 
-  // Pre-compute RoPE frequency table (once per frequency index)
+  // RoPE frequencies (ropeSize floats each). These depend only on the head
+  // geometry and rope theta, so they're computed once at load. We no longer
+  // pre-compute cos/sin for every position of the context window — that cost
+  // seqLen*ropeSize*4 bytes per table × 4 tables (~4 MB at seqLen=2048 for
+  // Gemma SWA), most of it never touched. Instead, cos/sin are filled just in
+  // time for the small set of positions actually processed in the current
+  // forward pass (1 position for single-token gen, up to PREFILL_BATCH_SIZE
+  // positions for prefill), into the ropeCosAll/ropeSinAll/… buffers below.
   var ropeSize = headSize / 2
   var seqLen = p.seqLen
-  var ropeFreqs = new Array(ropeSize)
+  var ropeFreqs = new Float32Array(ropeSize)
   for (var i = 0; i < ropeSize; i = i + 1) {
     ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, (i * 2) / headSize)
   }
-
-  // Pre-compute full RoPE sin/cos tables for all positions
-  var ropeCosAll = new Float32Array(seqLen * ropeSize)
-  var ropeSinAll = new Float32Array(seqLen * ropeSize)
-  for (var pos = 0; pos < seqLen; pos = pos + 1) {
-    var base = pos * ropeSize
+  var ropeSwaFreqs
+  if (p.isGemma) {
+    var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
+    ropeSwaFreqs = new Float32Array(ropeSize)
     for (var i = 0; i < ropeSize; i = i + 1) {
-      var val = pos * ropeFreqs[i]
-      ropeCosAll[base + i] = Math.cos(val)
-      ropeSinAll[base + i] = Math.sin(val)
+      ropeSwaFreqs[i] = 1.0 / Math.pow(swaTheta, (i * 2) / headSize)
     }
+  } else {
+    ropeSwaFreqs = ropeFreqs
   }
 
-  // Pre-compute SWA RoPE tables (only for Gemma models)
+  // Scratch buffers for the current forward pass's cos/sin values. Indexed as
+  // [batchIdx * ropeSize + i] — batchIdx is 0 for single-token generation.
+  var ropeScratchSize = PREFILL_BATCH_SIZE * ropeSize
+  var ropeCosAll = new Float32Array(ropeScratchSize)
+  var ropeSinAll = new Float32Array(ropeScratchSize)
   var ropeCosSwaAll
   var ropeSinSwaAll
   if (p.isGemma) {
-    var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
-    var swaFreqs = new Array(ropeSize)
-    for (var i = 0; i < ropeSize; i = i + 1) {
-      swaFreqs[i] = 1.0 / Math.pow(swaTheta, (i * 2) / headSize)
-    }
-    ropeCosSwaAll = new Float32Array(seqLen * ropeSize)
-    ropeSinSwaAll = new Float32Array(seqLen * ropeSize)
-    for (var pos = 0; pos < seqLen; pos = pos + 1) {
-      var base = pos * ropeSize
-      for (var i = 0; i < ropeSize; i = i + 1) {
-        var val = pos * swaFreqs[i]
-        ropeCosSwaAll[base + i] = Math.cos(val)
-        ropeSinSwaAll[base + i] = Math.sin(val)
-      }
-    }
+    ropeCosSwaAll = new Float32Array(ropeScratchSize)
+    ropeSinSwaAll = new Float32Array(ropeScratchSize)
   } else {
     ropeCosSwaAll = ropeCosAll
     ropeSinSwaAll = ropeSinAll
@@ -4685,11 +4681,14 @@ function createRunState(p) {
     qQ8i8: new Int8Array(qQ8Buffer),
     // Cache layout info
     headSeqBytes: headSeqBytes,
-    // Pre-computed RoPE sin/cos for all positions
+    // RoPE scratch buffers filled just-in-time by fillRopeBuffers(). Indexed
+    // as [batchIdx * ropeSize + i]. ropeCosAll === ropeCosSwaAll for non-Gemma.
     ropeCosAll: ropeCosAll,
     ropeSinAll: ropeSinAll,
     ropeCosSwaAll: ropeCosSwaAll,
     ropeSinSwaAll: ropeSinSwaAll,
+    ropeFreqs: ropeFreqs,
+    ropeSwaFreqs: ropeSwaFreqs,
     ropeSize: ropeSize,
     // Per-layer RoPE table references (avoid modulo check per layer)
     ropeCosLayer: ropeCosLayer,
@@ -4744,6 +4743,43 @@ function createRunState(p) {
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
+// Fill the RoPE cos/sin scratch buffers for a contiguous block of positions
+// starting at `startPos`, length `batchSize`. Writes into s.ropeCos/SinAll
+// (and the SWA variants for Gemma). Indexed as [b * ropeSize + i] where b is
+// the batch slot — hot loops read this with ropeBase = b * ropeSize. For
+// single-token generation, pass batchSize=1 and use ropeBase=0. The total
+// cos/sin call count per forward pass is just 2 * batchSize * ropeSize (×2
+// for Gemma SWA) — <0.1% of generation time vs the 4 MB table saved.
+function fillRopeBuffers(s, startPos, batchSize) {
+  var ropeSize = s.ropeSize
+  var freqs = s.ropeFreqs
+  var cos = s.ropeCosAll
+  var sin = s.ropeSinAll
+  for (var b = 0; b < batchSize; b = b + 1) {
+    var pos = startPos + b
+    var base = b * ropeSize
+    for (var i = 0; i < ropeSize; i = i + 1) {
+      var v = pos * freqs[i]
+      cos[base + i] = Math.cos(v)
+      sin[base + i] = Math.sin(v)
+    }
+  }
+  if (s.ropeCosSwaAll !== cos) {
+    var swaFreqs = s.ropeSwaFreqs
+    var swaCos = s.ropeCosSwaAll
+    var swaSin = s.ropeSinSwaAll
+    for (var b = 0; b < batchSize; b = b + 1) {
+      var pos = startPos + b
+      var base = b * ropeSize
+      for (var i = 0; i < ropeSize; i = i + 1) {
+        var v = pos * swaFreqs[i]
+        swaCos[base + i] = Math.cos(v)
+        swaSin[base + i] = Math.sin(v)
+      }
+    }
+  }
+}
+
 // Llama-optimized transformer: fused attnScale in RoPE, SiLU via tanh,
 // per-head KV layout, Q8 attention, GQA batching, pre-quantized matmul
 function transformerLlama(token, pos, computeLogits) {
@@ -4781,6 +4817,9 @@ function transformerLlama(token, pos, computeLogits) {
   var emb = w.tokenEmbedding
   dequantizeRow(xArr, emb.dataOffset + token * emb.rowSize, dim, emb.type)
 
+  // Fill RoPE scratch buffers for just this token's position (slot 0).
+  fillRopeBuffers(s, pos, 1)
+
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
@@ -4807,7 +4846,7 @@ function transformerLlama(token, pos, computeLogits) {
 
     // RoPE with fused attnScale on Q (#18)
     var half = headSize >> 1
-    var ropeBase = pos * s.ropeSize
+    var ropeBase = 0
     var ropeCos = s.ropeCosLayer[l]
     var ropeSin = s.ropeSinLayer[l]
 
@@ -5053,6 +5092,9 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
     )
   }
 
+  // Fill RoPE scratch buffers for all positions in this prefill batch.
+  fillRopeBuffers(s, startPos, batchSize)
+
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
@@ -5079,8 +5121,8 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
       var vArr = bV[b]
       var xbArr = bXb[b]
 
-      // RoPE with fused attnScale on Q
-      var ropeBase = pos * s.ropeSize
+      // RoPE with fused attnScale on Q (ropeBase indexes into per-batch scratch)
+      var ropeBase = b * s.ropeSize
       var kvDim4 = kvDim & ~3
       for (var i = 0; i < kvDim4; i = i + 4) {
         var fi0 = (i >> 1) % half
@@ -5297,6 +5339,10 @@ function transformerGemma(token, pos, computeLogits) {
   var emb = w.tokenEmbedding
   dequantizeRow(xArr, emb.dataOffset + token * emb.rowSize, dim, emb.type)
 
+  // Fill RoPE scratch buffers for this token's position (slot 0). Gemma has
+  // distinct main and SWA tables filled in the same call.
+  fillRopeBuffers(s, pos, 1)
+
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
@@ -5346,7 +5392,7 @@ function transformerGemma(token, pos, computeLogits) {
 
     // Fused RoPE + Q attention scaling
     var half = headSize >> 1
-    var ropeBase = pos * s.ropeSize
+    var ropeBase = 0
     var ropeCos = s.ropeCosLayer[l]
     var ropeSin = s.ropeSinLayer[l]
 
@@ -5602,6 +5648,9 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
     )
   }
 
+  // Fill RoPE scratch buffers for all positions in this prefill batch.
+  fillRopeBuffers(s, startPos, batchSize)
+
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
@@ -5669,8 +5718,8 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
         }
       }
 
-      // NEOX RoPE with fused attnScale on Q
-      var ropeBase = pos * s.ropeSize
+      // NEOX RoPE with fused attnScale on Q (ropeBase indexes per-batch scratch)
+      var ropeBase = b * s.ropeSize
       for (var h = 0; h < nHeads; h = h + 1) {
         var idx = h * headSize
         for (var i = 0; i < half; i = i + 1) {
