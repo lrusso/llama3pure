@@ -4584,8 +4584,14 @@ function createRunState(p) {
 
   // Q8_0 KV cache: 34 bytes per 32 floats
   // Per-head layout: [layer][kv_head][position][head_data] for cache locality
+  //
+  // Capacity starts small and doubles via ensureKvCapacity() as generation
+  // advances (capped at seqLen). Most inference runs touch only a fraction of
+  // the configured seqLen — sizing for the full window up front wastes ~27 MB
+  // on gemma-3-1b with contextSize=2048 for a typical ~70-position chat turn.
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-  var headSeqBytes = seqLen * headBytesQ8
+  var initialCap = seqLen < 128 ? seqLen : 128
+  var headSeqBytes = initialCap * headBytesQ8
   var kvCacheLayerBytes = p.nKvHeads * headSeqBytes
   var kvCacheTotalBytes = p.nLayers * kvCacheLayerBytes
 
@@ -4698,8 +4704,10 @@ function createRunState(p) {
     kvDim: kvDim,
     qDim: qDim,
     kvMul: p.nHeads / p.nKvHeads,
-    // Q8_0 cache: layer size in bytes (nKvHeads * seqLen * headBytesQ8)
+    // Q8_0 cache: layer size in bytes (nKvHeads * kvCapacity * headBytesQ8).
+    // Grows via ensureKvCapacity() as positions advance.
     kvCacheLayerSize: kvCacheLayerBytes,
+    kvCapacity: initialCap,
     attnScale: 1.0 / Math.sqrt(headSize),
     embedScale: Math.sqrt(p.dim),
     // Cache config values to avoid property lookups in hot loops
@@ -4743,6 +4751,70 @@ function createRunState(p) {
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
+// Grow the KV cache buffers in place when the next forward pass would index
+// past the currently-allocated capacity. Doubles capacity each grow (capped
+// at seqLen). We copy each [layer][kv_head] head-slice to its new, wider
+// position in the rebuilt buffer so written-to-date positions stay intact;
+// new positions are left zero-initialized. Called from the top of each
+// transformer* function before any cache reads/writes, so in-function cached
+// references like `var keyCache = s.keyCache` remain valid for the duration
+// of the pass.
+function ensureKvCapacity(s, needed) {
+  var cap = s.kvCapacity
+  if (needed <= cap) {
+    return
+  }
+  var maxCap = s.seqLen
+  var newCap = cap
+  while (newCap < needed) {
+    newCap = newCap * 2
+  }
+  if (newCap > maxCap) {
+    newCap = maxCap
+  }
+
+  var nLayers = s.nLayers
+  var nKvHeads = s.nKvHeads
+  var headBytesQ8 = s.headBytesQ8
+  var oldHeadSeq = cap * headBytesQ8
+  var newHeadSeq = newCap * headBytesQ8
+  var newLayerBytes = nKvHeads * newHeadSeq
+  var newTotal = nLayers * newLayerBytes
+
+  var newKeyBuf = new ArrayBuffer(newTotal)
+  var newValBuf = new ArrayBuffer(newTotal)
+  var newKey = new Uint8Array(newKeyBuf)
+  var newVal = new Uint8Array(newValBuf)
+  var oldKey = s.keyCache
+  var oldVal = s.valueCache
+  var oldLayerBytes = nKvHeads * oldHeadSeq
+  for (var l = 0; l < nLayers; l = l + 1) {
+    var oldLayerBase = l * oldLayerBytes
+    var newLayerBase = l * newLayerBytes
+    for (var h = 0; h < nKvHeads; h = h + 1) {
+      var oldHeadBase = oldLayerBase + h * oldHeadSeq
+      var newHeadBase = newLayerBase + h * newHeadSeq
+      newKey.set(oldKey.subarray(oldHeadBase, oldHeadBase + oldHeadSeq), newHeadBase)
+      newVal.set(oldVal.subarray(oldHeadBase, oldHeadBase + oldHeadSeq), newHeadBase)
+    }
+  }
+
+  s.keyCache = newKey
+  s.valueCache = newVal
+  s.keyCacheInt8 = new Int8Array(newKeyBuf)
+  s.valueCacheInt8 = new Int8Array(newValBuf)
+  s.headSeqBytes = newHeadSeq
+  s.kvCacheLayerSize = newLayerBytes
+  s.kvCapacity = newCap
+
+  // Rebuild per-head byte-offset table (headSeqBytes changed)
+  var hk = s.headKvByteOffsets
+  var kvMul = s.kvMul
+  for (var h = 0; h < s.nHeads; h = h + 1) {
+    hk[h] = ((h / kvMul) | 0) * newHeadSeq
+  }
+}
+
 // Fill the RoPE cos/sin scratch buffers for a contiguous block of positions
 // starting at `startPos`, length `batchSize`. Writes into s.ropeCos/SinAll
 // (and the SWA variants for Gemma). Indexed as [b * ropeSize + i] where b is
@@ -4785,6 +4857,7 @@ function fillRopeBuffers(s, startPos, batchSize) {
 function transformerLlama(token, pos, computeLogits) {
   var w = weights
   var s = state
+  ensureKvCapacity(s, pos + 1)
   var dim = s.dim
   var headSize = s.headSize
   var kvDim = s.kvDim
@@ -5050,6 +5123,7 @@ function transformerLlama(token, pos, computeLogits) {
 function transformerPrefillLlama(allTokens, startPos, batchSize) {
   var w = weights
   var s = state
+  ensureKvCapacity(s, startPos + batchSize)
   var dim = s.dim
   var headSize = s.headSize
   var kvDim = s.kvDim
@@ -5305,6 +5379,7 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
 function transformerGemma(token, pos, computeLogits) {
   var w = weights
   var s = state
+  ensureKvCapacity(s, pos + 1)
   var dim = s.dim
   var headSize = s.headSize
   var qDim = s.qDim
@@ -5604,6 +5679,7 @@ function transformerGemma(token, pos, computeLogits) {
 function transformerPrefillGemma(allTokens, startPos, batchSize) {
   var w = weights
   var s = state
+  ensureKvCapacity(s, startPos + batchSize)
   var dim = s.dim
   var headSize = s.headSize
   var qDim = s.qDim
