@@ -4248,8 +4248,11 @@ function readGGUFValue(type) {
 
 function loadModel(arrayBuffer) {
   // Reset vocab cache when loading a new model
-  vocabTrie = null
-  vocabMap = null
+  trieNodeId = null
+  trieNodeFirstChild = null
+  trieEdgeChar = null
+  trieEdgeTarget = null
+  trieEdgeNext = null
 
   // Initialize cached buffer views for fast matmul access
   ggufUint8 = new Uint8Array(arrayBuffer)
@@ -5998,43 +6001,165 @@ function sample(logits, temp) {
 // ----------------------------------------------------------------------------
 // Tokenizer
 
-var vocabMap = null
-var vocabTrie = null
+// Flat typed-array trie for vocabulary lookup (memory-efficient replacement
+// for nested-object trie; ~10-20x smaller for 262k-token Gemma vocabularies).
+// Per node: token id (or -1) and head of a linked list of child edges.
+// Per edge: char code, target node, next-sibling edge index.
+var trieNodeId = null
+var trieNodeFirstChild = null
+var trieEdgeChar = null
+var trieEdgeTarget = null
+var trieEdgeNext = null
 
 function buildSortedVocab() {
-  if (vocabTrie) {
+  if (trieNodeId) {
     return
   }
 
-  vocabMap = {}
-  // Build trie for O(max_token_len) longest-match lookup
-  vocabTrie = {}
+  var vocab = tokenizer.vocab
+  var vocabLen = vocab.length
 
-  for (var i = 0; i < tokenizer.vocab.length; i = i + 1) {
-    var token = tokenizer.vocab[i]
-    if (token && token.length > 0) {
-      vocabMap[token] = i
-      // Insert into trie
-      var node = vocabTrie
-      for (var j = 0; j < token.length; j = j + 1) {
-        var ch = token.charCodeAt(j)
-        if (!node[ch]) {
-          node[ch] = {}
-        }
-        node = node[ch]
-      }
-      node.id = i
-      node.len = token.length
+  // Collect non-empty token indices
+  var count = 0
+  for (var i = 0; i < vocabLen; i = i + 1) {
+    var t = vocab[i]
+    if (t && t.length > 0) {
+      count = count + 1
     }
   }
+  var indices = new Array(count)
+  var w = 0
+  var maxLen = 0
+  for (var i = 0; i < vocabLen; i = i + 1) {
+    var t = vocab[i]
+    if (t && t.length > 0) {
+      indices[w] = i
+      w = w + 1
+      if (t.length > maxLen) {
+        maxLen = t.length
+      }
+    }
+  }
+
+  // Lex-sort indices by vocab string. After sorting, walking in order means each
+  // token shares a common prefix with the previous one — no per-char child scan
+  // needed during build, giving O(totalChars) construction instead of O(edges^2).
+  indices.sort(function (a, b) {
+    var sa = vocab[a]
+    var sb = vocab[b]
+    if (sa < sb) {
+      return -1
+    }
+    if (sa > sb) {
+      return 1
+    }
+    return 0
+  })
+
+  // Pass 1: count unique trie nodes (root + char beyond LCP with prev)
+  var totalNodes = 1
+  var prevStr = ""
+  for (var m = 0; m < count; m = m + 1) {
+    var s = vocab[indices[m]]
+    var sLen = s.length
+    var prevLen = prevStr.length
+    var minLen = prevLen < sLen ? prevLen : sLen
+    var lcp = 0
+    while (lcp < minLen && prevStr.charCodeAt(lcp) === s.charCodeAt(lcp)) {
+      lcp = lcp + 1
+    }
+    totalNodes = totalNodes + (sLen - lcp)
+    prevStr = s
+  }
+  var totalEdges = totalNodes - 1
+
+  // Allocate exact-size flat arrays
+  var nodeId = new Int32Array(totalNodes)
+  var nodeFirstChild = new Int32Array(totalNodes)
+  for (var i = 0; i < totalNodes; i = i + 1) {
+    nodeId[i] = -1
+    nodeFirstChild[i] = -1
+  }
+  var edgeChar = new Uint16Array(totalEdges)
+  var edgeTarget = new Int32Array(totalEdges)
+  var edgeNext = new Int32Array(totalEdges)
+
+  // Pass 2: build trie. Path[d] = node index at depth d on current walk.
+  var path = new Int32Array(maxLen + 1)
+  path[0] = 0
+  var nodeIdx = 1
+  var edgeIdx = 0
+  prevStr = ""
+  for (var m = 0; m < count; m = m + 1) {
+    var tokId = indices[m]
+    var s = vocab[tokId]
+    var sLen = s.length
+    var prevLen = prevStr.length
+    var minLen = prevLen < sLen ? prevLen : sLen
+    var lcp = 0
+    while (lcp < minLen && prevStr.charCodeAt(lcp) === s.charCodeAt(lcp)) {
+      lcp = lcp + 1
+    }
+    for (var j = lcp; j < sLen; j = j + 1) {
+      var parent = path[j]
+      var newNode = nodeIdx
+      nodeIdx = nodeIdx + 1
+      edgeChar[edgeIdx] = s.charCodeAt(j)
+      edgeTarget[edgeIdx] = newNode
+      edgeNext[edgeIdx] = nodeFirstChild[parent]
+      nodeFirstChild[parent] = edgeIdx
+      edgeIdx = edgeIdx + 1
+      path[j + 1] = newNode
+    }
+    nodeId[path[sLen]] = tokId
+    prevStr = s
+  }
+
+  trieNodeId = nodeId
+  trieNodeFirstChild = nodeFirstChild
+  trieEdgeChar = edgeChar
+  trieEdgeTarget = edgeTarget
+  trieEdgeNext = edgeNext
+}
+
+function trieFindExact(tokenStr) {
+  if (!trieNodeId) {
+    buildSortedVocab()
+  }
+  var node = 0
+  var len = tokenStr.length
+  var firstChild = trieNodeFirstChild
+  var eChar = trieEdgeChar
+  var eTarget = trieEdgeTarget
+  var eNext = trieEdgeNext
+  for (var i = 0; i < len; i = i + 1) {
+    var ch = tokenStr.charCodeAt(i)
+    var e = firstChild[node]
+    var found = -1
+    while (e !== -1) {
+      if (eChar[e] === ch) {
+        found = eTarget[e]
+        break
+      }
+      e = eNext[e]
+    }
+    if (found === -1) {
+      return -1
+    }
+    node = found
+  }
+  return trieNodeId[node]
 }
 
 function findSpecialToken(tokenStr) {
-  buildSortedVocab()
-  if (vocabMap && Object.prototype.hasOwnProperty.call(vocabMap, tokenStr)) {
-    return vocabMap[tokenStr]
+  var id = trieFindExact(tokenStr)
+  if (id < 0) {
+    return -1
   }
-  return -1
+  if (tokenizer.vocab[id].length !== tokenStr.length) {
+    return -1
+  }
+  return id
 }
 
 // Build tiktoken byte-to-unicode mapping (OpenAI's bytes_to_unicode)
@@ -6286,19 +6411,37 @@ function bpeEncode(text) {
     codes[i] = encodedText.charCodeAt(i)
   }
 
+  // Hoist trie arrays into locals to help V8 bounds-check elimination
+  var tNodeId = trieNodeId
+  var tFirstChild = trieNodeFirstChild
+  var tEdgeChar = trieEdgeChar
+  var tEdgeTarget = trieEdgeTarget
+  var tEdgeNext = trieEdgeNext
+
   while (pos < textLen) {
     // Walk trie for longest match at current position
-    var node = vocabTrie
+    var node = 0
     var bestId = -1
     var bestLen = 0
     for (var j = pos; j < textLen; j = j + 1) {
-      node = node[codes[j]]
-      if (!node) {
+      var ch = codes[j]
+      var e = tFirstChild[node]
+      var next = -1
+      while (e !== -1) {
+        if (tEdgeChar[e] === ch) {
+          next = tEdgeTarget[e]
+          break
+        }
+        e = tEdgeNext[e]
+      }
+      if (next === -1) {
         break
       }
-      if (node.id !== undefined) {
-        bestId = node.id
-        bestLen = node.len
+      node = next
+      var nid = tNodeId[node]
+      if (nid >= 0) {
+        bestId = nid
+        bestLen = j - pos + 1
       }
     }
 
@@ -6306,13 +6449,7 @@ function bpeEncode(text) {
       tokens.push(bestId)
       pos = pos + bestLen
     } else {
-      // No match found - try to find single character token
-      var singleChar = encodedText.charAt(pos)
-      var singleId = vocabMap[singleChar]
-      if (singleId !== undefined) {
-        tokens.push(singleId)
-      }
-      // Skip this character regardless
+      // No prefix match - skip this character
       pos = pos + 1
     }
   }
