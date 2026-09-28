@@ -227,6 +227,7 @@
         return GET_APP_STRING[stringName] || ""
       }
 
+      var customResponseRegexRules = []
       var customPromptRegexRules = []
       var customPrefix = ""
       var rendering = false
@@ -781,6 +782,8 @@
             },
           },
         ]
+
+        rules = rules.concat(customResponseRegexRules)
 
         // applying the markdown rules
         rules.forEach(function (rule) {
