@@ -155,10 +155,6 @@
       var chatHistory = []
       var replies = []
       var selectedReply = 0
-      var isFollowingReply = false
-
-      // set to true to enable auto-scroll to bottom when a response is being rendered.
-      var useAutoScroll = false
 
       var MAX_TOKENS = -1
       var CONTEXT_SIZE = 2048
@@ -376,7 +372,6 @@
         var content = document.querySelector(".content")
         var message = createComponent("span", className, innerHTML)
         content.appendChild(message)
-        scrollToBottom()
         return message
       }
 
@@ -384,7 +379,6 @@
         var temp = document.createElement("div")
         temp.innerHTML = newHTML
         reconcileChildren(target, temp)
-        scrollToBottom()
       }
 
       function reconcileChildren(existing, updated) {
@@ -454,9 +448,6 @@
 
         rendering = true
 
-        // a new response starts pinned to the bottom (only if the feature is enabled)
-        isFollowingReply = useAutoScroll
-
         var formattedPrompt = prompt
         customPromptRegexRules.forEach(function (rule) {
           formattedPrompt = formattedPrompt.replace(rule.regex, rule.replacement)
@@ -501,8 +492,6 @@
         }
 
         document.title = t("title") + " - " + t("thinking")
-
-        scrollToBottom()
 
         worker.postMessage({
           type: "generate",
@@ -580,7 +569,6 @@
             .replace(/^\),/, "")
             .trim()
           promptResult.innerHTML = markdownToHTML(resultText)
-          scrollToBottom()
 
           var selection = window.getSelection()
           selection.removeAllRanges()
@@ -636,19 +624,17 @@
           pointerElement.remove()
         }
 
-        scrollToBottom()
-
         rendering = false
       }
 
-      function scrollToBottom(forcedScroll) {
+      function scrollToBottom() {
         var totalHeight = document.documentElement.scrollHeight
         var viewportHeight = window.innerHeight
         var scrollYPosition = window.scrollY
         var pixelsLeft = totalHeight - (scrollYPosition + viewportHeight)
         var finalDistance = Math.max(0, pixelsLeft)
 
-        if (finalDistance > 0 && (isFollowingReply || forcedScroll)) {
+        if (finalDistance > 0) {
           window.scrollTo({
             top: document.body.scrollHeight,
           })
@@ -827,7 +813,7 @@
           //
         }
 
-        scrollToBottom(true)
+        scrollToBottom()
       }
 
       function sendPrompt(prompt) {
@@ -934,28 +920,6 @@
             )
           })
           content.appendChild(buttonDemo2)
-
-          // autoscroll yields to the user: while a response renders, the view stays
-          // pinned to the bottom only while the user is at (or very near) the bottom.
-          // scrolling up releases the pin; scrolling back down to the bottom resumes it.
-          // this is a pure position check on purpose: a direction-based check misreads a
-          // content reflow that clamps the scroll position (e.g. a short first answer
-          // whose height dips below the screen) as the user scrolling up, which used to
-          // kill autoscroll. a small threshold keeps it from fighting momentum scrolling.
-          window.addEventListener(
-            "scroll",
-            function () {
-              if (useAutoScroll) {
-                var AUTOSCROLL_BOTTOM_THRESHOLD = 8
-
-                var pixelsLeft =
-                  document.documentElement.scrollHeight -
-                  (window.scrollY + window.innerHeight)
-                isFollowingReply = pixelsLeft <= AUTOSCROLL_BOTTOM_THRESHOLD
-              }
-            },
-            { passive: true }
-          )
 
           inputTextbox.placeholder = t("placeholder")
           inputTextbox.value = ""
