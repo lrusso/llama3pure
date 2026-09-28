@@ -13,6 +13,7 @@ Three inference engines for Llama 3: pure C for desktop systems, pure JavaScript
 - [Running in Web Environments](#running-in-web-environments)
 - [Suggested Models and Engines](#suggested-models-and-engines)
 - [Tested Models](#tested-models)
+- [Special Keys](#special-keys)
 - [Author's Notes](#authors-notes)
 - [Credits](#based-on-the-work-of)
 
@@ -289,6 +290,13 @@ A standalone version is available [here](https://lrusso.github.io/llama3pure/lla
 | [Llama-3-8B-Instruct-Q6_K.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q6_K.gguf?download=true)     | ✅  |   ✅    | ❌  |
 | [Llama-3-8B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q8_0.gguf?download=true)     | ✅  |   ✅    | ❌  |
 | [Llama-3-8B-Instruct-fp16.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-fp16.gguf?download=true)     | ✅  |   ✅    | ❌  |
+
+## Special Keys
+
+| Action     | macOS Shortcut | Windows Shortcut | Safari Shortcut |
+| :--------- | :------------: | :--------------: | :-------------: |
+| Next reply |  Command + 1   |     Ctrl + 1     |    Ctrl + 1     |
+| Regenerate |  Command + 2   |     Ctrl + 2     |    Ctrl + 2     |
 
 ## Author's Notes
 
