@@ -427,16 +427,9 @@
       }
 
       function createComponent(tag, className, innerHTML, innerText) {
-        if (className === void 0) {
-          className = ""
-        }
-        if (innerHTML === void 0) {
-          innerHTML = ""
-        }
-
         var element = document.createElement(tag)
-        element.className = className
-        element.innerHTML = innerHTML
+        element.className = className || ""
+        element.innerHTML = innerHTML || ""
         if (innerText) {
           element.innerText = innerText
         }
