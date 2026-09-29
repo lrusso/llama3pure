@@ -902,21 +902,125 @@
         }
       }
 
-      // no fetch here because the entire project
-      // is compatible with pre 2015 environments.
+      // the model is downloaded in chunks using Range requests, and every chunk
+      // is copied into one ArrayBuffer allocated with the final size. a single
+      // XHR with responseType "arraybuffer" keeps every received piece and then
+      // copies all of them into a new ArrayBuffer, so for a moment the model is
+      // twice in RAM and ios safari runs out of memory. no fetch here because
+      // the entire project is compatible with pre 2015 environments.
+      var DOWNLOAD_CHUNK_SIZE = 16777216
+
       function downloadFile(url, button, content) {
         content.removeChild(button)
 
         var downloadStatus = appendMessage("reply", t("downloading") + " 0%")
 
+        function showProgress(loaded, total) {
+          var percent = Math.round((loaded / total) * 100)
+          downloadStatus.innerText = t("downloading") + " " + percent + "%"
+        }
+
+        function showError() {
+          downloadStatus.innerText = t("error_download")
+        }
+
+        // the HEAD request gets the final size and the url after the redirects
+        var head = new XMLHttpRequest()
+        head.open("HEAD", url, true)
+
+        head.addEventListener("load", function () {
+          var total = parseInt(head.getResponseHeader("Content-Length"), 10)
+
+          // without the final size the buffer can't be allocated up front
+          if (head.status !== 200 || !(total > 0)) {
+            downloadFileXHR(url, showProgress, showError)
+            return
+          }
+
+          if (total >= 2147483648) {
+            downloadStatus.innerText = t("error_filesize")
+            return
+          }
+
+          downloadFileChunks(head.responseURL || url, total, showProgress, showError)
+        })
+
+        head.addEventListener("error", function () {
+          downloadFileXHR(url, showProgress, showError)
+        })
+
+        head.send()
+      }
+
+      function downloadFileChunks(url, total, showProgress, showError) {
+        var buffer = null
+
+        try {
+          buffer = new ArrayBuffer(total)
+        } catch (err) {
+          showError()
+          return
+        }
+
+        var bytes = new Uint8Array(buffer)
+        var loaded = 0
+
+        function downloadChunk() {
+          var end = Math.min(loaded + DOWNLOAD_CHUNK_SIZE, total) - 1
+
+          var xhr = new XMLHttpRequest()
+          xhr.open("GET", url, true)
+          xhr.responseType = "arraybuffer"
+          xhr.setRequestHeader("Range", "bytes=" + loaded + "-" + end)
+
+          xhr.addEventListener("progress", function (event) {
+            showProgress(loaded + event.loaded, total)
+          })
+
+          xhr.addEventListener("load", function () {
+            var chunk = xhr.response
+
+            // the server ignored the Range header and sent the entire file
+            if (xhr.status === 200 && chunk && chunk.byteLength === total) {
+              initialize(chunk)
+              return
+            }
+
+            if (
+              xhr.status !== 206 ||
+              !chunk ||
+              chunk.byteLength !== end - loaded + 1
+            ) {
+              showError()
+              return
+            }
+
+            bytes.set(new Uint8Array(chunk), loaded)
+            loaded = end + 1
+
+            if (loaded < total) {
+              downloadChunk()
+            } else {
+              initialize(buffer)
+            }
+          })
+
+          xhr.addEventListener("error", showError)
+
+          xhr.send()
+        }
+
+        downloadChunk()
+      }
+
+      function downloadFileXHR(url, showProgress, showError) {
         var xhr = new XMLHttpRequest()
         xhr.open("GET", url, true)
         xhr.responseType = "arraybuffer"
 
         xhr.addEventListener("progress", function (event) {
           if (event.lengthComputable) {
-            var percent = Math.round((event.loaded / event.total) * 100)
-            downloadStatus.innerText = t("downloading") + " " + percent + "%"
+            showProgress(event.loaded, event.total)
           }
         })
 
@@ -924,13 +1028,11 @@
           if (xhr.status === 200) {
             initialize(xhr.response)
           } else {
-            downloadStatus.innerText = t("error_download")
+            showError()
           }
         })
 
-        xhr.addEventListener("error", function () {
-          downloadStatus.innerText = t("error_download")
-        })
+        xhr.addEventListener("error", showError)
 
         xhr.send()
       }
