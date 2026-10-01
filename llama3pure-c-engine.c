@@ -720,7 +720,7 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t
     }
 }
 
-void dequantize_row_q4_K(const void* src, float* dst, int k) {
+void dequantize_row_q4_K(const void* src, float* restrict dst, int k) {
     const block_q4_K* blocks = (const block_q4_K*)src;
     int nb = k / QK_K;
 
@@ -728,9 +728,9 @@ void dequantize_row_q4_K(const void* src, float* dst, int k) {
         const float d = fp16_to_fp32(blocks[i].d);
         const float dmin = fp16_to_fp32(blocks[i].dmin);
 
-        const uint8_t* q = blocks[i].qs;
+        const uint8_t* restrict q = blocks[i].qs;
         uint8_t sc, m;
-        float* y = dst + i * QK_K;
+        float* restrict y = dst + i * QK_K;
 
         int is = 0;
         for (int j = 0; j < QK_K; j += 64) {
@@ -741,19 +741,30 @@ void dequantize_row_q4_K(const void* src, float* dst, int k) {
             const float d2 = d * sc;
             const float m2 = dmin * m;
 
+            // Low and high nibbles of the same 32 bytes in one loop: the
+            // compiler vectorizes it, the per-element expression is unchanged.
             for (int l = 0; l < 32; ++l) {
-                *y++ = d1 * (q[l] & 0xF) - m1;
+                y[l] = d1 * (q[l] & 0xF) - m1;
+                y[l + 32] = d2 * (q[l] >> 4) - m2;
             }
-            for (int l = 0; l < 32; ++l) {
-                *y++ = d2 * (q[l] >> 4) - m2;
-            }
+            y += 64;
             q += 32;
             is += 2;
         }
     }
 }
 
-void dequantize_row_q2_K(const void* src, float* dst, int k) {
+// 32 Q2_K values at one 2-bit position: 16 with scale/min 1, 16 with scale/min 2.
+// A constant shift per call is what lets clang vectorize this loop.
+static inline void dequantize_q2_K_32(float* restrict y, const uint8_t* restrict q, int shift,
+                                      float dl1, float ml1, float dl2, float ml2) {
+    for (int l = 0; l < 16; ++l) {
+        y[l] = dl1 * ((q[l] >> shift) & 3) - ml1;
+        y[l + 16] = dl2 * ((q[l + 16] >> shift) & 3) - ml2;
+    }
+}
+
+void dequantize_row_q2_K(const void* src, float* restrict dst, int k) {
     const block_q2_K* blocks = (const block_q2_K*)src;
     int nb = k / QK_K;
 
@@ -764,34 +775,27 @@ void dequantize_row_q2_K(const void* src, float* dst, int k) {
         const uint8_t* q = blocks[i].qs;
         const uint8_t* scales = blocks[i].scales;
 
-        int is = 0;
         float* y = dst + i * QK_K;
+        float dl[8], ml[8];
 
         for (int n = 0; n < QK_K; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; ++j) {
-                uint8_t sc = scales[is++];
-                float dl = d * (sc & 0xF);
-                float ml = min * (sc >> 4);
-                for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((q[l] >> shift) & 3) - ml;
-                }
-
-                sc = scales[is++];
-                dl = d * (sc & 0xF);
-                ml = min * (sc >> 4);
-                for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((q[l + 16] >> shift) & 3) - ml;
-                }
-
-                shift += 2;
+            for (int j = 0; j < 8; ++j) {
+                uint8_t sc = scales[j];
+                dl[j] = d * (sc & 0xF);
+                ml[j] = min * (sc >> 4);
             }
+            dequantize_q2_K_32(y, q, 0, dl[0], ml[0], dl[1], ml[1]);
+            dequantize_q2_K_32(y + 32, q, 2, dl[2], ml[2], dl[3], ml[3]);
+            dequantize_q2_K_32(y + 64, q, 4, dl[4], ml[4], dl[5], ml[5]);
+            dequantize_q2_K_32(y + 96, q, 6, dl[6], ml[6], dl[7], ml[7]);
+            y += 128;
             q += 32;
+            scales += 8;
         }
     }
 }
 
-void dequantize_row_q3_K(const void* src, float* dst, int k) {
+void dequantize_row_q3_K(const void* src, float* restrict dst, int k) {
     const block_q3_K* x = (const block_q3_K*)src;
     int nb = k / QK_K;
 
@@ -804,8 +808,8 @@ void dequantize_row_q3_K(const void* src, float* dst, int k) {
     for (int i = 0; i < nb; i++) {
         const float d_all = fp16_to_fp32(x[i].d);
 
-        const uint8_t* q = x[i].qs;
-        const uint8_t* hm = x[i].hmask;
+        const uint8_t* restrict q = x[i].qs;
+        const uint8_t* restrict hm = x[i].hmask;
         uint8_t m = 1;
 
         memcpy(aux, x[i].scales, 12);
@@ -816,22 +820,17 @@ void dequantize_row_q3_K(const void* src, float* dst, int k) {
         aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
 
         int is = 0;
-        float dl;
-        float* y = dst + i * QK_K;
+        float* restrict y = dst + i * QK_K;
         for (int n = 0; n < QK_K; n += 128) {
-            int shift = 0;
             for (int j = 0; j < 4; ++j) {
-                dl = d_all * (scales[is++] - 32);
+                const int shift = 2 * j;
+                const float dl1 = d_all * (scales[is++] - 32);
+                const float dl2 = d_all * (scales[is++] - 32);
                 for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((int8_t)((q[l+ 0] >> shift) & 3) - ((hm[l+ 0] & m) ? 0 : 4));
+                    y[l] = dl1 * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
+                    y[l + 16] = dl2 * ((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
                 }
-
-                dl = d_all * (scales[is++] - 32);
-                for (int l = 0; l < 16; ++l) {
-                    *y++ = dl * ((int8_t)((q[l+16] >> shift) & 3) - ((hm[l+16] & m) ? 0 : 4));
-                }
-
-                shift += 2;
+                y += 32;
                 m <<= 1;
             }
             q += 32;
@@ -878,30 +877,40 @@ void dequantize_row_q5_K(const void* src, float* dst, int k) {
     }
 }
 
-void dequantize_row_q6_K(const void* src, float* dst, int k) {
+void dequantize_row_q6_K(const void* src, float* restrict dst, int k) {
     const block_q6_K* x = (const block_q6_K*)src;
     int nb = k / QK_K;
 
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(x[i].d);
 
-        const uint8_t* ql = x[i].ql;
-        const uint8_t* qh = x[i].qh;
+        const uint8_t* restrict ql = x[i].ql;
+        const uint8_t* restrict qh = x[i].qh;
         const int8_t* sc = x[i].scales;
 
-        float* y = dst + i * QK_K;
+        float* restrict y = dst + i * QK_K;
 
         for (int n = 0; n < QK_K; n += 128) {
-            for (int l = 0; l < 32; ++l) {
-                int is = l / 16;
-                const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                const int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                const int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                y[l +  0] = d * sc[is + 0] * q1;
-                y[l + 32] = d * sc[is + 2] * q2;
-                y[l + 64] = d * sc[is + 4] * q3;
-                y[l + 96] = d * sc[is + 6] * q4;
+            // 16-element halves so each scale product is loop-invariant;
+            // d * sc[...] * q evaluates left to right, as before.
+            for (int h = 0; h < 2; h++) {
+                const float d0 = d * sc[h + 0];
+                const float d2 = d * sc[h + 2];
+                const float d4 = d * sc[h + 4];
+                const float d6 = d * sc[h + 6];
+                const uint8_t* restrict qlh = ql + 16 * h;
+                const uint8_t* restrict qhh = qh + 16 * h;
+                float* restrict yh = y + 16 * h;
+                for (int l = 0; l < 16; ++l) {
+                    const int8_t q1 = (int8_t)((qlh[l +  0] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+                    const int8_t q2 = (int8_t)((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+                    const int8_t q3 = (int8_t)((qlh[l +  0]  >> 4) | (((qhh[l] >> 4) & 3) << 4)) - 32;
+                    const int8_t q4 = (int8_t)((qlh[l + 32]  >> 4) | (((qhh[l] >> 6) & 3) << 4)) - 32;
+                    yh[l +  0] = d0 * q1;
+                    yh[l + 32] = d2 * q2;
+                    yh[l + 64] = d4 * q3;
+                    yh[l + 96] = d6 * q4;
+                }
             }
             y  += 128;
             ql += 64;
@@ -2092,21 +2101,303 @@ void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw);
 void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
                            int batch_size, int in_stride, int out_stride);
 void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw);
-static void matmul_q8_0_16row(float* xout, const float* x, const QuantizedTensor* qw);
+static void matmul_deq_16row(float* xout, const float* x, const QuantizedTensor* qw);
+
+// ---------------------------------------------------------------------------
+// Block-32 formats with Q8_0 activations (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL)
+//
+// The per-row vec_dot_*_q8_0 kernels unpack the nibbles of a weight row every
+// time they run; in the batched prefill that happened once per token for every
+// row. The kernels below unpack a group of 4 rows once into the per-thread
+// deq_buf (the int8 weights first, then the per-block scales and mins as
+// floats) and run the dot products from there. The integer block sums are
+// exact, and the scale products are applied per block with the very same
+// expressions and in the same order as the per-row kernels, so the results are
+// bit-identical to them.
+
+typedef void (*unpack_b32_func)(const void* src, int8_t* restrict w8,
+                                float* restrict dsc, float* restrict msc, int nb);
+
+static void unpack_row_q4_0(const void* src, int8_t* restrict w8,
+                            float* restrict dsc, float* restrict msc, int nb) {
+    const block_q4_0* y = (const block_q4_0*)src;
+    (void)msc;
+    for (int i = 0; i < nb; i++) {
+        dsc[i] = fp16_to_fp32(y[i].d);
+        const uint8_t* restrict qs = y[i].qs;
+        int8_t* restrict o = w8 + i * 32;
+        for (int j = 0; j < 16; j++) {
+            o[j] = (int8_t)((qs[j] & 0x0F) - 8);
+            o[j + 16] = (int8_t)((qs[j] >> 4) - 8);
+        }
+    }
+}
+
+static void unpack_row_q4_1(const void* src, int8_t* restrict w8,
+                            float* restrict dsc, float* restrict msc, int nb) {
+    const block_q4_1* y = (const block_q4_1*)src;
+    for (int i = 0; i < nb; i++) {
+        dsc[i] = fp16_to_fp32(y[i].d);
+        msc[i] = fp16_to_fp32(y[i].m);
+        const uint8_t* restrict qs = y[i].qs;
+        int8_t* restrict o = w8 + i * 32;
+        for (int j = 0; j < 16; j++) {
+            o[j] = (int8_t)(qs[j] & 0x0F);
+            o[j + 16] = (int8_t)(qs[j] >> 4);
+        }
+    }
+}
+
+// Bit j of the 32-bit qh word of Q5_0/Q5_1 lives in byte j >> 3, bit j & 7
+static const uint8_t kbit_b32[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+
+static void unpack_row_q5_0(const void* src, int8_t* restrict w8,
+                            float* restrict dsc, float* restrict msc, int nb) {
+    const block_q5_0* y = (const block_q5_0*)src;
+    (void)msc;
+    for (int i = 0; i < nb; i++) {
+        dsc[i] = fp16_to_fp32(y[i].d);
+        const uint8_t* restrict qh = y[i].qh;
+        const uint8_t* restrict qs = y[i].qs;
+        int8_t* restrict o = w8 + i * 32;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t h0 = qh[j >> 3];
+            const uint8_t h1 = qh[2 + (j >> 3)];
+            o[j] = (int8_t)(((qs[j] & 0x0F) | ((h0 & kbit_b32[j]) ? 16 : 0)) - 16);
+            o[j + 16] = (int8_t)(((qs[j] >> 4) | ((h1 & kbit_b32[j]) ? 16 : 0)) - 16);
+        }
+    }
+}
+
+static void unpack_row_q5_1(const void* src, int8_t* restrict w8,
+                            float* restrict dsc, float* restrict msc, int nb) {
+    const block_q5_1* y = (const block_q5_1*)src;
+    for (int i = 0; i < nb; i++) {
+        dsc[i] = fp16_to_fp32(y[i].d);
+        msc[i] = fp16_to_fp32(y[i].m);
+        const uint8_t* restrict qh = y[i].qh;
+        const uint8_t* restrict qs = y[i].qs;
+        int8_t* restrict o = w8 + i * 32;
+        for (int j = 0; j < 16; j++) {
+            const uint8_t h0 = qh[j >> 3];
+            const uint8_t h1 = qh[2 + (j >> 3)];
+            o[j] = (int8_t)((qs[j] & 0x0F) | ((h0 & kbit_b32[j]) ? 16 : 0));
+            o[j + 16] = (int8_t)((qs[j] >> 4) | ((h1 & kbit_b32[j]) ? 16 : 0));
+        }
+    }
+}
+
+static void unpack_row_iq4_nl(const void* src, int8_t* restrict w8,
+                              float* restrict dsc, float* restrict msc, int nb) {
+    const block_iq4_nl* y = (const block_iq4_nl*)src;
+    (void)msc;
+    for (int i = 0; i < nb; i++) {
+        dsc[i] = fp16_to_fp32(y[i].d);
+        const uint8_t* restrict qs = y[i].qs;
+        int8_t* restrict o = w8 + i * 32;
+        for (int j = 0; j < 16; j++) {
+            o[j] = kvalues_iq4nl[qs[j] & 0xF];
+            o[j + 16] = kvalues_iq4nl[qs[j] >> 4];
+        }
+    }
+}
+
+// Unpacker for the block-32 formats (NULL for every other type); has_min tells
+// whether the format carries a per-block min (Q4_1, Q5_1).
+static inline unpack_b32_func get_unpack_b32_func(enum ggml_type type, int* has_min) {
+    *has_min = 0;
+    switch (type) {
+        case GGML_TYPE_Q4_0:   return unpack_row_q4_0;
+        case GGML_TYPE_Q4_1:   *has_min = 1; return unpack_row_q4_1;
+        case GGML_TYPE_Q5_0:   return unpack_row_q5_0;
+        case GGML_TYPE_Q5_1:   *has_min = 1; return unpack_row_q5_1;
+        case GGML_TYPE_IQ4_NL: return unpack_row_iq4_nl;
+        default:               return NULL;
+    }
+}
+
+// Per-block sums of a Q8_0 activation row (the xsum term of the min formats).
+static void block_sums_q8_0(const block_q8_0* restrict xq, int32_t* restrict xs, int nb) {
+    for (int i = 0; i < nb; i++) {
+        const int8_t* restrict q = xq[i].qs;
+        int sum = 0;
+        for (int k = 0; k < 32; k++) {
+            sum += q[k];
+        }
+        xs[i] = sum;
+    }
+}
+
+// 4 unpacked rows (int8 weights w8 with row stride n, per-block scales dsc)
+// against one Q8_0 activation row: out[0..3] = the 4 dot products.
+// Per row and block this is exactly vec_dot_*_q8_0: an exact integer block
+// sum, then sum += dw * dx * (float)isum.
+static void dot4_b32_q8_0(const int8_t* restrict w8, int n, const float* restrict dsc,
+                          const block_q8_0* restrict xq, int nb, float* restrict out) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dx = fp16_to_fp32(xq[i].d);
+        const int8_t* restrict x8 = xq[i].qs;
+        const int8_t* restrict w0 = w8 + i * 32;
+        const int8_t* restrict w1 = w0 + n;
+        const int8_t* restrict w2 = w0 + 2 * n;
+        const int8_t* restrict w3 = w0 + 3 * n;
+        int i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        for (int k = 0; k < 32; k++) {
+            int xk = x8[k];
+            i0 += w0[k] * xk;
+            i1 += w1[k] * xk;
+            i2 += w2[k] * xk;
+            i3 += w3[k] * xk;
+        }
+        s0 += dsc[i] * dx * (float)i0;
+        s1 += dsc[nb + i] * dx * (float)i1;
+        s2 += dsc[2 * nb + i] * dx * (float)i2;
+        s3 += dsc[3 * nb + i] * dx * (float)i3;
+    }
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
+}
+
+// Same for the formats with a per-block min (Q4_1, Q5_1): the block term is
+// sum += dw * dx * (float)isum + mw * dx * (float)xsum, like vec_dot_q4_1_q8_0.
+static void dot4_b32_q8_0_min(const int8_t* restrict w8, int n, const float* restrict dsc,
+                              const float* restrict msc, const block_q8_0* restrict xq,
+                              const int32_t* restrict xs, int nb, float* restrict out) {
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float dx = fp16_to_fp32(xq[i].d);
+        const int8_t* restrict x8 = xq[i].qs;
+        const int8_t* restrict w0 = w8 + i * 32;
+        const int8_t* restrict w1 = w0 + n;
+        const int8_t* restrict w2 = w0 + 2 * n;
+        const int8_t* restrict w3 = w0 + 3 * n;
+        int i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        for (int k = 0; k < 32; k++) {
+            int xk = x8[k];
+            i0 += w0[k] * xk;
+            i1 += w1[k] * xk;
+            i2 += w2[k] * xk;
+            i3 += w3[k] * xk;
+        }
+        float xsum = (float)xs[i];
+        s0 += dsc[i] * dx * (float)i0 + msc[i] * dx * xsum;
+        s1 += dsc[nb + i] * dx * (float)i1 + msc[nb + i] * dx * xsum;
+        s2 += dsc[2 * nb + i] * dx * (float)i2 + msc[2 * nb + i] * dx * xsum;
+        s3 += dsc[3 * nb + i] * dx * (float)i3 + msc[3 * nb + i] * dx * xsum;
+    }
+    out[0] = s0;
+    out[1] = s1;
+    out[2] = s2;
+    out[3] = s3;
+}
+
+// Scratch layout inside a thread's deq_buf region (4 * max_input floats):
+//   [0, n)              int8 weights of the 4 rows (4 * n bytes)
+//   [n, n + 4 * nb)     per-block scales of the 4 rows
+//   [n + 4 * nb, ...)   per-block mins of the 4 rows (min formats)
+// which ends below n + n / 4 floats, and the per-token block sums of the
+// activations, shared by all threads, live in the upper half of thread 0's
+// region (at most PREFILL_BATCH_SIZE * nb <= n ints), so nothing overlaps.
+
+// Block-32 matmul for one Q8_0-quantized activation row, 4 weight rows per pass.
+static void matmul_b32_q8_0(float* xout, const QuantizedTensor* qw, const block_q8_0* xq,
+                            unpack_b32_func unpack, int has_min) {
+    int d = qw->rows;
+    int n = qw->cols;
+    int nb = n / 32;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    int32_t* xs = (int32_t*)(deq_buf + deq_buf_stride / 2);
+    if (has_min) {
+        block_sums_q8_0(xq, xs, nb);
+    }
+
+    int ngroups = d / 4;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 4;
+        float* region = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        int8_t* w8 = (int8_t*)region;
+        float* dsc = region + n;
+        float* msc = dsc + 4 * nb;
+        for (int r = 0; r < 4; r++) {
+            unpack(data + (size_t)(i + r) * row_size, w8 + r * n, dsc + r * nb, msc + r * nb, nb);
+        }
+        if (has_min) {
+            dot4_b32_q8_0_min(w8, n, dsc, msc, xq, xs, nb, xout + i);
+        } else {
+            dot4_b32_q8_0(w8, n, dsc, xq, nb, xout + i);
+        }
+    }
+
+    cached_q8_func q8_func = qw->q8_func;
+    for (int r = ngroups * 4; r < d; r++) {
+        xout[r] = q8_func(xq, data + (size_t)r * row_size, n);
+    }
+}
+
+// Batched block-32 matmul: every 4-row group is unpacked once and multiplied
+// with all the quantized activation rows of the batch.
+static void matmul_b32_q8_0_batch(float* xout, const QuantizedTensor* qw, int batch_size, int out_stride,
+                                  const block_q8_0* q8_bufs, int q8_stride,
+                                  unpack_b32_func unpack, int has_min) {
+    int d = qw->rows;
+    int n = qw->cols;
+    int nb = n / 32;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    int32_t* xs = (int32_t*)(deq_buf + deq_buf_stride / 2);
+    if (has_min) {
+        for (int b = 0; b < batch_size; b++) {
+            block_sums_q8_0(q8_bufs + b * q8_stride, xs + b * nb, nb);
+        }
+    }
+
+    int ngroups = d / 4;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 4;
+        float* region = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        int8_t* w8 = (int8_t*)region;
+        float* dsc = region + n;
+        float* msc = dsc + 4 * nb;
+        for (int r = 0; r < 4; r++) {
+            unpack(data + (size_t)(i + r) * row_size, w8 + r * n, dsc + r * nb, msc + r * nb, nb);
+        }
+        if (has_min) {
+            for (int b = 0; b < batch_size; b++) {
+                dot4_b32_q8_0_min(w8, n, dsc, msc, q8_bufs + b * q8_stride, xs + b * nb, nb,
+                                  xout + b * out_stride + i);
+            }
+        } else {
+            for (int b = 0; b < batch_size; b++) {
+                dot4_b32_q8_0(w8, n, dsc, q8_bufs + b * q8_stride, nb, xout + b * out_stride + i);
+            }
+        }
+    }
+
+    cached_q8_func q8_func = qw->q8_func;
+    for (int r = ngroups * 4; r < d; r++) {
+        const void* row = data + (size_t)r * row_size;
+        for (int b = 0; b < batch_size; b++) {
+            xout[b * out_stride + r] = q8_func(q8_bufs + b * q8_stride, row, n);
+        }
+    }
+}
 
 // Fused quantized matrix-vector multiplication
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
 // Uses Q8_0 quantized input path when available for integer dot products
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
-    // Q8_0: 16-row dequantize-then-dot kernel
-    if (qw->type == GGML_TYPE_Q8_0 && qw->deq_func && deq_buf) {
-        matmul_q8_0_16row(xout, x, qw);
-        return;
-    }
-    // Dequantize-then-4row path (K-quants)
+    // Dequantizable types (Q8_0, K-quants): 16-row dequantize-then-dot kernel
     if (qw->deq_func && deq_buf) {
-        matmul_deq_4row(xout, x, qw);
+        matmul_deq_16row(xout, x, qw);
         return;
     }
 
@@ -2121,6 +2412,14 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     if (q8_func && q8_buf) {
         // Quantize x to Q8_0 once before the parallel loop
         quantize_row_q8_0(x, q8_buf, n);
+
+        // Block-32 formats: 4-row kernel over unpacked int8 weights
+        int has_min;
+        unpack_b32_func unpack = deq_buf ? get_unpack_b32_func(qw->type, &has_min) : NULL;
+        if (unpack) {
+            matmul_b32_q8_0(xout, qw, q8_buf, unpack, has_min);
+            return;
+        }
 
         int i;
         #pragma omp parallel for private(i)
@@ -2147,24 +2446,28 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 }
 
-// Q8_0 single-token matmul: 16 rows per pass. Dequantizes the 16 rows into the
+// Single-token matmul for the dequantizable types (Q8_0 and the K-quants):
+// 16 rows per pass. Dequantizes the 16 rows into the
 // per-thread deq_buf (in column chunks when 16 full rows do not fit) and runs 16
 // independent multiply-accumulate chains, so the CPU can overlap four times
 // more FMAs than the 4-row kernel. Per row the operations and their order are
 // identical to matmul_deq_4row (same dequantized values, same sequential
 // sum += w * x), so results match it bit for bit; rows left over after the
 // 16-row groups go through matmul_deq_4row itself.
-static void matmul_q8_0_16row(float* xout, const float* x, const QuantizedTensor* qw) {
+static void matmul_deq_16row(float* xout, const float* x, const QuantizedTensor* qw) {
     int d = qw->rows;
     int n = qw->cols;
     size_t row_size = qw->row_size;
     const char* data = (const char*)qw->data;
     deq_row_func dfunc = qw->deq_func;
+    int block_size = get_block_size(qw->type);
+    size_t type_size = get_type_size(qw->type);
 
+    // Column chunks are whole blocks (32 for Q8_0, 256 for the K-quants)
     int chunk = deq_buf_stride / 16;
-    chunk -= chunk % QK8_0;
+    chunk -= chunk % block_size;
     if (chunk > n) chunk = n;
-    if (chunk < QK8_0) {
+    if (chunk < block_size) {
         matmul_deq_4row(xout, x, qw);
         return;
     }
@@ -2180,7 +2483,7 @@ static void matmul_q8_0_16row(float* xout, const float* x, const QuantizedTensor
         for (int c0 = 0; c0 < n; c0 += chunk) {
             int cn = n - c0;
             if (cn > chunk) cn = chunk;
-            size_t boff = (size_t)(c0 / QK8_0) * sizeof(block_q8_0);
+            size_t boff = (size_t)(c0 / block_size) * type_size;
             for (int r = 0; r < 16; r++) {
                 dfunc(data + (size_t)(i + r) * row_size + boff, buf + r * cn, cn);
             }
@@ -2275,7 +2578,9 @@ void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 }
 
-// Optimized batch matmul: dequantize 4 rows once, 3-batch sharing dot product (12 chains)
+// Optimized batch matmul: dequantize 4 rows once, 4-token sharing dot product
+// (16 independent multiply-accumulate chains, one per row and token; each chain
+// is the same sequential sum += w * x as the single-token kernels)
 void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
                            int batch_size, int in_stride, int out_stride) {
     int d = qw->rows;
@@ -2297,19 +2602,22 @@ void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* q
         dfunc(data + (size_t)(i + 3) * row_size, buf + 3 * n, n);
 
         int b = 0;
-        for (; b + 2 < batch_size; b += 3) {
+        for (; b + 3 < batch_size; b += 4) {
             const float* x0 = x + b * in_stride;
             const float* x1 = x + (b + 1) * in_stride;
             const float* x2 = x + (b + 2) * in_stride;
+            const float* x3 = x + (b + 3) * in_stride;
             float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
             float t0 = 0, t1 = 0, t2 = 0, t3 = 0;
             float u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+            float v0 = 0, v1 = 0, v2 = 0, v3 = 0;
             for (int j = 0; j < n; j++) {
                 float b0 = buf[j], b1 = buf[n + j], b2 = buf[2 * n + j], b3 = buf[3 * n + j];
-                float v0 = x0[j], v1 = x1[j], v2 = x2[j];
-                s0 += b0 * v0; s1 += b1 * v0; s2 += b2 * v0; s3 += b3 * v0;
-                t0 += b0 * v1; t1 += b1 * v1; t2 += b2 * v1; t3 += b3 * v1;
-                u0 += b0 * v2; u1 += b1 * v2; u2 += b2 * v2; u3 += b3 * v2;
+                float a0 = x0[j], a1 = x1[j], a2 = x2[j], a3 = x3[j];
+                s0 += b0 * a0; s1 += b1 * a0; s2 += b2 * a0; s3 += b3 * a0;
+                t0 += b0 * a1; t1 += b1 * a1; t2 += b2 * a1; t3 += b3 * a1;
+                u0 += b0 * a2; u1 += b1 * a2; u2 += b2 * a2; u3 += b3 * a2;
+                v0 += b0 * a3; v1 += b1 * a3; v2 += b2 * a3; v3 += b3 * a3;
             }
             xout[b * out_stride + i] = s0;
             xout[b * out_stride + i + 1] = s1;
@@ -2323,6 +2631,10 @@ void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* q
             xout[(b + 2) * out_stride + i + 1] = u1;
             xout[(b + 2) * out_stride + i + 2] = u2;
             xout[(b + 2) * out_stride + i + 3] = u3;
+            xout[(b + 3) * out_stride + i] = v0;
+            xout[(b + 3) * out_stride + i + 1] = v1;
+            xout[(b + 3) * out_stride + i + 2] = v2;
+            xout[(b + 3) * out_stride + i + 3] = v3;
         }
 
         for (; b < batch_size; b++) {
@@ -2379,6 +2691,14 @@ void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
     const char* data = (const char*)qw->data;
     cached_q8_func q8_func = qw->q8_func;
 
+    // Block-32 formats: 4-row kernel over unpacked int8 weights
+    int has_min;
+    unpack_b32_func unpack = deq_buf ? get_unpack_b32_func(qw->type, &has_min) : NULL;
+    if (unpack) {
+        matmul_b32_q8_0(xout, qw, q8_buf, unpack, has_min);
+        return;
+    }
+
     int i;
     #pragma omp parallel for private(i)
     for (i = 0; i < d; i++) {
@@ -2407,6 +2727,13 @@ void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* 
         // Quantize all batch inputs to Q8_0
         for (int b = 0; b < batch_size; b++) {
             quantize_row_q8_0(x + b * in_stride, q8_bufs + b * q8_stride, n);
+        }
+        // Block-32 formats: unpack each 4-row group once for the whole batch
+        int has_min;
+        unpack_b32_func unpack = deq_buf ? get_unpack_b32_func(qw->type, &has_min) : NULL;
+        if (unpack) {
+            matmul_b32_q8_0_batch(xout, qw, batch_size, out_stride, q8_bufs, q8_stride, unpack, has_min);
+            return;
         }
         // Read each weight row once, compute all batch dot products
         int i;
