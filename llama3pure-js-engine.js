@@ -210,10 +210,15 @@ var ggufData = null
 var dataView = null
 var offset = 0
 
-// Q8_0 buffers for quantizing x vector in matmulQuantized
+// Q8_0 buffers for quantizing the x vector in matmulQuantized. Allocated on
+// first use (ensureXQ8Buf): only Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL weights need them.
 var xQ8Buf = null
 var xQ8Int8Buf = null
+var xQ8Size = 0
 var matmulDeqBuf = null
+// Four row-sized Float64Array views over matmulDeqBuf (one per dequantized
+// row), used by the Q8_0 prefill kernel. Allocated with matmulDeqBuf.
+var matmulDeqRows = null
 
 var temperature = 0.9
 var topP = 0.9
@@ -357,7 +362,7 @@ var fp16Table = new Float32Array(65536)
   }
 })()
 
-// BF16 to FP32 lookup table — 256 KB, lazily populated since most loaded
+// BF16 to FP32 lookup table - 256 KB, lazily populated since most loaded
 // models (Q8_0, Q4_K, etc.) never touch a BF16 tensor. Filled on first
 // bf16ToFp32 call via ensureBf16Table().
 var bf16Table = null
@@ -3104,6 +3109,14 @@ function getDeqRowFunc(type) {
   }
 }
 
+function ensureXQ8Buf() {
+  if (xQ8Buf === null) {
+    var xQ8Buffer = new ArrayBuffer(xQ8Size)
+    xQ8Buf = new Uint8Array(xQ8Buffer)
+    xQ8Int8Buf = new Int8Array(xQ8Buffer)
+  }
+}
+
 function matmulQuantized(out, x, qw) {
   var rows = qw.rows
   var cols = qw.cols
@@ -3111,11 +3124,10 @@ function matmulQuantized(out, x, qw) {
   var rowSize = qw.rowSize
   var dotQ8Func = qw.dotQ8Func
 
-  if (qw.type === GGML_TYPE.Q8_0) {
-    // Per-matrix local views for better V8 bounds check elimination
-    matmulQ8_0Local(out, x, qw.localU8, qw.localI8, rows, cols, rowSize)
+  if (qw.localI32 !== null) {
+    matmulQ8_0Local(out, x, qw)
   } else if (qw.deqRowFunc) {
-    // K-quant: dequantize 4 rows at a time, flat dot product
+    // K-quant: dequantize a few rows at a time, flat dot product
     matmulKQuantLocal(
       out,
       x,
@@ -3128,6 +3140,7 @@ function matmulQuantized(out, x, qw) {
     )
   } else if (dotQ8Func) {
     // Quantize x to Q8_0 once, then use integer dot products
+    ensureXQ8Buf()
     quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
     for (var i = 0; i < rows; i = i + 1) {
       out[i] = dotQ8Func(xQ8Buf, xQ8Int8Buf, baseOffset + i * rowSize, cols)
@@ -3165,17 +3178,8 @@ function matmulQuantizedBatch(outs, xs, qw, batchSize) {
   var rowSize = qw.rowSize
   var dotQ8Func = qw.dotQ8Func
 
-  if (qw.type === GGML_TYPE.Q8_0) {
-    matmulQ8_0LocalBatch(
-      outs,
-      xs,
-      qw.localU8,
-      qw.localI8,
-      rows,
-      cols,
-      rowSize,
-      batchSize
-    )
+  if (qw.localI32 !== null) {
+    matmulQ8_0LocalBatch(outs, xs, qw, batchSize)
   } else if (qw.deqRowFunc) {
     // K-quant: dequantize 4 rows at a time, 3-batch sharing dot product
     matmulKQuantLocalBatch(
@@ -3212,78 +3216,630 @@ function matmulQuantizedBatch(outs, xs, qw, batchSize) {
   }
 }
 
-// Q8_0 batch matmul: dequantize 4 rows into reusable buffer, then flat dot product
-// Dequantization cost is amortized across all batch elements (32x reuse)
-function matmulQ8_0LocalBatch(
-  outs,
-  xs,
-  localU8,
-  localI8,
-  rows,
-  cols,
-  rowSize,
-  batchSize
-) {
-  var nb = cols >> 5
+// Q8_0 matmul, single token: 4 rows at a time, 4 weights per Int32 load.
+//
+// A Q8_0 block is 34 bytes (FP16 scale + 32 int8 weights), so consecutive
+// blocks alternate between 4-byte-aligned and 2-byte-aligned starts. We walk
+// the row in PAIRS of blocks (68 bytes = 17 Int32 words): word 0 holds the
+// first scale plus weights 0-1, words 1-7 hold weights 2-29, word 8 holds
+// weights 30-31 plus the second scale, and words 9-16 hold the second block.
+// Each weight is sign-extracted from its word with a shift pair, which V8
+// turns into plain ALU ops instead of a byte load + bounds check per weight.
+//
+// The summation order is exactly the one of the original byte kernel: a
+// left-to-right chain over the 32 weights of a block, then sum += d * chain.
+// Each block is split into two 16-column groups; the second group lives in a
+// one-iteration loop on purpose: the loop header bounds the size of the basic
+// block V8 schedules at once, which stops it from hoisting every load of the
+// block pair up front and spilling the live values to the stack.
+//
+// Requires qw.localI32 (matrix start 4-byte aligned and an even number of
+// blocks per row). A Q8_0 matrix without it goes through the generic
+// per-row vecDotQ8_0 path in matmulQuantized instead.
+function matmulQ8_0Local(out, x, qw) {
+  var I32 = qw.localI32
+  var rows = qw.rows
+  var cols = qw.cols
+  var rowWords = qw.rowSize >> 2
+  var nbp = cols >> 6
   var rows4 = rows & ~3
-  var buf = matmulDeqBuf
-  var off1 = cols
-  var off2 = cols + cols
-  var off3 = off2 + cols
-  var cols4 = cols & ~3
   for (var i = 0; i < rows4; i = i + 4) {
-    // Dequantize 4 weight rows into the reusable Float64 buffer
-    var bo = i * rowSize
-    for (var r = 0; r < 4; r = r + 1) {
-      var bOff = r * cols
-      var bk = bo
-      var idx = bOff
-      for (var b = 0; b < nb; b = b + 1) {
-        var d = fp16Table[localU8[bk] | (localU8[bk + 1] << 8)]
-        var qo = bk + 2
-        buf[idx] = d * localI8[qo]
-        buf[idx + 1] = d * localI8[qo + 1]
-        buf[idx + 2] = d * localI8[qo + 2]
-        buf[idx + 3] = d * localI8[qo + 3]
-        buf[idx + 4] = d * localI8[qo + 4]
-        buf[idx + 5] = d * localI8[qo + 5]
-        buf[idx + 6] = d * localI8[qo + 6]
-        buf[idx + 7] = d * localI8[qo + 7]
-        buf[idx + 8] = d * localI8[qo + 8]
-        buf[idx + 9] = d * localI8[qo + 9]
-        buf[idx + 10] = d * localI8[qo + 10]
-        buf[idx + 11] = d * localI8[qo + 11]
-        buf[idx + 12] = d * localI8[qo + 12]
-        buf[idx + 13] = d * localI8[qo + 13]
-        buf[idx + 14] = d * localI8[qo + 14]
-        buf[idx + 15] = d * localI8[qo + 15]
-        buf[idx + 16] = d * localI8[qo + 16]
-        buf[idx + 17] = d * localI8[qo + 17]
-        buf[idx + 18] = d * localI8[qo + 18]
-        buf[idx + 19] = d * localI8[qo + 19]
-        buf[idx + 20] = d * localI8[qo + 20]
-        buf[idx + 21] = d * localI8[qo + 21]
-        buf[idx + 22] = d * localI8[qo + 22]
-        buf[idx + 23] = d * localI8[qo + 23]
-        buf[idx + 24] = d * localI8[qo + 24]
-        buf[idx + 25] = d * localI8[qo + 25]
-        buf[idx + 26] = d * localI8[qo + 26]
-        buf[idx + 27] = d * localI8[qo + 27]
-        buf[idx + 28] = d * localI8[qo + 28]
-        buf[idx + 29] = d * localI8[qo + 29]
-        buf[idx + 30] = d * localI8[qo + 30]
-        buf[idx + 31] = d * localI8[qo + 31]
-        bk = bk + 34
-        idx = idx + 32
+    var p0 = i * rowWords
+    var p1 = p0 + rowWords
+    var p2 = p1 + rowWords
+    var p3 = p2 + rowWords
+    var s0 = 0.0
+    var s1 = 0.0
+    var s2 = 0.0
+    var s3 = 0.0
+    var xb = 0
+    for (var b = 0; b < nbp; b = b + 1) {
+      var d0_0 = fp16Table[I32[p0] & 0xffff]
+      var d0_1 = fp16Table[I32[p1] & 0xffff]
+      var d0_2 = fp16Table[I32[p2] & 0xffff]
+      var d0_3 = fp16Table[I32[p3] & 0xffff]
+      // Even block of the pair (weights 0-31), columns 0-15
+      var xi = xb
+      var w0 = p0
+      var w1 = p1
+      var w2 = p2
+      var w3 = p3
+      var x0 = x[xi]
+      var x1 = x[(xi + 1) | 0]
+      var x2 = x[(xi + 2) | 0]
+      var x3 = x[(xi + 3) | 0]
+      var x4 = x[(xi + 4) | 0]
+      var x5 = x[(xi + 5) | 0]
+      var x6 = x[(xi + 6) | 0]
+      var x7 = x[(xi + 7) | 0]
+      var x8 = x[(xi + 8) | 0]
+      var x9 = x[(xi + 9) | 0]
+      var x10 = x[(xi + 10) | 0]
+      var x11 = x[(xi + 11) | 0]
+      var x12 = x[(xi + 12) | 0]
+      var x13 = x[(xi + 13) | 0]
+      var x14 = x[(xi + 14) | 0]
+      var x15 = x[(xi + 15) | 0]
+      var v0_0 = I32[w0]
+      var v0_1 = I32[(w0 + 1) | 0]
+      var v0_2 = I32[(w0 + 2) | 0]
+      var v0_3 = I32[(w0 + 3) | 0]
+      var v0_4 = I32[(w0 + 4) | 0]
+      var v1_0 = I32[w1]
+      var v1_1 = I32[(w1 + 1) | 0]
+      var v1_2 = I32[(w1 + 2) | 0]
+      var v1_3 = I32[(w1 + 3) | 0]
+      var v1_4 = I32[(w1 + 4) | 0]
+      var v2_0 = I32[w2]
+      var v2_1 = I32[(w2 + 1) | 0]
+      var v2_2 = I32[(w2 + 2) | 0]
+      var v2_3 = I32[(w2 + 3) | 0]
+      var v2_4 = I32[(w2 + 4) | 0]
+      var v3_0 = I32[w3]
+      var v3_1 = I32[(w3 + 1) | 0]
+      var v3_2 = I32[(w3 + 2) | 0]
+      var v3_3 = I32[(w3 + 3) | 0]
+      var v3_4 = I32[(w3 + 4) | 0]
+      var a0 =
+        x0 * ((v0_0 << 8) >> 24) +
+        x1 * (v0_0 >> 24) +
+        x2 * ((v0_1 << 24) >> 24) +
+        x3 * ((v0_1 << 16) >> 24) +
+        x4 * ((v0_1 << 8) >> 24) +
+        x5 * (v0_1 >> 24) +
+        x6 * ((v0_2 << 24) >> 24) +
+        x7 * ((v0_2 << 16) >> 24) +
+        x8 * ((v0_2 << 8) >> 24) +
+        x9 * (v0_2 >> 24) +
+        x10 * ((v0_3 << 24) >> 24) +
+        x11 * ((v0_3 << 16) >> 24) +
+        x12 * ((v0_3 << 8) >> 24) +
+        x13 * (v0_3 >> 24) +
+        x14 * ((v0_4 << 24) >> 24) +
+        x15 * ((v0_4 << 16) >> 24)
+      var a1 =
+        x0 * ((v1_0 << 8) >> 24) +
+        x1 * (v1_0 >> 24) +
+        x2 * ((v1_1 << 24) >> 24) +
+        x3 * ((v1_1 << 16) >> 24) +
+        x4 * ((v1_1 << 8) >> 24) +
+        x5 * (v1_1 >> 24) +
+        x6 * ((v1_2 << 24) >> 24) +
+        x7 * ((v1_2 << 16) >> 24) +
+        x8 * ((v1_2 << 8) >> 24) +
+        x9 * (v1_2 >> 24) +
+        x10 * ((v1_3 << 24) >> 24) +
+        x11 * ((v1_3 << 16) >> 24) +
+        x12 * ((v1_3 << 8) >> 24) +
+        x13 * (v1_3 >> 24) +
+        x14 * ((v1_4 << 24) >> 24) +
+        x15 * ((v1_4 << 16) >> 24)
+      var a2 =
+        x0 * ((v2_0 << 8) >> 24) +
+        x1 * (v2_0 >> 24) +
+        x2 * ((v2_1 << 24) >> 24) +
+        x3 * ((v2_1 << 16) >> 24) +
+        x4 * ((v2_1 << 8) >> 24) +
+        x5 * (v2_1 >> 24) +
+        x6 * ((v2_2 << 24) >> 24) +
+        x7 * ((v2_2 << 16) >> 24) +
+        x8 * ((v2_2 << 8) >> 24) +
+        x9 * (v2_2 >> 24) +
+        x10 * ((v2_3 << 24) >> 24) +
+        x11 * ((v2_3 << 16) >> 24) +
+        x12 * ((v2_3 << 8) >> 24) +
+        x13 * (v2_3 >> 24) +
+        x14 * ((v2_4 << 24) >> 24) +
+        x15 * ((v2_4 << 16) >> 24)
+      var a3 =
+        x0 * ((v3_0 << 8) >> 24) +
+        x1 * (v3_0 >> 24) +
+        x2 * ((v3_1 << 24) >> 24) +
+        x3 * ((v3_1 << 16) >> 24) +
+        x4 * ((v3_1 << 8) >> 24) +
+        x5 * (v3_1 >> 24) +
+        x6 * ((v3_2 << 24) >> 24) +
+        x7 * ((v3_2 << 16) >> 24) +
+        x8 * ((v3_2 << 8) >> 24) +
+        x9 * (v3_2 >> 24) +
+        x10 * ((v3_3 << 24) >> 24) +
+        x11 * ((v3_3 << 16) >> 24) +
+        x12 * ((v3_3 << 8) >> 24) +
+        x13 * (v3_3 >> 24) +
+        x14 * ((v3_4 << 24) >> 24) +
+        x15 * ((v3_4 << 16) >> 24)
+      // Columns 16-31 (one-iteration loop: bounds the basic block for V8)
+      for (var g = 1; g < 2; g = g + 1) {
+        xi = xi + 16
+        w0 = w0 + 4
+        w1 = w1 + 4
+        w2 = w2 + 4
+        w3 = w3 + 4
+        var x0 = x[xi]
+        var x1 = x[(xi + 1) | 0]
+        var x2 = x[(xi + 2) | 0]
+        var x3 = x[(xi + 3) | 0]
+        var x4 = x[(xi + 4) | 0]
+        var x5 = x[(xi + 5) | 0]
+        var x6 = x[(xi + 6) | 0]
+        var x7 = x[(xi + 7) | 0]
+        var x8 = x[(xi + 8) | 0]
+        var x9 = x[(xi + 9) | 0]
+        var x10 = x[(xi + 10) | 0]
+        var x11 = x[(xi + 11) | 0]
+        var x12 = x[(xi + 12) | 0]
+        var x13 = x[(xi + 13) | 0]
+        var x14 = x[(xi + 14) | 0]
+        var x15 = x[(xi + 15) | 0]
+        var v0_0 = I32[w0]
+        var v0_1 = I32[(w0 + 1) | 0]
+        var v0_2 = I32[(w0 + 2) | 0]
+        var v0_3 = I32[(w0 + 3) | 0]
+        var v0_4 = I32[(w0 + 4) | 0]
+        var v1_0 = I32[w1]
+        var v1_1 = I32[(w1 + 1) | 0]
+        var v1_2 = I32[(w1 + 2) | 0]
+        var v1_3 = I32[(w1 + 3) | 0]
+        var v1_4 = I32[(w1 + 4) | 0]
+        var v2_0 = I32[w2]
+        var v2_1 = I32[(w2 + 1) | 0]
+        var v2_2 = I32[(w2 + 2) | 0]
+        var v2_3 = I32[(w2 + 3) | 0]
+        var v2_4 = I32[(w2 + 4) | 0]
+        var v3_0 = I32[w3]
+        var v3_1 = I32[(w3 + 1) | 0]
+        var v3_2 = I32[(w3 + 2) | 0]
+        var v3_3 = I32[(w3 + 3) | 0]
+        var v3_4 = I32[(w3 + 4) | 0]
+        a0 =
+          a0 +
+          x0 * ((v0_0 << 8) >> 24) +
+          x1 * (v0_0 >> 24) +
+          x2 * ((v0_1 << 24) >> 24) +
+          x3 * ((v0_1 << 16) >> 24) +
+          x4 * ((v0_1 << 8) >> 24) +
+          x5 * (v0_1 >> 24) +
+          x6 * ((v0_2 << 24) >> 24) +
+          x7 * ((v0_2 << 16) >> 24) +
+          x8 * ((v0_2 << 8) >> 24) +
+          x9 * (v0_2 >> 24) +
+          x10 * ((v0_3 << 24) >> 24) +
+          x11 * ((v0_3 << 16) >> 24) +
+          x12 * ((v0_3 << 8) >> 24) +
+          x13 * (v0_3 >> 24) +
+          x14 * ((v0_4 << 24) >> 24) +
+          x15 * ((v0_4 << 16) >> 24)
+        a1 =
+          a1 +
+          x0 * ((v1_0 << 8) >> 24) +
+          x1 * (v1_0 >> 24) +
+          x2 * ((v1_1 << 24) >> 24) +
+          x3 * ((v1_1 << 16) >> 24) +
+          x4 * ((v1_1 << 8) >> 24) +
+          x5 * (v1_1 >> 24) +
+          x6 * ((v1_2 << 24) >> 24) +
+          x7 * ((v1_2 << 16) >> 24) +
+          x8 * ((v1_2 << 8) >> 24) +
+          x9 * (v1_2 >> 24) +
+          x10 * ((v1_3 << 24) >> 24) +
+          x11 * ((v1_3 << 16) >> 24) +
+          x12 * ((v1_3 << 8) >> 24) +
+          x13 * (v1_3 >> 24) +
+          x14 * ((v1_4 << 24) >> 24) +
+          x15 * ((v1_4 << 16) >> 24)
+        a2 =
+          a2 +
+          x0 * ((v2_0 << 8) >> 24) +
+          x1 * (v2_0 >> 24) +
+          x2 * ((v2_1 << 24) >> 24) +
+          x3 * ((v2_1 << 16) >> 24) +
+          x4 * ((v2_1 << 8) >> 24) +
+          x5 * (v2_1 >> 24) +
+          x6 * ((v2_2 << 24) >> 24) +
+          x7 * ((v2_2 << 16) >> 24) +
+          x8 * ((v2_2 << 8) >> 24) +
+          x9 * (v2_2 >> 24) +
+          x10 * ((v2_3 << 24) >> 24) +
+          x11 * ((v2_3 << 16) >> 24) +
+          x12 * ((v2_3 << 8) >> 24) +
+          x13 * (v2_3 >> 24) +
+          x14 * ((v2_4 << 24) >> 24) +
+          x15 * ((v2_4 << 16) >> 24)
+        a3 =
+          a3 +
+          x0 * ((v3_0 << 8) >> 24) +
+          x1 * (v3_0 >> 24) +
+          x2 * ((v3_1 << 24) >> 24) +
+          x3 * ((v3_1 << 16) >> 24) +
+          x4 * ((v3_1 << 8) >> 24) +
+          x5 * (v3_1 >> 24) +
+          x6 * ((v3_2 << 24) >> 24) +
+          x7 * ((v3_2 << 16) >> 24) +
+          x8 * ((v3_2 << 8) >> 24) +
+          x9 * (v3_2 >> 24) +
+          x10 * ((v3_3 << 24) >> 24) +
+          x11 * ((v3_3 << 16) >> 24) +
+          x12 * ((v3_3 << 8) >> 24) +
+          x13 * (v3_3 >> 24) +
+          x14 * ((v3_4 << 24) >> 24) +
+          x15 * ((v3_4 << 16) >> 24)
       }
-      bo = bo + rowSize
+      s0 = s0 + d0_0 * a0
+      s1 = s1 + d0_1 * a1
+      s2 = s2 + d0_2 * a2
+      s3 = s3 + d0_3 * a3
+      // Odd block of the pair (weights 32-63): scale in the high half of word 8
+      var d1_0 = fp16Table[I32[(p0 + 8) | 0] >>> 16]
+      var d1_1 = fp16Table[I32[(p1 + 8) | 0] >>> 16]
+      var d1_2 = fp16Table[I32[(p2 + 8) | 0] >>> 16]
+      var d1_3 = fp16Table[I32[(p3 + 8) | 0] >>> 16]
+      xi = xb + 32
+      w0 = p0 + 9
+      w1 = p1 + 9
+      w2 = p2 + 9
+      w3 = p3 + 9
+      var x0 = x[xi]
+      var x1 = x[(xi + 1) | 0]
+      var x2 = x[(xi + 2) | 0]
+      var x3 = x[(xi + 3) | 0]
+      var x4 = x[(xi + 4) | 0]
+      var x5 = x[(xi + 5) | 0]
+      var x6 = x[(xi + 6) | 0]
+      var x7 = x[(xi + 7) | 0]
+      var x8 = x[(xi + 8) | 0]
+      var x9 = x[(xi + 9) | 0]
+      var x10 = x[(xi + 10) | 0]
+      var x11 = x[(xi + 11) | 0]
+      var x12 = x[(xi + 12) | 0]
+      var x13 = x[(xi + 13) | 0]
+      var x14 = x[(xi + 14) | 0]
+      var x15 = x[(xi + 15) | 0]
+      var v0_0 = I32[w0]
+      var v0_1 = I32[(w0 + 1) | 0]
+      var v0_2 = I32[(w0 + 2) | 0]
+      var v0_3 = I32[(w0 + 3) | 0]
+      var v1_0 = I32[w1]
+      var v1_1 = I32[(w1 + 1) | 0]
+      var v1_2 = I32[(w1 + 2) | 0]
+      var v1_3 = I32[(w1 + 3) | 0]
+      var v2_0 = I32[w2]
+      var v2_1 = I32[(w2 + 1) | 0]
+      var v2_2 = I32[(w2 + 2) | 0]
+      var v2_3 = I32[(w2 + 3) | 0]
+      var v3_0 = I32[w3]
+      var v3_1 = I32[(w3 + 1) | 0]
+      var v3_2 = I32[(w3 + 2) | 0]
+      var v3_3 = I32[(w3 + 3) | 0]
+      a0 =
+        x0 * ((v0_0 << 24) >> 24) +
+        x1 * ((v0_0 << 16) >> 24) +
+        x2 * ((v0_0 << 8) >> 24) +
+        x3 * (v0_0 >> 24) +
+        x4 * ((v0_1 << 24) >> 24) +
+        x5 * ((v0_1 << 16) >> 24) +
+        x6 * ((v0_1 << 8) >> 24) +
+        x7 * (v0_1 >> 24) +
+        x8 * ((v0_2 << 24) >> 24) +
+        x9 * ((v0_2 << 16) >> 24) +
+        x10 * ((v0_2 << 8) >> 24) +
+        x11 * (v0_2 >> 24) +
+        x12 * ((v0_3 << 24) >> 24) +
+        x13 * ((v0_3 << 16) >> 24) +
+        x14 * ((v0_3 << 8) >> 24) +
+        x15 * (v0_3 >> 24)
+      a1 =
+        x0 * ((v1_0 << 24) >> 24) +
+        x1 * ((v1_0 << 16) >> 24) +
+        x2 * ((v1_0 << 8) >> 24) +
+        x3 * (v1_0 >> 24) +
+        x4 * ((v1_1 << 24) >> 24) +
+        x5 * ((v1_1 << 16) >> 24) +
+        x6 * ((v1_1 << 8) >> 24) +
+        x7 * (v1_1 >> 24) +
+        x8 * ((v1_2 << 24) >> 24) +
+        x9 * ((v1_2 << 16) >> 24) +
+        x10 * ((v1_2 << 8) >> 24) +
+        x11 * (v1_2 >> 24) +
+        x12 * ((v1_3 << 24) >> 24) +
+        x13 * ((v1_3 << 16) >> 24) +
+        x14 * ((v1_3 << 8) >> 24) +
+        x15 * (v1_3 >> 24)
+      a2 =
+        x0 * ((v2_0 << 24) >> 24) +
+        x1 * ((v2_0 << 16) >> 24) +
+        x2 * ((v2_0 << 8) >> 24) +
+        x3 * (v2_0 >> 24) +
+        x4 * ((v2_1 << 24) >> 24) +
+        x5 * ((v2_1 << 16) >> 24) +
+        x6 * ((v2_1 << 8) >> 24) +
+        x7 * (v2_1 >> 24) +
+        x8 * ((v2_2 << 24) >> 24) +
+        x9 * ((v2_2 << 16) >> 24) +
+        x10 * ((v2_2 << 8) >> 24) +
+        x11 * (v2_2 >> 24) +
+        x12 * ((v2_3 << 24) >> 24) +
+        x13 * ((v2_3 << 16) >> 24) +
+        x14 * ((v2_3 << 8) >> 24) +
+        x15 * (v2_3 >> 24)
+      a3 =
+        x0 * ((v3_0 << 24) >> 24) +
+        x1 * ((v3_0 << 16) >> 24) +
+        x2 * ((v3_0 << 8) >> 24) +
+        x3 * (v3_0 >> 24) +
+        x4 * ((v3_1 << 24) >> 24) +
+        x5 * ((v3_1 << 16) >> 24) +
+        x6 * ((v3_1 << 8) >> 24) +
+        x7 * (v3_1 >> 24) +
+        x8 * ((v3_2 << 24) >> 24) +
+        x9 * ((v3_2 << 16) >> 24) +
+        x10 * ((v3_2 << 8) >> 24) +
+        x11 * (v3_2 >> 24) +
+        x12 * ((v3_3 << 24) >> 24) +
+        x13 * ((v3_3 << 16) >> 24) +
+        x14 * ((v3_3 << 8) >> 24) +
+        x15 * (v3_3 >> 24)
+      for (var g = 1; g < 2; g = g + 1) {
+        xi = xi + 16
+        w0 = w0 + 4
+        w1 = w1 + 4
+        w2 = w2 + 4
+        w3 = w3 + 4
+        var x0 = x[xi]
+        var x1 = x[(xi + 1) | 0]
+        var x2 = x[(xi + 2) | 0]
+        var x3 = x[(xi + 3) | 0]
+        var x4 = x[(xi + 4) | 0]
+        var x5 = x[(xi + 5) | 0]
+        var x6 = x[(xi + 6) | 0]
+        var x7 = x[(xi + 7) | 0]
+        var x8 = x[(xi + 8) | 0]
+        var x9 = x[(xi + 9) | 0]
+        var x10 = x[(xi + 10) | 0]
+        var x11 = x[(xi + 11) | 0]
+        var x12 = x[(xi + 12) | 0]
+        var x13 = x[(xi + 13) | 0]
+        var x14 = x[(xi + 14) | 0]
+        var x15 = x[(xi + 15) | 0]
+        var v0_0 = I32[w0]
+        var v0_1 = I32[(w0 + 1) | 0]
+        var v0_2 = I32[(w0 + 2) | 0]
+        var v0_3 = I32[(w0 + 3) | 0]
+        var v1_0 = I32[w1]
+        var v1_1 = I32[(w1 + 1) | 0]
+        var v1_2 = I32[(w1 + 2) | 0]
+        var v1_3 = I32[(w1 + 3) | 0]
+        var v2_0 = I32[w2]
+        var v2_1 = I32[(w2 + 1) | 0]
+        var v2_2 = I32[(w2 + 2) | 0]
+        var v2_3 = I32[(w2 + 3) | 0]
+        var v3_0 = I32[w3]
+        var v3_1 = I32[(w3 + 1) | 0]
+        var v3_2 = I32[(w3 + 2) | 0]
+        var v3_3 = I32[(w3 + 3) | 0]
+        a0 =
+          a0 +
+          x0 * ((v0_0 << 24) >> 24) +
+          x1 * ((v0_0 << 16) >> 24) +
+          x2 * ((v0_0 << 8) >> 24) +
+          x3 * (v0_0 >> 24) +
+          x4 * ((v0_1 << 24) >> 24) +
+          x5 * ((v0_1 << 16) >> 24) +
+          x6 * ((v0_1 << 8) >> 24) +
+          x7 * (v0_1 >> 24) +
+          x8 * ((v0_2 << 24) >> 24) +
+          x9 * ((v0_2 << 16) >> 24) +
+          x10 * ((v0_2 << 8) >> 24) +
+          x11 * (v0_2 >> 24) +
+          x12 * ((v0_3 << 24) >> 24) +
+          x13 * ((v0_3 << 16) >> 24) +
+          x14 * ((v0_3 << 8) >> 24) +
+          x15 * (v0_3 >> 24)
+        a1 =
+          a1 +
+          x0 * ((v1_0 << 24) >> 24) +
+          x1 * ((v1_0 << 16) >> 24) +
+          x2 * ((v1_0 << 8) >> 24) +
+          x3 * (v1_0 >> 24) +
+          x4 * ((v1_1 << 24) >> 24) +
+          x5 * ((v1_1 << 16) >> 24) +
+          x6 * ((v1_1 << 8) >> 24) +
+          x7 * (v1_1 >> 24) +
+          x8 * ((v1_2 << 24) >> 24) +
+          x9 * ((v1_2 << 16) >> 24) +
+          x10 * ((v1_2 << 8) >> 24) +
+          x11 * (v1_2 >> 24) +
+          x12 * ((v1_3 << 24) >> 24) +
+          x13 * ((v1_3 << 16) >> 24) +
+          x14 * ((v1_3 << 8) >> 24) +
+          x15 * (v1_3 >> 24)
+        a2 =
+          a2 +
+          x0 * ((v2_0 << 24) >> 24) +
+          x1 * ((v2_0 << 16) >> 24) +
+          x2 * ((v2_0 << 8) >> 24) +
+          x3 * (v2_0 >> 24) +
+          x4 * ((v2_1 << 24) >> 24) +
+          x5 * ((v2_1 << 16) >> 24) +
+          x6 * ((v2_1 << 8) >> 24) +
+          x7 * (v2_1 >> 24) +
+          x8 * ((v2_2 << 24) >> 24) +
+          x9 * ((v2_2 << 16) >> 24) +
+          x10 * ((v2_2 << 8) >> 24) +
+          x11 * (v2_2 >> 24) +
+          x12 * ((v2_3 << 24) >> 24) +
+          x13 * ((v2_3 << 16) >> 24) +
+          x14 * ((v2_3 << 8) >> 24) +
+          x15 * (v2_3 >> 24)
+        a3 =
+          a3 +
+          x0 * ((v3_0 << 24) >> 24) +
+          x1 * ((v3_0 << 16) >> 24) +
+          x2 * ((v3_0 << 8) >> 24) +
+          x3 * (v3_0 >> 24) +
+          x4 * ((v3_1 << 24) >> 24) +
+          x5 * ((v3_1 << 16) >> 24) +
+          x6 * ((v3_1 << 8) >> 24) +
+          x7 * (v3_1 >> 24) +
+          x8 * ((v3_2 << 24) >> 24) +
+          x9 * ((v3_2 << 16) >> 24) +
+          x10 * ((v3_2 << 8) >> 24) +
+          x11 * (v3_2 >> 24) +
+          x12 * ((v3_3 << 24) >> 24) +
+          x13 * ((v3_3 << 16) >> 24) +
+          x14 * ((v3_3 << 8) >> 24) +
+          x15 * (v3_3 >> 24)
+      }
+      s0 = s0 + d1_0 * a0
+      s1 = s1 + d1_1 * a1
+      s2 = s2 + d1_2 * a2
+      s3 = s3 + d1_3 * a3
+      p0 = p0 + 17
+      p1 = p1 + 17
+      p2 = p2 + 17
+      p3 = p3 + 17
+      xb = xb + 64
     }
-    // Process 3 batch elements at a time, sharing buf reads (12 independent chains)
-    var batchTrips = batchSize - (batchSize % 3)
-    for (var batch = 0; batch < batchTrips; batch = batch + 3) {
-      var xA = xs[batch]
-      var xB = xs[batch + 1]
-      var xC = xs[batch + 2]
+    out[i] = s0
+    out[i + 1] = s1
+    out[i + 2] = s2
+    out[i + 3] = s3
+  }
+  for (var i = rows4; i < rows; i = i + 1) {
+    out[i] = dotRowQ8_0I32(x, I32, i * rowWords, nbp)
+  }
+}
+
+// One row of a Q8_0 matrix against x, same Int32 block-pair layout and the
+// same summation order as matmulQ8_0Local. Used for the (rare) row remainder.
+function dotRowQ8_0I32(x, I32, p, nbp) {
+  var s = 0.0
+  var xb = 0
+  for (var b = 0; b < nbp; b = b + 1) {
+    var v0 = I32[p]
+    var d0 = fp16Table[v0 & 0xffff]
+    var a = x[xb] * ((v0 << 8) >> 24) + x[xb + 1] * (v0 >> 24)
+    for (var k = 1; k < 8; k = k + 1) {
+      var v = I32[p + k]
+      var j = xb + 4 * k - 2
+      a =
+        a +
+        x[j] * ((v << 24) >> 24) +
+        x[j + 1] * ((v << 16) >> 24) +
+        x[j + 2] * ((v << 8) >> 24) +
+        x[j + 3] * (v >> 24)
+    }
+    var v8 = I32[p + 8]
+    a = a + x[xb + 30] * ((v8 << 24) >> 24) + x[xb + 31] * ((v8 << 16) >> 24)
+    s = s + d0 * a
+    var d1 = fp16Table[v8 >>> 16]
+    var v9 = I32[p + 9]
+    a =
+      x[xb + 32] * ((v9 << 24) >> 24) +
+      x[xb + 33] * ((v9 << 16) >> 24) +
+      x[xb + 34] * ((v9 << 8) >> 24) +
+      x[xb + 35] * (v9 >> 24)
+    for (var k = 10; k < 17; k = k + 1) {
+      var v = I32[p + k]
+      var j = xb + 4 * k - 4
+      a =
+        a +
+        x[j] * ((v << 24) >> 24) +
+        x[j + 1] * ((v << 16) >> 24) +
+        x[j + 2] * ((v << 8) >> 24) +
+        x[j + 3] * (v >> 24)
+    }
+    s = s + d1 * a
+    p = p + 17
+    xb = xb + 64
+  }
+  return s
+}
+
+// Dequantize one Q8_0 row (even number of blocks) into dst[dstOff...] using
+// the Int32 block-pair layout. Products d * q are exact in double, so this
+// matches the byte-wise dequantizer bit for bit.
+function deqRowQ8_0I32(I32, p, dst, dstOff, nbp) {
+  var o = dstOff
+  for (var b = 0; b < nbp; b = b + 1) {
+    var v0 = I32[p]
+    var v8 = I32[p + 8]
+    var d0 = fp16Table[v0 & 0xffff]
+    var d1 = fp16Table[v8 >>> 16]
+    dst[o] = d0 * ((v0 << 8) >> 24)
+    dst[o + 1] = d0 * (v0 >> 24)
+    for (var k = 1; k < 8; k = k + 1) {
+      var v = I32[p + k]
+      var j = o + 4 * k - 2
+      dst[j] = d0 * ((v << 24) >> 24)
+      dst[j + 1] = d0 * ((v << 16) >> 24)
+      dst[j + 2] = d0 * ((v << 8) >> 24)
+      dst[j + 3] = d0 * (v >> 24)
+    }
+    dst[o + 30] = d0 * ((v8 << 24) >> 24)
+    dst[o + 31] = d0 * ((v8 << 16) >> 24)
+    for (var k = 9; k < 17; k = k + 1) {
+      var v = I32[p + k]
+      var j = o + 4 * k - 4
+      dst[j] = d1 * ((v << 24) >> 24)
+      dst[j + 1] = d1 * ((v << 16) >> 24)
+      dst[j + 2] = d1 * ((v << 8) >> 24)
+      dst[j + 3] = d1 * (v >> 24)
+    }
+    p = p + 17
+    o = o + 64
+  }
+}
+
+// Q8_0 batch matmul (prefill): dequantize 4 rows into the four row views of
+// matmulDeqBuf, then run a 4-row x 3-token tile over the columns, one column
+// per step (12 independent accumulators). Each x value is loaded once per
+// 4 rows and each weight once per 3 tokens. The per-row views (instead of
+// one buffer with row offsets) save an index add per weight load; the tile
+// shape is the largest one V8 keeps in registers without spilling.
+// Summation order per (row, token) is the plain left-to-right column order,
+// identical to the byte kernel.
+function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
+  var I32 = qw.localI32
+  var rows = qw.rows
+  var cols = qw.cols
+  var rowWords = qw.rowSize >> 2
+  var nbp = cols >> 6
+  var rows4 = rows & ~3
+  var batch3 = batchSize - (batchSize % 3)
+  var buf0 = matmulDeqRows[0]
+  var buf1 = matmulDeqRows[1]
+  var buf2 = matmulDeqRows[2]
+  var buf3 = matmulDeqRows[3]
+  for (var i = 0; i < rows4; i = i + 4) {
+    var p = i * rowWords
+    deqRowQ8_0I32(I32, p, buf0, 0, nbp)
+    deqRowQ8_0I32(I32, p + rowWords, buf1, 0, nbp)
+    deqRowQ8_0I32(I32, p + rowWords + rowWords, buf2, 0, nbp)
+    deqRowQ8_0I32(I32, p + rowWords + rowWords + rowWords, buf3, 0, nbp)
+    for (var bt = 0; bt < batch3; bt = bt + 3) {
+      var xA = xs[bt]
+      var xB = xs[bt + 1]
+      var xC = xs[bt + 2]
       var s0 = 0.0
       var s1 = 0.0
       var s2 = 0.0
@@ -3296,319 +3852,137 @@ function matmulQ8_0LocalBatch(
       var u1 = 0.0
       var u2 = 0.0
       var u3 = 0.0
-      for (var j = 0; j < cols4; j = j + 4) {
+      for (var j = 0; j < cols; j = j + 1) {
         var a = xA[j]
-        var b = xA[j + 1]
-        var c = xA[j + 2]
-        var d = xA[j + 3]
         var e = xB[j]
-        var f = xB[j + 1]
-        var g = xB[j + 2]
-        var h = xB[j + 3]
-        var p = xC[j]
-        var q = xC[j + 1]
-        var r = xC[j + 2]
-        var v = xC[j + 3]
-        var w0 = buf[j]
-        var w1 = buf[j + 1]
-        var w2 = buf[j + 2]
-        var w3 = buf[j + 3]
-        s0 = s0 + a * w0 + b * w1 + c * w2 + d * w3
-        t0 = t0 + e * w0 + f * w1 + g * w2 + h * w3
-        u0 = u0 + p * w0 + q * w1 + r * w2 + v * w3
-        w0 = buf[off1 + j]
-        w1 = buf[off1 + j + 1]
-        w2 = buf[off1 + j + 2]
-        w3 = buf[off1 + j + 3]
-        s1 = s1 + a * w0 + b * w1 + c * w2 + d * w3
-        t1 = t1 + e * w0 + f * w1 + g * w2 + h * w3
-        u1 = u1 + p * w0 + q * w1 + r * w2 + v * w3
-        w0 = buf[off2 + j]
-        w1 = buf[off2 + j + 1]
-        w2 = buf[off2 + j + 2]
-        w3 = buf[off2 + j + 3]
-        s2 = s2 + a * w0 + b * w1 + c * w2 + d * w3
-        t2 = t2 + e * w0 + f * w1 + g * w2 + h * w3
-        u2 = u2 + p * w0 + q * w1 + r * w2 + v * w3
-        w0 = buf[off3 + j]
-        w1 = buf[off3 + j + 1]
-        w2 = buf[off3 + j + 2]
-        w3 = buf[off3 + j + 3]
-        s3 = s3 + a * w0 + b * w1 + c * w2 + d * w3
-        t3 = t3 + e * w0 + f * w1 + g * w2 + h * w3
-        u3 = u3 + p * w0 + q * w1 + r * w2 + v * w3
+        var q = xC[j]
+        var w0 = buf0[j]
+        var w1 = buf1[j]
+        var w2 = buf2[j]
+        var w3 = buf3[j]
+        s0 = s0 + a * w0
+        t0 = t0 + e * w0
+        u0 = u0 + q * w0
+        s1 = s1 + a * w1
+        t1 = t1 + e * w1
+        u1 = u1 + q * w1
+        s2 = s2 + a * w2
+        t2 = t2 + e * w2
+        u2 = u2 + q * w2
+        s3 = s3 + a * w3
+        t3 = t3 + e * w3
+        u3 = u3 + q * w3
       }
-      outs[batch][i] = s0
-      outs[batch][i + 1] = s1
-      outs[batch][i + 2] = s2
-      outs[batch][i + 3] = s3
-      outs[batch + 1][i] = t0
-      outs[batch + 1][i + 1] = t1
-      outs[batch + 1][i + 2] = t2
-      outs[batch + 1][i + 3] = t3
-      outs[batch + 2][i] = u0
-      outs[batch + 2][i + 1] = u1
-      outs[batch + 2][i + 2] = u2
-      outs[batch + 2][i + 3] = u3
+      var oA = outs[bt]
+      var oB = outs[bt + 1]
+      var oC = outs[bt + 2]
+      oA[i] = s0
+      oA[i + 1] = s1
+      oA[i + 2] = s2
+      oA[i + 3] = s3
+      oB[i] = t0
+      oB[i + 1] = t1
+      oB[i + 2] = t2
+      oB[i + 3] = t3
+      oC[i] = u0
+      oC[i + 1] = u1
+      oC[i + 2] = u2
+      oC[i + 3] = u3
     }
-    // Handle remaining 1-2 batch elements one at a time
-    for (var batch = batchTrips; batch < batchSize; batch = batch + 1) {
-      var xArr = xs[batch]
+    // Remaining 2 tokens of the batch: 4-row x 2-token tile
+    if (batchSize - batch3 === 2) {
+      var xA = xs[batch3]
+      var xB = xs[batch3 + 1]
       var s0 = 0.0
       var s1 = 0.0
       var s2 = 0.0
       var s3 = 0.0
-      for (var j = 0; j < cols4; j = j + 4) {
-        var a = xArr[j]
-        var b = xArr[j + 1]
-        var c = xArr[j + 2]
-        var d = xArr[j + 3]
-        s0 = s0 + a * buf[j] + b * buf[j + 1] + c * buf[j + 2] + d * buf[j + 3]
-        s1 =
-          s1 +
-          a * buf[off1 + j] +
-          b * buf[off1 + j + 1] +
-          c * buf[off1 + j + 2] +
-          d * buf[off1 + j + 3]
-        s2 =
-          s2 +
-          a * buf[off2 + j] +
-          b * buf[off2 + j + 1] +
-          c * buf[off2 + j + 2] +
-          d * buf[off2 + j + 3]
-        s3 =
-          s3 +
-          a * buf[off3 + j] +
-          b * buf[off3 + j + 1] +
-          c * buf[off3 + j + 2] +
-          d * buf[off3 + j + 3]
+      var t0 = 0.0
+      var t1 = 0.0
+      var t2 = 0.0
+      var t3 = 0.0
+      for (var j = 0; j < cols; j = j + 1) {
+        var a = xA[j]
+        var e = xB[j]
+        var w0 = buf0[j]
+        var w1 = buf1[j]
+        var w2 = buf2[j]
+        var w3 = buf3[j]
+        s0 = s0 + a * w0
+        t0 = t0 + e * w0
+        s1 = s1 + a * w1
+        t1 = t1 + e * w1
+        s2 = s2 + a * w2
+        t2 = t2 + e * w2
+        s3 = s3 + a * w3
+        t3 = t3 + e * w3
       }
-      outs[batch][i] = s0
-      outs[batch][i + 1] = s1
-      outs[batch][i + 2] = s2
-      outs[batch][i + 3] = s3
+      var oA = outs[batch3]
+      var oB = outs[batch3 + 1]
+      oA[i] = s0
+      oA[i + 1] = s1
+      oA[i + 2] = s2
+      oA[i + 3] = s3
+      oB[i] = t0
+      oB[i + 1] = t1
+      oB[i + 2] = t2
+      oB[i + 3] = t3
+    } else if (batchSize - batch3 === 1) {
+      // Remaining single token
+      var xArr = xs[batch3]
+      var s0 = 0.0
+      var s1 = 0.0
+      var s2 = 0.0
+      var s3 = 0.0
+      for (var j = 0; j < cols; j = j + 1) {
+        var a = xArr[j]
+        s0 = s0 + a * buf0[j]
+        s1 = s1 + a * buf1[j]
+        s2 = s2 + a * buf2[j]
+        s3 = s3 + a * buf3[j]
+      }
+      var oArr = outs[batch3]
+      oArr[i] = s0
+      oArr[i + 1] = s1
+      oArr[i + 2] = s2
+      oArr[i + 3] = s3
+    }
+  }
+  // Remaining 1-3 rows
+  for (var i = rows4; i < rows; i = i + 1) {
+    deqRowQ8_0I32(I32, i * rowWords, buf0, 0, nbp)
+    for (var bt = 0; bt < batchSize; bt = bt + 1) {
+      var xArr = xs[bt]
+      var s = 0.0
+      for (var j = 0; j < cols; j = j + 1) {
+        s = s + xArr[j] * buf0[j]
+      }
+      outs[bt][i] = s
     }
   }
 }
 
-// Q8_0 matmul: 4 rows at a time, sharing x reads across rows
-function matmulQ8_0Local(out, x, localU8, localI8, rows, cols, rowSize) {
-  var nb = cols >> 5
-  var rows4 = rows & ~3
-  var rs2 = rowSize + rowSize
-  var rs3 = rs2 + rowSize
-  for (var i = 0; i < rows4; i = i + 4) {
-    var sum0 = 0.0
-    var sum1 = 0.0
-    var sum2 = 0.0
-    var sum3 = 0.0
-    var bo0 = i * rowSize
-    var bo1 = bo0 + rowSize
-    var bo2 = bo0 + rs2
-    var bo3 = bo0 + rs3
-    var xb = 0
-    for (var b = 0; b < nb; b = b + 1) {
-      var x0 = x[xb]
-      var x1 = x[xb + 1]
-      var x2 = x[xb + 2]
-      var x3 = x[xb + 3]
-      var x4 = x[xb + 4]
-      var x5 = x[xb + 5]
-      var x6 = x[xb + 6]
-      var x7 = x[xb + 7]
-      var x8 = x[xb + 8]
-      var x9 = x[xb + 9]
-      var x10 = x[xb + 10]
-      var x11 = x[xb + 11]
-      var x12 = x[xb + 12]
-      var x13 = x[xb + 13]
-      var x14 = x[xb + 14]
-      var x15 = x[xb + 15]
-      var x16 = x[xb + 16]
-      var x17 = x[xb + 17]
-      var x18 = x[xb + 18]
-      var x19 = x[xb + 19]
-      var x20 = x[xb + 20]
-      var x21 = x[xb + 21]
-      var x22 = x[xb + 22]
-      var x23 = x[xb + 23]
-      var x24 = x[xb + 24]
-      var x25 = x[xb + 25]
-      var x26 = x[xb + 26]
-      var x27 = x[xb + 27]
-      var x28 = x[xb + 28]
-      var x29 = x[xb + 29]
-      var x30 = x[xb + 30]
-      var x31 = x[xb + 31]
-      // Row 0
-      var d0 = fp16Table[localU8[bo0] | (localU8[bo0 + 1] << 8)]
-      var q0 = bo0 + 2
-      sum0 =
-        sum0 +
-        d0 *
-          (x0 * localI8[q0] +
-            x1 * localI8[q0 + 1] +
-            x2 * localI8[q0 + 2] +
-            x3 * localI8[q0 + 3] +
-            x4 * localI8[q0 + 4] +
-            x5 * localI8[q0 + 5] +
-            x6 * localI8[q0 + 6] +
-            x7 * localI8[q0 + 7] +
-            x8 * localI8[q0 + 8] +
-            x9 * localI8[q0 + 9] +
-            x10 * localI8[q0 + 10] +
-            x11 * localI8[q0 + 11] +
-            x12 * localI8[q0 + 12] +
-            x13 * localI8[q0 + 13] +
-            x14 * localI8[q0 + 14] +
-            x15 * localI8[q0 + 15] +
-            x16 * localI8[q0 + 16] +
-            x17 * localI8[q0 + 17] +
-            x18 * localI8[q0 + 18] +
-            x19 * localI8[q0 + 19] +
-            x20 * localI8[q0 + 20] +
-            x21 * localI8[q0 + 21] +
-            x22 * localI8[q0 + 22] +
-            x23 * localI8[q0 + 23] +
-            x24 * localI8[q0 + 24] +
-            x25 * localI8[q0 + 25] +
-            x26 * localI8[q0 + 26] +
-            x27 * localI8[q0 + 27] +
-            x28 * localI8[q0 + 28] +
-            x29 * localI8[q0 + 29] +
-            x30 * localI8[q0 + 30] +
-            x31 * localI8[q0 + 31])
-      // Row 1
-      var d1 = fp16Table[localU8[bo1] | (localU8[bo1 + 1] << 8)]
-      var q1 = bo1 + 2
-      sum1 =
-        sum1 +
-        d1 *
-          (x0 * localI8[q1] +
-            x1 * localI8[q1 + 1] +
-            x2 * localI8[q1 + 2] +
-            x3 * localI8[q1 + 3] +
-            x4 * localI8[q1 + 4] +
-            x5 * localI8[q1 + 5] +
-            x6 * localI8[q1 + 6] +
-            x7 * localI8[q1 + 7] +
-            x8 * localI8[q1 + 8] +
-            x9 * localI8[q1 + 9] +
-            x10 * localI8[q1 + 10] +
-            x11 * localI8[q1 + 11] +
-            x12 * localI8[q1 + 12] +
-            x13 * localI8[q1 + 13] +
-            x14 * localI8[q1 + 14] +
-            x15 * localI8[q1 + 15] +
-            x16 * localI8[q1 + 16] +
-            x17 * localI8[q1 + 17] +
-            x18 * localI8[q1 + 18] +
-            x19 * localI8[q1 + 19] +
-            x20 * localI8[q1 + 20] +
-            x21 * localI8[q1 + 21] +
-            x22 * localI8[q1 + 22] +
-            x23 * localI8[q1 + 23] +
-            x24 * localI8[q1 + 24] +
-            x25 * localI8[q1 + 25] +
-            x26 * localI8[q1 + 26] +
-            x27 * localI8[q1 + 27] +
-            x28 * localI8[q1 + 28] +
-            x29 * localI8[q1 + 29] +
-            x30 * localI8[q1 + 30] +
-            x31 * localI8[q1 + 31])
-      // Row 2
-      var d2 = fp16Table[localU8[bo2] | (localU8[bo2 + 1] << 8)]
-      var q2 = bo2 + 2
-      sum2 =
-        sum2 +
-        d2 *
-          (x0 * localI8[q2] +
-            x1 * localI8[q2 + 1] +
-            x2 * localI8[q2 + 2] +
-            x3 * localI8[q2 + 3] +
-            x4 * localI8[q2 + 4] +
-            x5 * localI8[q2 + 5] +
-            x6 * localI8[q2 + 6] +
-            x7 * localI8[q2 + 7] +
-            x8 * localI8[q2 + 8] +
-            x9 * localI8[q2 + 9] +
-            x10 * localI8[q2 + 10] +
-            x11 * localI8[q2 + 11] +
-            x12 * localI8[q2 + 12] +
-            x13 * localI8[q2 + 13] +
-            x14 * localI8[q2 + 14] +
-            x15 * localI8[q2 + 15] +
-            x16 * localI8[q2 + 16] +
-            x17 * localI8[q2 + 17] +
-            x18 * localI8[q2 + 18] +
-            x19 * localI8[q2 + 19] +
-            x20 * localI8[q2 + 20] +
-            x21 * localI8[q2 + 21] +
-            x22 * localI8[q2 + 22] +
-            x23 * localI8[q2 + 23] +
-            x24 * localI8[q2 + 24] +
-            x25 * localI8[q2 + 25] +
-            x26 * localI8[q2 + 26] +
-            x27 * localI8[q2 + 27] +
-            x28 * localI8[q2 + 28] +
-            x29 * localI8[q2 + 29] +
-            x30 * localI8[q2 + 30] +
-            x31 * localI8[q2 + 31])
-      // Row 3
-      var d3 = fp16Table[localU8[bo3] | (localU8[bo3 + 1] << 8)]
-      var q3 = bo3 + 2
-      sum3 =
-        sum3 +
-        d3 *
-          (x0 * localI8[q3] +
-            x1 * localI8[q3 + 1] +
-            x2 * localI8[q3 + 2] +
-            x3 * localI8[q3 + 3] +
-            x4 * localI8[q3 + 4] +
-            x5 * localI8[q3 + 5] +
-            x6 * localI8[q3 + 6] +
-            x7 * localI8[q3 + 7] +
-            x8 * localI8[q3 + 8] +
-            x9 * localI8[q3 + 9] +
-            x10 * localI8[q3 + 10] +
-            x11 * localI8[q3 + 11] +
-            x12 * localI8[q3 + 12] +
-            x13 * localI8[q3 + 13] +
-            x14 * localI8[q3 + 14] +
-            x15 * localI8[q3 + 15] +
-            x16 * localI8[q3 + 16] +
-            x17 * localI8[q3 + 17] +
-            x18 * localI8[q3 + 18] +
-            x19 * localI8[q3 + 19] +
-            x20 * localI8[q3 + 20] +
-            x21 * localI8[q3 + 21] +
-            x22 * localI8[q3 + 22] +
-            x23 * localI8[q3 + 23] +
-            x24 * localI8[q3 + 24] +
-            x25 * localI8[q3 + 25] +
-            x26 * localI8[q3 + 26] +
-            x27 * localI8[q3 + 27] +
-            x28 * localI8[q3 + 28] +
-            x29 * localI8[q3 + 29] +
-            x30 * localI8[q3 + 30] +
-            x31 * localI8[q3 + 31])
-      bo0 = bo0 + 34
-      bo1 = bo1 + 34
-      bo2 = bo2 + 34
-      bo3 = bo3 + 34
-      xb = xb + 32
-    }
-    out[i] = sum0
-    out[i + 1] = sum1
-    out[i + 2] = sum2
-    out[i + 3] = sum3
-  }
-}
-
-// K-quant matmul: dequantize 4 rows into buffer, then flat dot product
+// K-quant matmul: dequantize 4 rows into a scratch buffer, then flat dot product.
+// During prefill the scratch is matmulDeqBuf. During generation that buffer is
+// freed, so we borrow an idle buffer instead (no extra RAM): the logits buffer
+// while running the layers, and hb while computing the logits themselves.
+// Fewer than 4 rows per pass are processed when the borrowed buffer is small;
+// every row's dot product is computed in the same column order regardless.
 function matmulKQuantLocal(out, x, localU8, localI8, rows, cols, rowSize, deqFunc) {
   var buf = matmulDeqBuf
   var rows4 = rows & ~3
+  if (buf === null) {
+    buf = out === state.logits ? state.hb64 : state.logits64
+    if (buf === null || buf.length < cols) {
+      if (state.kqRowScratch === null || state.kqRowScratch.length < cols) {
+        state.kqRowScratch = new Float64Array(cols)
+      }
+      buf = state.kqRowScratch
+    }
+    if (buf.length < 4 * cols) {
+      rows4 = 0
+    }
+  }
   var off1 = cols
   var off2 = cols + cols
   var off3 = off2 + cols
@@ -4243,11 +4617,11 @@ function readGGUFValue(type) {
       }
       if (arrType === GGUF_TYPE.STRING) {
         // Storing full cumulative offsets as Uint32Array[N+1] costs ~1 MB on a
-        // 262k-token vocab. Token byte lengths stay small (Gemma ≤48, Llama
-        // ≤256) so we keep Uint16 lengths + a sparse cumulative-offset
+        // 262k-token vocab. Token byte lengths stay small (Gemma <=48, Llama
+        // <=256) so we keep Uint16 lengths + a sparse cumulative-offset
         // checkpoint every SPARSE_STEP entries. Random access reconstructs
         // the absolute offset by adding at most SPARSE_STEP-1 byte lengths
-        // from the nearest checkpoint — O(SPARSE_STEP) worst-case for
+        // from the nearest checkpoint - O(SPARSE_STEP) worst-case for
         // vocabString (called only during token decode, a handful of times
         // per generate), O(1) amortized when iterating sequentially.
         var SPARSE_STEP = 256
@@ -4411,6 +4785,7 @@ function loadWeights(gguf) {
   var tensors = gguf.tensors
   var baseOffset = gguf.tensorDataOffset
   var w = {}
+  w.hasKQuant = false
 
   // Load tensor as dequantized float (for small tensors like norms and embeddings)
   function loadTensorFloat(name) {
@@ -4449,10 +4824,19 @@ function loadWeights(gguf) {
       dotFunc: getVecDotFunc(t.type),
       dotQ8Func: getVecDotQ8Func(t.type),
       deqRowFunc: getDeqRowFunc(t.type),
+      localI32: null,
     }
-    // Per-matrix typed array views for quantized types (helps V8 bounds check elimination)
+    if (result.deqRowFunc) {
+      w.hasKQuant = true
+    }
+    // Q8_0: whole-matrix Int32 view, 4 weights per load. Needs a 4-byte aligned
+    // start and an even number of 34-byte blocks per row (rowSize % 4 === 0),
+    // true for every GGUF tensor whose column count is a multiple of 64.
+    if (t.type === GGML_TYPE.Q8_0 && (off & 3) === 0 && (rs & 3) === 0) {
+      result.localI32 = new Int32Array(ggufData, off, totalBytes >> 2)
+    }
+    // Per-matrix byte views for the K-quant kernels
     if (
-      t.type === GGML_TYPE.Q8_0 ||
       t.type === GGML_TYPE.Q2_K ||
       t.type === GGML_TYPE.Q3_K ||
       t.type === GGML_TYPE.Q4_K ||
@@ -4566,9 +4950,15 @@ function loadWeights(gguf) {
       dotFunc: getVecDotFunc(embType),
       dotQ8Func: getVecDotQ8Func(embType),
       deqRowFunc: getDeqRowFunc(embType),
+      localI32: null,
+    }
+    if (w.wcls.deqRowFunc) {
+      w.hasKQuant = true
+    }
+    if (embType === GGML_TYPE.Q8_0 && (embOff & 3) === 0 && (embRowSize & 3) === 0) {
+      w.wcls.localI32 = new Int32Array(ggufData, embOff, embTotalBytes >> 2)
     }
     if (
-      embType === GGML_TYPE.Q8_0 ||
       embType === GGML_TYPE.Q2_K ||
       embType === GGML_TYPE.Q3_K ||
       embType === GGML_TYPE.Q4_K ||
@@ -4591,12 +4981,12 @@ function createRunState(p) {
 
   // RoPE frequencies (ropeSize floats each). These depend only on the head
   // geometry and rope theta, so they're computed once at load. We no longer
-  // pre-compute cos/sin for every position of the context window — that cost
+  // pre-compute cos/sin for every position of the context window - that cost
   // seqLen*ropeSize*4 bytes per table × 4 tables (~4 MB at seqLen=2048 for
   // Gemma SWA), most of it never touched. Instead, cos/sin are filled just in
   // time for the small set of positions actually processed in the current
   // forward pass (1 position for single-token gen, up to PREFILL_BATCH_SIZE
-  // positions for prefill), into the ropeCosAll/ropeSinAll/… buffers below.
+  // positions for prefill), into the ropeCosAll/ropeSinAll/... buffers below.
   var ropeSize = headSize / 2
   var ropeFreqs = new Float32Array(ropeSize)
   for (var i = 0; i < ropeSize; i = i + 1) {
@@ -4614,7 +5004,7 @@ function createRunState(p) {
   }
 
   // Scratch buffers for the current forward pass's cos/sin values. Indexed as
-  // [batchIdx * ropeSize + i] — batchIdx is 0 for single-token generation.
+  // [batchIdx * ropeSize + i] - batchIdx is 0 for single-token generation.
   var ropeScratchSize = PREFILL_BATCH_SIZE * ropeSize
   var ropeCosAll = new Float32Array(ropeScratchSize)
   var ropeSinAll = new Float32Array(ropeScratchSize)
@@ -4633,12 +5023,12 @@ function createRunState(p) {
   //
   // Capacity starts small and doubles via ensureKvCapacity() as generation
   // advances (capped at seqLen). Most inference runs touch only a fraction of
-  // the configured seqLen — sizing for the full window up front wastes ~27 MB
+  // the configured seqLen - sizing for the full window up front wastes ~27 MB
   // on gemma-3-1b with contextSize=2048 for a typical ~70-position chat turn.
   // The initial cap trades a handful of doubling copies during prefill
   // (each O(bytes-already-written), sub-millisecond) for lower sustained RAM.
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-  // Initial KV cache is empty — `ensureKvCapacity` allocates at the top of
+  // Initial KV cache is empty - `ensureKvCapacity` allocates at the top of
   // the first forward pass, which would happen anyway to cover the first
   // prefill batch. Starting at capacity 0 removes the load-time KV alloc
   // entirely (~430 KB on gemma-3-1b) without shifting any work onto the
@@ -4652,12 +5042,11 @@ function createRunState(p) {
   var keyCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
   var valueCacheBuffer = new ArrayBuffer(kvCacheTotalBytes)
 
-  // Allocate Q8_0 buffer for quantizing x in matmulQuantized
+  // Size of the Q8_0 scratch for x in matmulQuantized (allocated lazily)
   var maxCols = Math.max(p.dim, qDim, p.hiddenDim)
-  var xQ8Size = (maxCols >> 5) * 34
-  var xQ8Buffer = new ArrayBuffer(xQ8Size)
-  xQ8Buf = new Uint8Array(xQ8Buffer)
-  xQ8Int8Buf = new Int8Array(xQ8Buffer)
+  xQ8Size = (maxCols >> 5) * 34
+  xQ8Buf = null
+  xQ8Int8Buf = null
 
   // matmulDeqBuf (4 rows × maxCols Float64, ~216 KB) is used only by the
   // batch-matmul path during prefill. Leave it null here and let
@@ -4710,11 +5099,13 @@ function createRunState(p) {
   var batchQ8 = new Array(PREFILL_BATCH_SIZE)
   var batchQ8i8 = new Array(PREFILL_BATCH_SIZE)
 
-  return {
+  var hbBuf = new Float32Array(p.hiddenDim)
+
+  var runState = {
     x: new Float32Array(p.dim),
     xb: new Float32Array(maxDim),
     xb2: new Float32Array(p.dim),
-    hb: new Float32Array(p.hiddenDim),
+    hb: hbBuf,
     hb2: new Float32Array(p.hiddenDim),
     q: new Float32Array(qDim),
     k: new Float32Array(kvDim),
@@ -4724,6 +5115,12 @@ function createRunState(p) {
     // ensureLogits()). Saves 1 MB of zeroed arraybuf between load and
     // generate for large vocabularies (Gemma: 262k × 4 B = 1 MB).
     logits: null,
+    logits64: null,
+    // Float64 view over hb: idle scratch for a K-quant output matrix during
+    // generation (hb is dead once the last layer's FFN has finished).
+    hb64: null,
+    // Fallback one-row K-quant scratch, only if no idle buffer is wide enough.
+    kqRowScratch: null,
     // Sizes for lazy batch-buffer allocation (ensureBatchBuffers).
     _batchDim: p.dim,
     _batchMaxDim: maxDim,
@@ -4803,6 +5200,8 @@ function createRunState(p) {
     batchQ8: batchQ8,
     batchQ8i8: batchQ8i8,
   }
+  runState.hb64 = new Float64Array(hbBuf.buffer, 0, p.hiddenDim >> 1)
+  return runState
 }
 
 // ----------------------------------------------------------------------------
@@ -4837,13 +5236,20 @@ function ensureBatchBuffers(s) {
   }
   // matmulDeqBuf is a global read by the batch-matmul kernels; allocate it
   // here since it's only needed during prefill.
-  matmulDeqBuf = new Float64Array(4 * s._batchMatmulDeqCols)
+  var deqCols = s._batchMatmulDeqCols
+  matmulDeqBuf = new Float64Array(4 * deqCols)
+  matmulDeqRows = [
+    new Float64Array(matmulDeqBuf.buffer, 0, deqCols),
+    new Float64Array(matmulDeqBuf.buffer, deqCols * 8, deqCols),
+    new Float64Array(matmulDeqBuf.buffer, deqCols * 16, deqCols),
+    new Float64Array(matmulDeqBuf.buffer, deqCols * 24, deqCols),
+  ]
   s._batchBuffersReady = true
 }
 
 // Release the prefill batch buffers after a generate call finishes prefill.
 // Single-token generation doesn't read any of them, so they just sit until
-// the next generate reallocates via ensureBatchBuffers — tradeoff is a <1 ms
+// the next generate reallocates via ensureBatchBuffers - tradeoff is a <1 ms
 // alloc cost per generate for 2.5 MB of RAM reclaimed between calls.
 function freeBatchBuffers(s) {
   if (!s._batchBuffersReady) {
@@ -4863,6 +5269,7 @@ function freeBatchBuffers(s) {
     s.batchQ8i8[b] = null
   }
   matmulDeqBuf = null
+  matmulDeqRows = null
   s._batchBuffersReady = false
 }
 
@@ -4871,6 +5278,9 @@ function freeBatchBuffers(s) {
 function ensureLogits(s) {
   if (s.logits === null) {
     s.logits = new Float32Array(s.vocabSize)
+    // Float64 view over the same bytes: idle scratch for K-quant matmuls
+    // while the layers run (the logits are only written at the very end).
+    s.logits64 = new Float64Array(s.logits.buffer, 0, s.vocabSize >> 1)
   }
 }
 
@@ -4943,10 +5353,10 @@ function ensureKvCapacity(s, needed) {
 // Fill the RoPE cos/sin scratch buffers for a contiguous block of positions
 // starting at `startPos`, length `batchSize`. Writes into s.ropeCos/SinAll
 // (and the SWA variants for Gemma). Indexed as [b * ropeSize + i] where b is
-// the batch slot — hot loops read this with ropeBase = b * ropeSize. For
+// the batch slot - hot loops read this with ropeBase = b * ropeSize. For
 // single-token generation, pass batchSize=1 and use ropeBase=0. The total
 // cos/sin call count per forward pass is just 2 * batchSize * ropeSize (×2
-// for Gemma SWA) — <0.1% of generation time vs the 4 MB table saved.
+// for Gemma SWA) - <0.1% of generation time vs the 4 MB table saved.
 function fillRopeBuffers(s, startPos, batchSize) {
   var ropeSize = s.ropeSize
   var freqs = s.ropeFreqs
@@ -5032,6 +5442,7 @@ function transformerLlama(token, pos, computeLogits) {
       lw.wv.dotQ8Func &&
       !lw.wv.deqRowFunc
     ) {
+      ensureXQ8Buf()
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(qArr, lw.wq)
       matmulQuantizedPreQ8(kArr, lw.wk)
@@ -5204,6 +5615,7 @@ function transformerLlama(token, pos, computeLogits) {
       lw.w3.dotQ8Func &&
       !lw.w3.deqRowFunc
     ) {
+      ensureXQ8Buf()
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(hbArr, lw.w1)
       matmulQuantizedPreQ8(hb2Arr, lw.w3)
@@ -5298,6 +5710,10 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
 
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
+    // Prefill tokens only feed later positions through the KV cache, so the
+    // last layer needs nothing beyond K and V: Q, attention, wo and the FFN
+    // would only produce a hidden state that no one reads.
+    var kvOnly = l === nLayers - 1
 
     // Batch rmsnorm
     for (var b = 0; b < batchSize; b = b + 1) {
@@ -5305,7 +5721,9 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
     }
 
     // Batch QKV matmuls - read weights once, compute for all batch elements
-    matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    if (!kvOnly) {
+      matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    }
     matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
     matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
 
@@ -5393,6 +5811,10 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
         )
       }
 
+      if (kvOnly) {
+        continue
+      }
+
       // Quantize all Q heads to Q8_0
       quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
@@ -5455,6 +5877,10 @@ function transformerPrefillLlama(allTokens, startPos, batchSize) {
           }
         }
       }
+    }
+
+    if (kvOnly) {
+      break
     }
 
     // Batch wo matmul
@@ -5549,7 +5975,7 @@ function transformerGemma(token, pos, computeLogits) {
     var lw = w.layers[l]
 
     if (l === 0) {
-      // First layer: fused embed scale + rmsnorm (3 passes → 2)
+      // First layer: fused embed scale + rmsnorm (3 passes -> 2)
       rmsnormGemmaFusedScale(
         xbArr,
         xArr,
@@ -5572,6 +5998,7 @@ function transformerGemma(token, pos, computeLogits) {
       lw.wv.dotQ8Func &&
       !lw.wv.deqRowFunc
     ) {
+      ensureXQ8Buf()
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(qArr, lw.wq)
       matmulQuantizedPreQ8(kArr, lw.wk)
@@ -5742,6 +6169,7 @@ function transformerGemma(token, pos, computeLogits) {
       lw.w3.dotQ8Func &&
       !lw.w3.deqRowFunc
     ) {
+      ensureXQ8Buf()
       quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
       matmulQuantizedPreQ8(hbArr, lw.w1)
       matmulQuantizedPreQ8(hb2Arr, lw.w3)
@@ -5878,8 +6306,14 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
       }
     }
 
+    // Last layer of a prefill batch: only K and V are consumed (see the
+    // Llama prefill); skip Q, attention, wo and the FFN.
+    var kvOnly = l === nLayers - 1
+
     // Batch QKV matmuls
-    matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    if (!kvOnly) {
+      matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+    }
     matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
     matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
 
@@ -5901,15 +6335,17 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
 
       // Gemma QK norms
       if (lw.attnQNorm && lw.attnKNorm) {
-        for (var h = 0; h < nHeads; h = h + 1) {
-          rmsnormGemmaAt(
-            qArr,
-            h * headSize,
-            lw.attnQNorm,
-            headSize,
-            eps,
-            invHeadSize
-          )
+        if (!kvOnly) {
+          for (var h = 0; h < nHeads; h = h + 1) {
+            rmsnormGemmaAt(
+              qArr,
+              h * headSize,
+              lw.attnQNorm,
+              headSize,
+              eps,
+              invHeadSize
+            )
+          }
         }
         for (var h = 0; h < nKvHeads; h = h + 1) {
           rmsnormGemmaAt(
@@ -5925,15 +6361,17 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
 
       // NEOX RoPE with fused attnScale on Q (ropeBase indexes per-batch scratch)
       var ropeBase = b * s.ropeSize
-      for (var h = 0; h < nHeads; h = h + 1) {
-        var idx = h * headSize
-        for (var i = 0; i < half; i = i + 1) {
-          var fcr = ropeCos[ropeBase + i]
-          var fci = ropeSin[ropeBase + i]
-          var v0 = qArr[idx + i]
-          var v1 = qArr[idx + i + half]
-          qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
-          qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
+      if (!kvOnly) {
+        for (var h = 0; h < nHeads; h = h + 1) {
+          var idx = h * headSize
+          for (var i = 0; i < half; i = i + 1) {
+            var fcr = ropeCos[ropeBase + i]
+            var fci = ropeSin[ropeBase + i]
+            var v0 = qArr[idx + i]
+            var v1 = qArr[idx + i + half]
+            qArr[idx + i] = (v0 * fcr - v1 * fci) * attnScale
+            qArr[idx + i + half] = (v0 * fci + v1 * fcr) * attnScale
+          }
         }
       }
       for (var h = 0; h < nKvHeads; h = h + 1) {
@@ -5967,6 +6405,10 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
           headOff,
           headSize
         )
+      }
+
+      if (kvOnly) {
+        continue
       }
 
       // Quantize all Q heads to Q8_0
@@ -6039,6 +6481,10 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
           }
         }
       }
+    }
+
+    if (kvOnly) {
+      break
     }
 
     // Batch wo matmul
@@ -6119,6 +6565,10 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
 
 // Dispatch to model-specific transformer (#21)
 function transformer(token, pos, computeLogits) {
+  if (weights.hasKQuant) {
+    // K-quant matmuls borrow the logits buffer as scratch during generation
+    ensureLogits(state)
+  }
   if (state.isGemma) {
     transformerGemma(token, pos, computeLogits)
   } else {
@@ -6301,7 +6751,7 @@ function vocabString(i) {
 }
 
 // Flat typed-array trie for vocabulary lookup, keyed by UTF-8 bytes. The build
-// walks ggufUint8 directly — no per-token string decode, no Uint16 char codes —
+// walks ggufUint8 directly - no per-token string decode, no Uint16 char codes -
 // which avoids the ~35 MB transient heap spike that decoding 262k vocab
 // strings used to cause. Edges are stored in CSR form (contiguous per parent,
 // sorted by byte value thanks to the lex-sorted token order) so we can drop
@@ -6385,7 +6835,7 @@ function buildSortedVocab() {
   }
 
   // Collect indices of non-empty tokens. We sort these lex by UTF-8 byte value
-  // so the trie can be built in O(totalBytes) via prev-token LCP — no per-char
+  // so the trie can be built in O(totalBytes) via prev-token LCP - no per-char
   // child scan, and no string decoding.
   var count = 0
   var maxLen = 0
@@ -6553,7 +7003,7 @@ function buildSortedVocab() {
   trieEdgeTarget = edgeTarget
 }
 
-// Linear byte-scan over the vocab. Avoids triggering buildSortedVocab() —
+// Linear byte-scan over the vocab. Avoids triggering buildSortedVocab() -
 // the ~7.8 MB trie stays unbuilt until the first bpeEncode call. This
 // function runs a handful of times at load (eos/eot lookup) and a few times
 // per generate (chat-template tokens) on a 262k-entry vocab; each call is
@@ -6659,16 +7109,16 @@ function textToTiktoken(text) {
 
 function textToSentencePiece(text) {
   var parts = []
-  var needPrefix = true // Add ▁ before first alphanumeric char
+  var needPrefix = true // Add \u2581 before first alphanumeric char
 
   for (var i = 0; i < text.length; i = i + 1) {
     var c = text.charAt(i)
     var code = text.charCodeAt(i)
 
     if (c === " ") {
-      // Space -> ▁ (U+2581)
+      // Space -> \u2581 (U+2581)
       parts.push("\u2581")
-      needPrefix = false // ▁ already added for the space
+      needPrefix = false // \u2581 already added for the space
     } else if (c === "\n" || c === "\t" || c === "\r") {
       // Control characters are kept as-is
       parts.push(c)
@@ -6809,7 +7259,7 @@ function decodeToken(token) {
     return String.fromCharCode(byte)
   }
 
-  // For Gemma (SentencePiece), just replace ▁ with space
+  // For Gemma (SentencePiece), just replace \u2581 with space
   if (config.isGemma) {
     return piece.replace(/\u2581/g, " ")
   }
@@ -6832,7 +7282,7 @@ function bpeEncode(text) {
 
   var tokens = []
 
-  // Convert encodedText to UTF-8 bytes — the trie is byte-keyed.
+  // Convert encodedText to UTF-8 bytes - the trie is byte-keyed.
   var bytes = encodeStringToUTF8(encodedText)
   var byteLen = bytes.length
   var pos = 0
@@ -7038,7 +7488,7 @@ function generate(chatHistory) {
     promptTokens = encodeLlama3Chat(chatHistory, systemPrompt)
   }
 
-  // Release the vocab trie — it's only needed while turning text into token
+  // Release the vocab trie - it's only needed while turning text into token
   // IDs. The transformer and sampler work on IDs alone, so we can free ~7-8 MB
   // of typed arrays before the long generation phase starts. The next
   // generate() call will lazy-rebuild via buildSortedVocab on first bpeEncode.
@@ -7079,7 +7529,7 @@ function generate(chatHistory) {
     token = promptTokens[pos]
   }
 
-  // Prefill is over — single-token generation doesn't touch the batch
+  // Prefill is over - single-token generation doesn't touch the batch
   // buffers, so release ~2.5 MB for the generation phase.
   freeBatchBuffers(state)
 
@@ -7176,6 +7626,7 @@ function generate(chatHistory) {
   // re-allocates it on the next forward pass for <1 ms, freeing ~1 MB of
   // Float32Array backing memory while the engine is idle between turns.
   state.logits = null
+  state.logits64 = null
 
   postMessage({ type: "complete", output: output })
 
