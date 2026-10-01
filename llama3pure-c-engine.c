@@ -688,15 +688,23 @@ void dequantize_row_q5_1(const void* src, float* dst, int k) {
     }
 }
 
-void dequantize_row_q8_0(const void* src, float* dst, int k) {
+void dequantize_row_q8_0(const void* src, float* restrict dst, int k) {
     const block_q8_0* blocks = (const block_q8_0*)src;
     int nb = k / QK8_0;
 
     for (int i = 0; i < nb; i++) {
         const float d = fp16_to_fp32(blocks[i].d);
+        const int8_t* restrict q = blocks[i].qs;
+        float* restrict out = dst + i * QK8_0;
 
-        for (int j = 0; j < QK8_0; j++) {
-            dst[i*QK8_0 + j] = blocks[i].qs[j] * d;
+        // Four elements per statement group: lets the compiler emit NEON/SSE
+        // int8->float converts and multiplies (the plain 32-iteration loop is
+        // left scalar by clang's cost model). Same (float)q * d per element.
+        for (int j = 0; j < QK8_0; j += 4) {
+            out[j]     = q[j]     * d;
+            out[j + 1] = q[j + 1] * d;
+            out[j + 2] = q[j + 2] * d;
+            out[j + 3] = q[j + 3] * d;
         }
     }
 }
@@ -2083,13 +2091,20 @@ static inline size_t get_row_size(int n_cols, enum ggml_type type) {
 void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw);
 void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
                            int batch_size, int in_stride, int out_stride);
+void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw);
+static void matmul_q8_0_16row(float* xout, const float* x, const QuantizedTensor* qw);
 
 // Fused quantized matrix-vector multiplication
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
 // Uses Q8_0 quantized input path when available for integer dot products
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
-    // Dequantize-then-4row path (Q8_0 + K-quants)
+    // Q8_0: 16-row dequantize-then-dot kernel
+    if (qw->type == GGML_TYPE_Q8_0 && qw->deq_func && deq_buf) {
+        matmul_q8_0_16row(xout, x, qw);
+        return;
+    }
+    // Dequantize-then-4row path (K-quants)
     if (qw->deq_func && deq_buf) {
         matmul_deq_4row(xout, x, qw);
         return;
@@ -2129,6 +2144,91 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     for (i = 0; i < d; i++) {
         const void* row = data + i * row_size;
         xout[i] = dot_func(x, row, n);
+    }
+}
+
+// Q8_0 single-token matmul: 16 rows per pass. Dequantizes the 16 rows into the
+// per-thread deq_buf (in column chunks when 16 full rows do not fit) and runs 16
+// independent multiply-accumulate chains, so the CPU can overlap four times
+// more FMAs than the 4-row kernel. Per row the operations and their order are
+// identical to matmul_deq_4row (same dequantized values, same sequential
+// sum += w * x), so results match it bit for bit; rows left over after the
+// 16-row groups go through matmul_deq_4row itself.
+static void matmul_q8_0_16row(float* xout, const float* x, const QuantizedTensor* qw) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    deq_row_func dfunc = qw->deq_func;
+
+    int chunk = deq_buf_stride / 16;
+    chunk -= chunk % QK8_0;
+    if (chunk > n) chunk = n;
+    if (chunk < QK8_0) {
+        matmul_deq_4row(xout, x, qw);
+        return;
+    }
+
+    int ngroups = d / 16;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 16;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        float s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0, s7 = 0;
+        float s8 = 0, s9 = 0, s10 = 0, s11 = 0, s12 = 0, s13 = 0, s14 = 0, s15 = 0;
+        for (int c0 = 0; c0 < n; c0 += chunk) {
+            int cn = n - c0;
+            if (cn > chunk) cn = chunk;
+            size_t boff = (size_t)(c0 / QK8_0) * sizeof(block_q8_0);
+            for (int r = 0; r < 16; r++) {
+                dfunc(data + (size_t)(i + r) * row_size + boff, buf + r * cn, cn);
+            }
+            const float* xc = x + c0;
+            for (int j = 0; j < cn; j++) {
+                float xj = xc[j];
+                s0 += buf[j] * xj;
+                s1 += buf[cn + j] * xj;
+                s2 += buf[2 * cn + j] * xj;
+                s3 += buf[3 * cn + j] * xj;
+                s4 += buf[4 * cn + j] * xj;
+                s5 += buf[5 * cn + j] * xj;
+                s6 += buf[6 * cn + j] * xj;
+                s7 += buf[7 * cn + j] * xj;
+                s8 += buf[8 * cn + j] * xj;
+                s9 += buf[9 * cn + j] * xj;
+                s10 += buf[10 * cn + j] * xj;
+                s11 += buf[11 * cn + j] * xj;
+                s12 += buf[12 * cn + j] * xj;
+                s13 += buf[13 * cn + j] * xj;
+                s14 += buf[14 * cn + j] * xj;
+                s15 += buf[15 * cn + j] * xj;
+            }
+        }
+        xout[i] = s0;
+        xout[i + 1] = s1;
+        xout[i + 2] = s2;
+        xout[i + 3] = s3;
+        xout[i + 4] = s4;
+        xout[i + 5] = s5;
+        xout[i + 6] = s6;
+        xout[i + 7] = s7;
+        xout[i + 8] = s8;
+        xout[i + 9] = s9;
+        xout[i + 10] = s10;
+        xout[i + 11] = s11;
+        xout[i + 12] = s12;
+        xout[i + 13] = s13;
+        xout[i + 14] = s14;
+        xout[i + 15] = s15;
+    }
+
+    int done = ngroups * 16;
+    if (done < d) {
+        QuantizedTensor tail = *qw;
+        tail.data = (void*)(data + (size_t)done * row_size);
+        tail.rows = d - done;
+        matmul_deq_4row(xout + done, x, &tail);
     }
 }
 
@@ -3473,6 +3573,10 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
     // Forward all layers
     for (int l = 0; l < p->n_layers; l++) {
+        // Prefill tokens only feed later positions through the KV cache, so the
+        // last layer needs nothing beyond K and V: Q, attention, wo and the FFN
+        // would only produce a hidden state that nobody reads.
+        int kv_only = (l == p->n_layers - 1);
 
         // Batch rmsnorm
         if (p->is_gemma3 && l == 0) {
@@ -3488,7 +3592,9 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
         }
 
         // Batch QKV matmuls - read weights once, compute for all batch elements
-        matmul_quantized_batch(bq, bxb, &w->wq[l], batch_size, max_dim, q_dim, bq8, q8_stride);
+        if (!kv_only) {
+            matmul_quantized_batch(bq, bxb, &w->wq[l], batch_size, max_dim, q_dim, bq8, q8_stride);
+        }
         matmul_quantized_batch(bk, bxb, &w->wk[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
         matmul_quantized_batch(bv, bxb, &w->wv[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
 
@@ -3505,8 +3611,10 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
             // Gemma3: per-head Q/K normalization
             if (p->is_gemma3 && w->attn_q_norm && w->attn_k_norm) {
-                rmsnorm_per_head(q_arr, q_arr, w->attn_q_norm + l * head_size,
-                    p->n_heads, head_size, inv_head_size, eps);
+                if (!kv_only) {
+                    rmsnorm_per_head(q_arr, q_arr, w->attn_q_norm + l * head_size,
+                        p->n_heads, head_size, inv_head_size, eps);
+                }
                 rmsnorm_per_head(k_arr, k_arr, w->attn_k_norm + l * head_size,
                     p->n_kv_heads, head_size, inv_head_size, eps);
             }
@@ -3518,7 +3626,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
             if (p->is_gemma3) {
                 // Gemma NEOX RoPE: pairs (i, i+half)
-                for (int h = 0; h < p->n_heads; h++) {
+                for (int h = 0; h < (kv_only ? 0 : p->n_heads); h++) {
                     float* q_head = q_arr + h * head_size;
                     for (int i = 0; i < half; i++) {
                         float fcr = rope_cos[i];
@@ -3566,6 +3674,10 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
                 quantize_to_q8_0_cache(v_arr + kh * head_size, s->value_cache + cache_offset, head_size);
             }
 
+            if (kv_only) {
+                continue;
+            }
+
             // Quantize all Q heads to Q8_0
             quantize_to_q8_0_cache(q_arr, s->qQ8, q_dim);
 
@@ -3610,6 +3722,10 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
                     }
                 }
             }
+        }
+
+        if (kv_only) {
+            break;
         }
 
         // Batch wo matmul
