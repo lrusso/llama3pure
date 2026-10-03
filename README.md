@@ -293,10 +293,11 @@ A standalone version is available [here](https://lrusso.github.io/llama3pure/lla
 
 ## Special Keys
 
-| Action     | macOS Shortcut | Windows Shortcut | Safari Shortcut |
-| :--------- | :------------: | :--------------: | :-------------: |
-| Next reply |  Command + 1   |     Ctrl + 1     |    Ctrl + 1     |
-| Regenerate |  Command + 2   |     Ctrl + 2     |    Ctrl + 2     |
+| Action            | macOS Shortcut | Windows Shortcut | Safari Shortcut |
+| :---------------- | :------------: | :--------------: | :-------------: |
+| Next reply        |  Command + 1   |     Ctrl + 1     |    Ctrl + 1     |
+| Regenerate        |  Command + 2   |     Ctrl + 2     |    Ctrl + 2     |
+| Copy to clipboard |  Command + 3   |     Ctrl + 3     |    Ctrl + 3     |
 
 ## Author's Notes
 
