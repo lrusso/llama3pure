@@ -60,7 +60,6 @@ var QK4_1 = 32
 var QK5_0 = 32
 var QK5_1 = 32
 var QK8_0 = 32
-var QK_K = 256
 var QK4_NL = 32
 
 // IQ4_NL lookup table
@@ -210,17 +209,18 @@ var ggufData = null
 var dataView = null
 var offset = 0
 
-// Q8_0 buffers for quantizing the x vector in matmulQuantized. Allocated on
-// first use (ensureXQ8Buf): only Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL weights need them.
+// Q8_0 buffers for the x vector in matmulQuantized (allocated on first use)
 var xQ8Buf = null
 var xQ8Int8Buf = null
 var xQ8Size = 0
+// Scratch of one generate() call: holds the tokenizer hash table while the
+// prompt is encoded, then the prefill batch buffers, then the logits (they
+// are never needed at the same time), and is released when the call ends
+var genScratch = null
 var matmulDeqBuf = null
-// Four row-sized Float64Array views over matmulDeqBuf (one per dequantized
-// row), used by the Q8_0 prefill kernel. Allocated with matmulDeqBuf.
+// Four row views over matmulDeqBuf (Q8_0 prefill kernel)
 var matmulDeqRows = null
-// Int8 view over the same bytes as matmulDeqBuf: scratch for the unpacked
-// int8 weights of the block-32 integer prefill kernel.
+// Int8 view over matmulDeqBuf (block-32 integer prefill kernel)
 var matmulDeqI8 = null
 
 var temperature = 0.9
@@ -230,8 +230,8 @@ var systemPrompt = "You are a helpful assistant."
 var maxTokens = -1
 var contextSize = 0
 
-// QuantizedTensor structure: { dataOffset, type, rows, cols }
-// Stores metadata to read quantized weights on-the-fly during matmul
+// QuantizedTensor: { dataOffset, type, rows, cols, ... }, read on the fly by
+// the matmuls
 
 // ----------------------------------------------------------------------------
 // DataView helpers
@@ -333,41 +333,42 @@ var convBuffer = new ArrayBuffer(4)
 var convInt = new Uint32Array(convBuffer)
 var convFloat = new Float32Array(convBuffer)
 
-// Pre-computed FP16 to FP32 lookup table (256KB)
+// FP16 to FP32 lookup table (256 KB), filled on the first generate() call
+// (ensureFp16Table); until then its pages are never touched
 var fp16Table = new Float32Array(65536)
-;(function () {
-  for (var h = 0; h < 65536; h = h + 1) {
-    var sign = (h & 0x8000) >> 15
-    var exp = (h >> 10) & 0x1f
-    var mant = h & 0x3ff
+var fp16TableReady = false
 
-    if (exp === 0) {
-      if (mant === 0) {
-        fp16Table[h] = sign ? -0 : 0
-        continue
-      }
-      // Denormalized
-      while (!(mant & 0x400)) {
-        mant <<= 1
-        exp = exp - 1
-      }
-      exp = exp + 1
-      mant = mant & ~0x400
-    } else if (exp === 31) {
-      fp16Table[h] = mant === 0 ? (sign ? -Infinity : Infinity) : NaN
-      continue
-    }
-
-    exp = exp + (127 - 15)
-    mant = mant << 13
-    convInt[0] = (sign << 31) | (exp << 23) | mant
-    fp16Table[h] = convFloat[0]
+function ensureFp16Table() {
+  if (fp16TableReady) {
+    return
   }
-})()
+  fp16TableReady = true
+  var t = fp16Table
+  // Exponent e, mantissa m: (m + 1024) * 2^(e - 25), denormals (e = 0) m * 2^-24;
+  // e = 31 is +-Infinity (m = 0) or NaN. The upper half of the table is the
+  // negative sign bit.
+  var scale = Math.pow(2, -24)
+  for (var e = 0; e < 31; e = e + 1) {
+    var base = e << 10
+    var add = e === 0 ? 0 : 1024
+    for (var m = 0; m < 1024; m = m + 1) {
+      var v = (add + m) * scale
+      t[base + m] = v
+      t[base + m + 0x8000] = -v
+    }
+    if (e > 0) {
+      scale = scale * 2
+    }
+  }
+  t[0x7c00] = Infinity
+  t[0xfc00] = -Infinity
+  for (var m = 1; m < 1024; m = m + 1) {
+    t[0x7c00 + m] = NaN
+    t[0xfc00 + m] = NaN
+  }
+}
 
-// BF16 to FP32 lookup table - 256 KB, lazily populated since most loaded
-// models (Q8_0, Q4_K, etc.) never touch a BF16 tensor. Filled on first
-// bf16ToFp32 call via ensureBf16Table().
+// BF16 to FP32 lookup table (256 KB), filled on first use (ensureBf16Table)
 var bf16Table = null
 
 function ensureBf16Table() {
@@ -421,10 +422,7 @@ function fp32ToFp16(f) {
 
 var Q8_0_BLOCK_SIZE = 34 // 2 + 32
 
-// Quantize a float vector to Q8_0 format in cache
-// src: Float32Array source, srcOffset: start index in src
-// dst: Uint8Array destination cache, dstOffset: byte offset in dst
-// count: number of floats (must be multiple of 32)
+// Quantize `count` floats (multiple of 32) of src into the Q8_0 cache dst
 function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
   var nb = count >> 5 // count / 32
   var bo = dstOffset // byte offset in destination
@@ -464,14 +462,8 @@ function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
   }
 }
 
-// Compute dot product of float vector with Q8_0 cached vector
-// x: Float32Array query vector, xOffset: start index
-// Accumulate weighted Q8_0 cached vector to output
-// out: Float32Array output, outOffset: start index
-// cache: Uint8Array Q8_0 cache, cacheInt8: Int8Array view
-// cacheOffset: byte offset in cache
-// weight: scalar weight to multiply
-// count: number of elements (must be multiple of 32)
+// out[outOffset...] += weight * (Q8_0 cached vector at cacheOffset), `count`
+// elements (multiple of 32)
 function accumQ8_0Cache(
   out,
   outOffset,
@@ -502,8 +494,7 @@ function accumQ8_0Cache(
   }
 }
 
-// Compute dot product of two Q8_0 cached vectors (int8 * int8)
-// Used for Q8-quantized Q heads against Q8_0 KV cache
+// Dot product of two Q8_0 cached vectors (Q heads against the KV cache)
 function dotQ8_0_Q8_0Cache(aQ8, aI8, aOff, bQ8, bI8, bOff, count) {
   var nb = count >> 5
   var sum = 0.0
@@ -549,6 +540,36 @@ function dequantizeBF16(srcOffset, dst, dstOffset, count) {
 function dequantizeF32(srcOffset, dst, dstOffset, count) {
   var src = getFloat32ArrayAt(srcOffset, count)
   dst.set(src, dstOffset)
+}
+
+// Row dequantizers for 4-byte-aligned F16 / BF16 / F32 matrices, same signature
+// as the K-quant ones (view: Int32Array, two values per word, or Float32Array)
+function deqRowF16(I32, p, dst, dstOff, cols) {
+  var tab = fp16Table
+  var half = cols >> 1
+  for (var k = 0; k < half; k = k + 1) {
+    var v = I32[(p + k) | 0]
+    var y = (dstOff + (k << 1)) | 0
+    dst[y] = tab[v & 0xffff]
+    dst[(y + 1) | 0] = tab[v >>> 16]
+  }
+}
+
+function deqRowBF16(I32, p, dst, dstOff, cols) {
+  var tab = bf16Table
+  var half = cols >> 1
+  for (var k = 0; k < half; k = k + 1) {
+    var v = I32[(p + k) | 0]
+    var y = (dstOff + (k << 1)) | 0
+    dst[y] = tab[v & 0xffff]
+    dst[(y + 1) | 0] = tab[v >>> 16]
+  }
+}
+
+function deqRowF32(F32, p, dst, dstOff, cols) {
+  for (var j = 0; j < cols; j = j + 1) {
+    dst[(dstOff + j) | 0] = F32[(p + j) | 0]
+  }
 }
 
 function dequantizeQ4_0(srcOffset, dst, dstOffset, count) {
@@ -671,20 +692,13 @@ function dequantizeQ5_1(srcOffset, dst, dstOffset, count) {
 }
 
 // ----------------------------------------------------------------------------
-// Row dequantizers for the K-quant formats, used by the K-quant matmuls and
-// for embedding rows. They read the row through the matrix's Int32 view
-// (Q2_K/Q4_K/Q5_K: 84/144/176-byte blocks, always 4-byte aligned) or Uint16
-// view (Q3_K/Q6_K: 110/210-byte blocks, only 2-byte aligned), 4 or 2 bytes
-// per load instead of one, without data-dependent branches. Every element is
-// produced by the same double-precision operations as before (scale products
-// are exact, so hoisting them out of the element loops changes nothing), which
-// keeps the results bit-identical.
-// First argument: the matrix view (tensor.deqView); bo = byte offset of the
-// row inside that view; dst[dstOff...] receives cols values.
+// Row dequantizers for the K-quant formats (matmuls and embedding rows).
+// Arguments: the view the matrix is read through (Int32Array for
+// Q2_K/Q4_K/Q5_K, Uint16Array for Q3_K/Q6_K), p = index of the row's first
+// element in it, dst[dstOff...] gets cols values.
 
-function deqRowQ2_K(I32, bo, dst, dstOff, cols) {
+function deqRowQ2_K(I32, p, dst, dstOff, cols) {
   var nb = cols >> 8
-  var p = bo >> 2
   var y = dstOff
   for (var i = 0; i < nb; i = i + 1) {
     var w20 = I32[(p + 20) | 0]
@@ -753,42 +767,38 @@ function deqRowQ2_K(I32, bo, dst, dstOff, cols) {
   }
 }
 
-// Pre-allocated scales array for Q3_K
-var q3kScales = new Int8Array(16)
+// Scales of the Q3_K / Q6_K blocks being read (16 per row)
+var q3kScales = new Int8Array(64)
 
-function deqRowQ3_K(U16, bo, dst, dstOff, cols) {
+// 12 scale bytes of the Q3_K block at word p -> 16 signed 6-bit scales at
+// q3kScales[base...] (same unpacking as llama.cpp).
+function q3kUnpackScales(U16, p, base) {
   var kmask1 = 0x03030303
   var kmask2 = 0x0f0f0f0f
+  var aux0 = U16[(p + 48) | 0] | (U16[(p + 49) | 0] << 16)
+  var aux1 = U16[(p + 50) | 0] | (U16[(p + 51) | 0] << 16)
+  var aux2 = U16[(p + 52) | 0] | (U16[(p + 53) | 0] << 16)
+  var s0 = (aux0 & kmask2) | (((aux2 >> 0) & kmask1) << 4)
+  var s1 = (aux1 & kmask2) | (((aux2 >> 2) & kmask1) << 4)
+  var s2 = ((aux0 >> 4) & kmask2) | (((aux2 >> 4) & kmask1) << 4)
+  var s3 = ((aux1 >> 4) & kmask2) | (((aux2 >> 6) & kmask1) << 4)
+  var sc = q3kScales
+  for (var q = 0; q < 4; q = q + 1) {
+    var sh = q << 3
+    sc[base + q] = (s0 >> sh) & 0xff
+    sc[base + 4 + q] = (s1 >> sh) & 0xff
+    sc[base + 8 + q] = (s2 >> sh) & 0xff
+    sc[base + 12 + q] = (s3 >> sh) & 0xff
+  }
+}
+
+function deqRowQ3_K(U16, p, dst, dstOff, cols) {
   var nb = cols >> 8
-  var p = bo >> 1
   var y = dstOff
+  var sc = q3kScales
   for (var i = 0; i < nb; i = i + 1) {
     var dAll = fp16Table[U16[(p + 54) | 0]]
-    // 12 scale bytes -> 16 signed 6-bit scales (same unpacking as llama.cpp)
-    var aux0 = U16[(p + 48) | 0] | (U16[(p + 49) | 0] << 16)
-    var aux1 = U16[(p + 50) | 0] | (U16[(p + 51) | 0] << 16)
-    var aux2 = U16[(p + 52) | 0] | (U16[(p + 53) | 0] << 16)
-    var s0 = (aux0 & kmask2) | (((aux2 >> 0) & kmask1) << 4)
-    var s1 = (aux1 & kmask2) | (((aux2 >> 2) & kmask1) << 4)
-    var s2 = ((aux0 >> 4) & kmask2) | (((aux2 >> 4) & kmask1) << 4)
-    var s3 = ((aux1 >> 4) & kmask2) | (((aux2 >> 6) & kmask1) << 4)
-    var sc = q3kScales
-    sc[0] = s0 & 0xff
-    sc[1] = (s0 >> 8) & 0xff
-    sc[2] = (s0 >> 16) & 0xff
-    sc[3] = (s0 >> 24) & 0xff
-    sc[4] = s1 & 0xff
-    sc[5] = (s1 >> 8) & 0xff
-    sc[6] = (s1 >> 16) & 0xff
-    sc[7] = (s1 >> 24) & 0xff
-    sc[8] = s2 & 0xff
-    sc[9] = (s2 >> 8) & 0xff
-    sc[10] = (s2 >> 16) & 0xff
-    sc[11] = (s2 >> 24) & 0xff
-    sc[12] = s3 & 0xff
-    sc[13] = (s3 >> 8) & 0xff
-    sc[14] = (s3 >> 16) & 0xff
-    sc[15] = (s3 >> 24) & 0xff
+    q3kUnpackScales(U16, p, 0)
     var is = 0
     for (var h = 0; h < 2; h = h + 1) {
       // quants: 32 bytes per half (16 words); high-bit mask: 32 bytes shared
@@ -832,18 +842,17 @@ function deqRowQ3_K(U16, bo, dst, dstOff, cols) {
 // scale words; returns sc in the low 8 bits and m in the high 8 bits.
 function kScaleMin(is, w1, w2, w3) {
   if (is < 4) {
-    return ((w1 >>> (is << 3)) & 63) | (((w2 >>> (is << 3)) & 63) << 8)
+    return ((w1 >> (is << 3)) & 63) | (((w2 >> (is << 3)) & 63) << 8)
   }
   var k = (is - 4) << 3
-  var a = (w3 >>> k) & 0xff
-  var sc = (a & 0xf) | ((((w1 >>> k) & 0xff) >> 6) << 4)
-  var m = (a >> 4) | ((((w2 >>> k) & 0xff) >> 6) << 4)
+  var a = (w3 >> k) & 0xff
+  var sc = (a & 0xf) | ((((w1 >> k) & 0xff) >> 6) << 4)
+  var m = (a >> 4) | ((((w2 >> k) & 0xff) >> 6) << 4)
   return sc | (m << 8)
 }
 
-function deqRowQ4_K(I32, bo, dst, dstOff, cols) {
+function deqRowQ4_K(I32, p, dst, dstOff, cols) {
   var nb = cols >> 8
-  var p = bo >> 2
   var y = dstOff
   for (var i = 0; i < nb; i = i + 1) {
     var w0 = I32[p]
@@ -880,9 +889,8 @@ function deqRowQ4_K(I32, bo, dst, dstOff, cols) {
   }
 }
 
-function deqRowQ5_K(I32, bo, dst, dstOff, cols) {
+function deqRowQ5_K(I32, p, dst, dstOff, cols) {
   var nb = cols >> 8
-  var p = bo >> 2
   var y = dstOff
   for (var i = 0; i < nb; i = i + 1) {
     var w0 = I32[p]
@@ -923,9 +931,8 @@ function deqRowQ5_K(I32, bo, dst, dstOff, cols) {
   }
 }
 
-function deqRowQ6_K(U16, bo, dst, dstOff, cols) {
+function deqRowQ6_K(U16, p, dst, dstOff, cols) {
   var nb = cols >> 8
-  var p = bo >> 1
   var y = dstOff
   for (var i = 0; i < nb; i = i + 1) {
     var d = fp16Table[U16[(p + 104) | 0]]
@@ -1005,8 +1012,7 @@ function dequantizeIQ4_NL(srcOffset, dst, dstOffset, count) {
 }
 
 // Dequantize `count` K-quant values at an absolute buffer offset through a
-// temporary view. Only used for whole small tensors and non-embedding rows;
-// the hot paths use the per-matrix views in the tensor records.
+// temporary view (small tensors and non-embedding rows)
 function deqKQuantAt(type, srcOffset, dst, count) {
   var bytes = getRowSize(count, type)
   var deqFunc = getDeqRowFunc(type)
@@ -1018,56 +1024,9 @@ function deqKQuantAt(type, srcOffset, dst, count) {
 }
 
 function dequantizeTensor(srcOffset, count, type) {
+  ensureFp16Table()
   var dst = new Float32Array(count)
-
-  switch (type) {
-    case GGML_TYPE.F32:
-      dequantizeF32(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.F16:
-      dequantizeF16(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.BF16:
-    case 30:
-      dequantizeBF16(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q4_0:
-      dequantizeQ4_0(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q4_1:
-      dequantizeQ4_1(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q5_0:
-      dequantizeQ5_0(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q5_1:
-      dequantizeQ5_1(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q8_0:
-      dequantizeQ8_0(srcOffset, dst, 0, count)
-      break
-    case GGML_TYPE.Q2_K:
-      deqKQuantAt(type, srcOffset, dst, count)
-      break
-    case GGML_TYPE.Q3_K:
-      deqKQuantAt(type, srcOffset, dst, count)
-      break
-    case GGML_TYPE.Q4_K:
-      deqKQuantAt(type, srcOffset, dst, count)
-      break
-    case GGML_TYPE.Q5_K:
-      deqKQuantAt(type, srcOffset, dst, count)
-      break
-    case GGML_TYPE.Q6_K:
-      deqKQuantAt(type, srcOffset, dst, count)
-      break
-    case GGML_TYPE.IQ4_NL:
-      dequantizeIQ4_NL(srcOffset, dst, 0, count)
-      break
-    default:
-      throw new Error("Unsupported quantization type: " + type)
-  }
-
+  dequantizeRow(dst, srcOffset, count, type)
   return dst
 }
 
@@ -1075,80 +1034,27 @@ function dequantizeTensor(srcOffset, count, type) {
 // Fused quantized vector-matrix multiplication
 // These compute dot products directly from quantized weights without full dequantization
 
+// Values per block and bytes per block of the tensor types (index: GGML type)
+var BLOCK_VALUES = [1, 1, 32, 32, 0, 0, 32, 32, 32, 0, 256, 256, 256, 256, 256]
+var BLOCK_BYTES = [4, 2, 18, 20, 0, 0, 22, 24, 34, 0, 84, 110, 144, 176, 210]
+
 // Get block size for quantization type
 function getBlockSize(type) {
-  switch (type) {
-    case GGML_TYPE.F32:
-      return 1
-    case GGML_TYPE.F16:
-      return 1
-    case GGML_TYPE.BF16:
-      return 1
-    case 30:
-      return 1
-    case GGML_TYPE.Q4_0:
-      return QK4_0
-    case GGML_TYPE.Q4_1:
-      return QK4_1
-    case GGML_TYPE.Q5_0:
-      return QK5_0
-    case GGML_TYPE.Q5_1:
-      return QK5_1
-    case GGML_TYPE.Q8_0:
-      return QK8_0
-    case GGML_TYPE.Q2_K:
-      return QK_K
-    case GGML_TYPE.Q3_K:
-      return QK_K
-    case GGML_TYPE.Q4_K:
-      return QK_K
-    case GGML_TYPE.Q5_K:
-      return QK_K
-    case GGML_TYPE.Q6_K:
-      return QK_K
-    case GGML_TYPE.IQ4_NL:
-      return QK4_NL
-    default:
-      return 1
+  if (type === GGML_TYPE.IQ4_NL) {
+    return QK4_NL
   }
+  return BLOCK_VALUES[type] || 1
 }
 
 // Get bytes per block for quantization type
 function getTypeSize(type) {
-  switch (type) {
-    case GGML_TYPE.F32:
-      return 4
-    case GGML_TYPE.F16:
-      return 2
-    case GGML_TYPE.BF16:
-      return 2
-    case 30:
-      return 2
-    case GGML_TYPE.Q4_0:
-      return 2 + QK4_0 / 2
-    case GGML_TYPE.Q4_1:
-      return 2 + 2 + QK4_1 / 2
-    case GGML_TYPE.Q5_0:
-      return 2 + 4 + QK5_0 / 2
-    case GGML_TYPE.Q5_1:
-      return 2 + 2 + 4 + QK5_1 / 2
-    case GGML_TYPE.Q8_0:
-      return 2 + QK8_0
-    case GGML_TYPE.Q2_K:
-      return QK_K / 16 + QK_K / 4 + 2 + 2
-    case GGML_TYPE.Q3_K:
-      return QK_K / 8 + QK_K / 4 + 12 + 2
-    case GGML_TYPE.Q4_K:
-      return 2 + 2 + 12 + QK_K / 2
-    case GGML_TYPE.Q5_K:
-      return 2 + 2 + 12 + QK_K / 8 + QK_K / 2
-    case GGML_TYPE.Q6_K:
-      return QK_K / 2 + QK_K / 4 + QK_K / 16 + 2
-    case GGML_TYPE.IQ4_NL:
-      return 2 + QK4_NL / 2
-    default:
-      return 0
+  if (type === GGML_TYPE.IQ4_NL) {
+    return 2 + QK4_NL / 2
   }
+  if (type === GGML_TYPE.BF16 || type === 30) {
+    return 2
+  }
+  return BLOCK_BYTES[type] || 0
 }
 
 // Get row size in bytes
@@ -1158,8 +1064,7 @@ function getRowSize(nCols, type) {
   return ((nCols / blockSize) | 0) * typeSize
 }
 
-// Dequantize a single row from quantized tensor into destination array
-// Used for on-demand embedding lookup to avoid storing full dequantized embeddings
+// Dequantize a single row of a quantized tensor into dst
 function dequantizeRow(dst, srcOffset, nCols, type) {
   switch (type) {
     case GGML_TYPE.F32:
@@ -1188,17 +1093,9 @@ function dequantizeRow(dst, srcOffset, nCols, type) {
       dequantizeQ8_0(srcOffset, dst, 0, nCols)
       break
     case GGML_TYPE.Q2_K:
-      deqKQuantAt(type, srcOffset, dst, nCols)
-      break
     case GGML_TYPE.Q3_K:
-      deqKQuantAt(type, srcOffset, dst, nCols)
-      break
     case GGML_TYPE.Q4_K:
-      deqKQuantAt(type, srcOffset, dst, nCols)
-      break
     case GGML_TYPE.Q5_K:
-      deqKQuantAt(type, srcOffset, dst, nCols)
-      break
     case GGML_TYPE.Q6_K:
       deqKQuantAt(type, srcOffset, dst, nCols)
       break
@@ -1206,11 +1103,12 @@ function dequantizeRow(dst, srcOffset, nCols, type) {
       dequantizeIQ4_NL(srcOffset, dst, 0, nCols)
       break
     default:
-      throw new Error("Unsupported embedding type: " + type)
+      throw new Error("Unsupported quantization type: " + type)
   }
 }
 
-// Fused dot product for Q8_0 - JIT optimized
+// Byte-wise dot product of one Q8_0 row, for the matrices the Int32 kernels
+// cannot read (odd number of blocks per row)
 function vecDotQ8_0(x, srcOffset, n) {
   var nb = n >> 5
   var sum = 0.0
@@ -1266,254 +1164,11 @@ function vecDotQ8_0(x, srcOffset, n) {
   return sum
 }
 
-// Fused dot product for F16 - unrolled by 8
-function vecDotF16(x, srcOffset, n) {
-  var sum = 0.0
-  var bo = srcOffset
-  var u8 = ggufUint8
-  var n8 = n & ~7
-  var i = 0
-  for (; i < n8; i = i + 8) {
-    sum =
-      sum +
-      x[i] * fp16Table[u8[bo] | (u8[bo + 1] << 8)] +
-      x[i + 1] * fp16Table[u8[bo + 2] | (u8[bo + 3] << 8)] +
-      x[i + 2] * fp16Table[u8[bo + 4] | (u8[bo + 5] << 8)] +
-      x[i + 3] * fp16Table[u8[bo + 6] | (u8[bo + 7] << 8)] +
-      x[i + 4] * fp16Table[u8[bo + 8] | (u8[bo + 9] << 8)] +
-      x[i + 5] * fp16Table[u8[bo + 10] | (u8[bo + 11] << 8)] +
-      x[i + 6] * fp16Table[u8[bo + 12] | (u8[bo + 13] << 8)] +
-      x[i + 7] * fp16Table[u8[bo + 14] | (u8[bo + 15] << 8)]
-    bo = bo + 16
-  }
-  for (; i < n; i = i + 1) {
-    sum = sum + x[i] * fp16Table[u8[bo] | (u8[bo + 1] << 8)]
-    bo = bo + 2
-  }
-  return sum
-}
-
-// Fused dot product for BF16 - unrolled by 8
-function vecDotBF16(x, srcOffset, n) {
-  var sum = 0.0
-  var bo = srcOffset
-  var u8 = ggufUint8
-  var n8 = n & ~7
-  var i = 0
-  for (; i < n8; i = i + 8) {
-    sum =
-      sum +
-      x[i] * bf16Table[u8[bo] | (u8[bo + 1] << 8)] +
-      x[i + 1] * bf16Table[u8[bo + 2] | (u8[bo + 3] << 8)] +
-      x[i + 2] * bf16Table[u8[bo + 4] | (u8[bo + 5] << 8)] +
-      x[i + 3] * bf16Table[u8[bo + 6] | (u8[bo + 7] << 8)] +
-      x[i + 4] * bf16Table[u8[bo + 8] | (u8[bo + 9] << 8)] +
-      x[i + 5] * bf16Table[u8[bo + 10] | (u8[bo + 11] << 8)] +
-      x[i + 6] * bf16Table[u8[bo + 12] | (u8[bo + 13] << 8)] +
-      x[i + 7] * bf16Table[u8[bo + 14] | (u8[bo + 15] << 8)]
-    bo = bo + 16
-  }
-  for (; i < n; i = i + 1) {
-    sum = sum + x[i] * bf16Table[u8[bo] | (u8[bo + 1] << 8)]
-    bo = bo + 2
-  }
-  return sum
-}
-
-// Fused dot product for F32
-function vecDotF32(x, srcOffset, n) {
-  var sum = 0.0
-  var bo = srcOffset
-  for (var i = 0; i < n; i = i + 1) {
-    sum = sum + x[i] * dataView.getFloat32(bo, true)
-    bo = bo + 4
-  }
-  return sum
-}
-
-// Fused quantized matrix-vector multiplication
-// Computes out = W @ x where W is quantized (rows x cols)
-// Get vec_dot function for a type (avoids switch in hot loop)
-function getVecDotFunc(type) {
-  switch (type) {
-    case GGML_TYPE.Q8_0:
-      return vecDotQ8_0
-    case GGML_TYPE.F16:
-      return vecDotF16
-    case GGML_TYPE.BF16:
-    case 30:
-      ensureBf16Table()
-      return vecDotBF16
-    case GGML_TYPE.F32:
-      return vecDotF32
-    default:
-      return null
-  }
-}
-
 // ----------------------------------------------------------------------------
-// Q8_0-input vec_dot functions (integer inner loops)
-// These take Q8_0-quantized x instead of float x for faster dot products.
-// Signature: (xQ8, xQ8i8, srcOffset, n) where xQ8 is Uint8Array, xQ8i8 is Int8Array view
-
-function vecDotQ4_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
-  var nb = n >> 5
-  var sum = 0.0
-  var wOff = srcOffset
-  var xOff = 0
-  var u8 = ggufUint8
-  for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
-    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = wOff + 2
-    var qx = xOff + 2
-    var isum = 0
-    for (var j = 0; j < 16; j = j + 1) {
-      var qByte = u8[qw + j]
-      isum =
-        isum +
-        xQ8i8[qx + j] * ((qByte & 0x0f) - 8) +
-        xQ8i8[qx + j + 16] * ((qByte >> 4) - 8)
-    }
-    sum = sum + dw * dx * isum
-    wOff = wOff + 18
-    xOff = xOff + 34
-  }
-  return sum
-}
-
-function vecDotQ4_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
-  var nb = n >> 5
-  var sum = 0.0
-  var wOff = srcOffset
-  var xOff = 0
-  var u8 = ggufUint8
-  for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
-    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
-    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = wOff + 4
-    var qx = xOff + 2
-    var isum = 0
-    var xsum = 0
-    for (var j = 0; j < 16; j = j + 1) {
-      var qByte = u8[qw + j]
-      isum =
-        isum + xQ8i8[qx + j] * (qByte & 0x0f) + xQ8i8[qx + j + 16] * (qByte >> 4)
-      xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
-    }
-    sum = sum + dw * dx * isum + mw * dx * xsum
-    wOff = wOff + 20
-    xOff = xOff + 34
-  }
-  return sum
-}
-
-function vecDotQ5_0_Q8_0(xQ8, xQ8i8, srcOffset, n) {
-  var nb = n >> 5
-  var sum = 0.0
-  var wOff = srcOffset
-  var xOff = 0
-  var u8 = ggufUint8
-  for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
-    var qh =
-      u8[wOff + 2] |
-      (u8[wOff + 3] << 8) |
-      (u8[wOff + 4] << 16) |
-      (u8[wOff + 5] << 24)
-    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = wOff + 6
-    var qx = xOff + 2
-    var isum = 0
-    for (var j = 0; j < 16; j = j + 1) {
-      var xh_0 = ((qh >> j) & 1) << 4
-      var xh_1 = ((qh >> (j + 16)) & 1) << 4
-      var qByte = u8[qw + j]
-      isum =
-        isum +
-        xQ8i8[qx + j] * (((qByte & 0x0f) | xh_0) - 16) +
-        xQ8i8[qx + j + 16] * (((qByte >> 4) | xh_1) - 16)
-    }
-    sum = sum + dw * dx * isum
-    wOff = wOff + 22
-    xOff = xOff + 34
-  }
-  return sum
-}
-
-function vecDotQ5_1_Q8_0(xQ8, xQ8i8, srcOffset, n) {
-  var nb = n >> 5
-  var sum = 0.0
-  var wOff = srcOffset
-  var xOff = 0
-  var u8 = ggufUint8
-  for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
-    var mw = fp16ToFp32(u8[wOff + 2] | (u8[wOff + 3] << 8))
-    var qh =
-      u8[wOff + 4] |
-      (u8[wOff + 5] << 8) |
-      (u8[wOff + 6] << 16) |
-      (u8[wOff + 7] << 24)
-    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = wOff + 8
-    var qx = xOff + 2
-    var isum = 0
-    var xsum = 0
-    for (var j = 0; j < 16; j = j + 1) {
-      var xh_0 = ((qh >> j) & 1) << 4
-      var xh_1 = ((qh >> (j + 16)) & 1) << 4
-      var qByte = u8[qw + j]
-      isum =
-        isum +
-        xQ8i8[qx + j] * ((qByte & 0x0f) | xh_0) +
-        xQ8i8[qx + j + 16] * ((qByte >> 4) | xh_1)
-      xsum = xsum + xQ8i8[qx + j] + xQ8i8[qx + j + 16]
-    }
-    sum = sum + dw * dx * isum + mw * dx * xsum
-    wOff = wOff + 24
-    xOff = xOff + 34
-  }
-  return sum
-}
-
-function vecDotIQ4_NL_Q8_0(xQ8, xQ8i8, srcOffset, n) {
-  var nb = n >> 5
-  var sum = 0.0
-  var wOff = srcOffset
-  var xOff = 0
-  var u8 = ggufUint8
-  for (var i = 0; i < nb; i = i + 1) {
-    var dw = fp16ToFp32(u8[wOff] | (u8[wOff + 1] << 8))
-    var dx = fp16ToFp32(xQ8[xOff] | (xQ8[xOff + 1] << 8))
-    var qw = wOff + 2
-    var qx = xOff + 2
-    var isum = 0
-    for (var j = 0; j < 16; j = j + 1) {
-      var qByte = u8[qw + j]
-      isum =
-        isum +
-        xQ8i8[qx + j] * kvalues_iq4nl[qByte & 0xf] +
-        xQ8i8[qx + j + 16] * kvalues_iq4nl[qByte >> 4]
-    }
-    sum = sum + dw * dx * isum
-    wOff = wOff + 18
-    xOff = xOff + 34
-  }
-  return sum
-}
-
-
-// ----------------------------------------------------------------------------
-// Block-32 formats with Q8_0 activations (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL):
-// prefill kernel. The old path re-unpacked every weight once per token of the
-// batch; here each row is unpacked ONCE into int8 weights plus per-block
-// scales (and mins), then a 4-row x 3-token integer tile runs against the
-// Q8_0-quantized activations. The integer block sums are exact, and the
-// per-block scale products are applied in the same order as the per-row
-// vecDot*_Q8_0 functions (sum + dw * dx * isum [+ mw * dx * xsum]), so the
-// results are bit-identical to the old path.
+// Block-32 formats with Q8_0 activations (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL),
+// prefill: each row is unpacked once into int8 weights and per-block scales
+// (and mins), then a 4-row x 3-token integer tile runs against the Q8_0
+// activations; exact integer block sums, scale products in block order.
 
 // Unpack one row into w8[wOff...] (int8 weights, 32 per block), sc[scOff + b]
 // (fp16 scale as float) and, for the *_1 formats, mn[mnOff + b] (fp16 min).
@@ -1626,12 +1281,9 @@ function block32XSums(bQ8i8, batchSize, nb, sc, xsBase) {
   }
 }
 
-// Integer 4-row x 3-token tile over one group of 4 unpacked rows (w8 holds the
-// int8 weights, sc the per-block scales, mins and x block sums). Tokens
-// bt..bt+nTok-1 (nTok 1..3); a short group reuses its last token for the
-// missing lanes and only stores the real ones. Per (row, token): the block
-// integer sums are exact and the scale products are applied in block order as
-// sum + d * dx * isum [+ m * dx * xsum], like the per-row vecDot*_Q8_0.
+// Integer 4-row x 3-token tile over one group of 4 unpacked rows (w8: int8
+// weights; sc: per-block scales, mins and x block sums) for tokens
+// bt..bt+nTok-1; a short group reuses its last token for the missing lanes.
 function block32Tile(outs, bt, nTok, i, nb, cols, hasMin, sc, scBase, mnBase, xsBase) {
   var bQ8 = state.batchQ8
   var bQ8i8 = state.batchQ8i8
@@ -1790,8 +1442,7 @@ function matmulBlock32Q8Batch(outs, xs, qw, batchSize) {
     block32XSums(bQ8i8, batchSize, nb, sc, xsBase)
   }
 
-  var rows4 = rows & ~3
-  for (var i = 0; i < rows4; i = i + 4) {
+  for (var i = 0; i < rows; i = i + 4) {
     var ro = base + i * rowSize
     unpack(u8, ro, w8, 0, sc, scBase, sc, mnBase, nb)
     unpack(u8, ro + rowSize, w8, cols, sc, scBase + nb, sc, mnBase + nb, nb)
@@ -1805,26 +1456,13 @@ function matmulBlock32Q8Batch(outs, xs, qw, batchSize) {
       block32Tile(outs, bt, nTok, i, nb, cols, hasMin, sc, scBase, mnBase, xsBase)
     }
   }
-  // Remaining 1-3 rows: the per-row vecDot keeps the same math
-  var dotQ8Func = qw.dotQ8Func
-  for (var i = rows4; i < rows; i = i + 1) {
-    var rowOff = base + i * rowSize
-    for (var b = 0; b < batchSize; b = b + 1) {
-      outs[b][i] = dotQ8Func(bQ8[b], bQ8i8[b], rowOff, cols)
-    }
-  }
 }
 
 // ----------------------------------------------------------------------------
-// Single-token kernels for block-32 formats with Q8_0 activations (Q4_0, Q4_1,
-// Q5_0, Q5_1, IQ4_NL): one call computes rows i..i+3 (the row loop lives in
-// matmulQuantizedPreQ8, which keeps each compiled kernel small). Weights are read 2 bytes at a time
-// through the matrix's Uint16 view and the quantized x is read once
-// per block and shared by the 4 rows. The integer block sums are exact; the
-// signed offset of Q4_0/Q5_0 is folded out of the per-weight work
-// (sum(x * (q - 16)) = sum(x * q) - 16 * sum(x)) and the scale products are
-// applied in the same order as the per-row vecDot*_Q8_0 functions, so the
-// results are bit-identical to them.
+// Single-token kernels for the block-32 formats with Q8_0 activations: rows
+// i..i+3 per call (row loop in matmulQuantizedPreQ8), weights read through the
+// Uint16 view, the quantized x once per block for the 4 rows; same math as the
+// prefill tile (the Q4_0/Q5_0 offset is folded out of the inner sum).
 
 function matmulQ4_0Q8Rows4(out, qw, i) {
   var U16 = qw.localU16
@@ -1832,7 +1470,7 @@ function matmulQ4_0Q8Rows4(out, qw, i) {
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
   var xu = xQ8Buf
-  var p0 = i * rowWords
+  var p0 = qw.base + i * rowWords
   var p1 = p0 + rowWords
   var p2 = p1 + rowWords
   var p3 = p2 + rowWords
@@ -1910,7 +1548,7 @@ function matmulQ4_1Q8Rows4(out, qw, i) {
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
   var xu = xQ8Buf
-  var p0 = i * rowWords
+  var p0 = qw.base + i * rowWords
   var p1 = p0 + rowWords
   var p2 = p1 + rowWords
   var p3 = p2 + rowWords
@@ -1992,7 +1630,7 @@ function matmulQ5_0Q8Rows4(out, qw, i) {
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
   var xu = xQ8Buf
-  var p0 = i * rowWords
+  var p0 = qw.base + i * rowWords
   var p1 = p0 + rowWords
   var p2 = p1 + rowWords
   var p3 = p2 + rowWords
@@ -2078,7 +1716,7 @@ function matmulQ5_1Q8Rows4(out, qw, i) {
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
   var xu = xQ8Buf
-  var p0 = i * rowWords
+  var p0 = qw.base + i * rowWords
   var p1 = p0 + rowWords
   var p2 = p1 + rowWords
   var p3 = p2 + rowWords
@@ -2169,7 +1807,7 @@ function matmulIQ4_NLQ8Rows4(out, qw, i) {
   var xq = xQ8Int8Buf
   var xu = xQ8Buf
   var kv = kvalues_iq4nl
-  var p0 = i * rowWords
+  var p0 = qw.base + i * rowWords
   var p1 = p0 + rowWords
   var p2 = p1 + rowWords
   var p3 = p2 + rowWords
@@ -2235,43 +1873,6 @@ function matmulIQ4_NLQ8Rows4(out, qw, i) {
   out[i + 3] = s3
 }
 
-function getDotQ8RowsFunc(type) {
-  switch (type) {
-    case GGML_TYPE.Q4_0:
-      return matmulQ4_0Q8Rows4
-    case GGML_TYPE.Q4_1:
-      return matmulQ4_1Q8Rows4
-    case GGML_TYPE.Q5_0:
-      return matmulQ5_0Q8Rows4
-    case GGML_TYPE.Q5_1:
-      return matmulQ5_1Q8Rows4
-    case GGML_TYPE.IQ4_NL:
-      return matmulIQ4_NLQ8Rows4
-    default:
-      return null
-  }
-}
-
-// Get Q8_0-input vec_dot function for a type (null for float types)
-function getVecDotQ8Func(type) {
-  switch (type) {
-    case GGML_TYPE.Q4_0:
-      return vecDotQ4_0_Q8_0
-    case GGML_TYPE.Q4_1:
-      return vecDotQ4_1_Q8_0
-    case GGML_TYPE.Q5_0:
-      return vecDotQ5_0_Q8_0
-    case GGML_TYPE.Q5_1:
-      return vecDotQ5_1_Q8_0
-    case GGML_TYPE.Q8_0:
-      return null // Float×Q8 path is faster in JS (no quantization overhead)
-    case GGML_TYPE.IQ4_NL:
-      return vecDotIQ4_NL_Q8_0
-    default:
-      return null
-  }
-}
-
 function getDeqRowFunc(type) {
   switch (type) {
     case GGML_TYPE.Q2_K:
@@ -2284,6 +1885,47 @@ function getDeqRowFunc(type) {
       return deqRowQ5_K
     case GGML_TYPE.Q6_K:
       return deqRowQ6_K
+    case GGML_TYPE.F16:
+      return deqRowF16
+    case GGML_TYPE.BF16:
+    case 30:
+      ensureBf16Table()
+      return deqRowBF16
+    case GGML_TYPE.F32:
+      return deqRowF32
+    default:
+      return null
+  }
+}
+
+// Single-token kernel that computes a group of rows per call: (out, qw, i)
+// for the block-32 formats (4 rows, Q8_0 activations), (out, x, qw, i) for
+// the fused ones (2 rows); null for Q8_0 and Q2_K.
+function getRowsFunc(type) {
+  switch (type) {
+    case GGML_TYPE.Q4_0:
+      return matmulQ4_0Q8Rows4
+    case GGML_TYPE.Q4_1:
+      return matmulQ4_1Q8Rows4
+    case GGML_TYPE.Q5_0:
+      return matmulQ5_0Q8Rows4
+    case GGML_TYPE.Q5_1:
+      return matmulQ5_1Q8Rows4
+    case GGML_TYPE.IQ4_NL:
+      return matmulIQ4_NLQ8Rows4
+    case GGML_TYPE.Q4_K:
+      return matmulQ4_KRows
+    case GGML_TYPE.Q5_K:
+      return matmulQ5_KRows
+    case GGML_TYPE.Q3_K:
+    case GGML_TYPE.Q6_K:
+      return matmulK16Rows
+    case GGML_TYPE.F16:
+    case GGML_TYPE.BF16:
+    case 30:
+      return matmulF16Rows
+    case GGML_TYPE.F32:
+      return matmulF32Rows
     default:
       return null
   }
@@ -2298,55 +1940,42 @@ function ensureXQ8Buf() {
 }
 
 function matmulQuantized(out, x, qw) {
-  var rows = qw.rows
-  var cols = qw.cols
-  var baseOffset = qw.dataOffset
-  var rowSize = qw.rowSize
-  var dotQ8Func = qw.dotQ8Func
-
   if (qw.localI32 !== null) {
     matmulQ8_0Local(out, x, qw)
   } else if (qw.deqRowFunc) {
-    // K-quant: dequantize a few rows at a time, flat dot product
-    matmulKQuantLocal(out, x, qw)
-  } else if (dotQ8Func) {
-    // Quantize x to Q8_0 once, then use integer dot products
+    // Fused kernel when the type has one, else dequantize-then-dot
+    if (qw.rowsFunc !== null) {
+      matmulRows(out, x, qw)
+    } else {
+      matmulKQuantLocal(out, x, qw, 0)
+    }
+  } else if (qw.rowsFunc !== null) {
+    // Block-32 formats: quantize x to Q8_0 once, then integer dot products
     ensureXQ8Buf()
-    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
+    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, qw.cols)
     matmulQuantizedPreQ8(out, qw)
   } else {
-    // Float weight types - use original float dot
-    var dotFunc = qw.dotFunc
+    var rows = qw.rows
+    var cols = qw.cols
+    var baseOffset = qw.dataOffset
+    var rowSize = qw.rowSize
     for (var i = 0; i < rows; i = i + 1) {
-      out[i] = dotFunc(x, baseOffset + i * rowSize, cols)
+      out[i] = vecDotQ8_0(x, baseOffset + i * rowSize, cols)
     }
   }
 }
 
-// Quantized matmul using pre-quantized x (avoids redundant quantization)
-// Caller must have already quantized x into xQ8Buf/xQ8Int8Buf
+// Quantized matmul with x already quantized into xQ8Buf/xQ8Int8Buf
 function matmulQuantizedPreQ8(out, qw) {
+  // 4 rows per call, weights read as Uint16 words, x shared by the 4 rows
   var rows = qw.rows
-  var dotQ8Func = qw.dotQ8Func
-  var baseOffset = qw.dataOffset
-  var rowSize = qw.rowSize
-  var cols = qw.cols
-  var i = 0
-  var rowsFunc = qw.dotQ8RowsFunc
-  if (rowsFunc !== null && qw.localU16 !== null) {
-    // 4 rows per call, weights read as Uint16 words, x shared by the 4 rows
-    var rows4 = rows & ~3
-    for (; i < rows4; i = i + 4) {
-      rowsFunc(out, qw, i)
-    }
-  }
-  for (; i < rows; i = i + 1) {
-    out[i] = dotQ8Func(xQ8Buf, xQ8Int8Buf, baseOffset + i * rowSize, cols)
+  var rowsFunc = qw.rowsFunc
+  for (var i = 0; i < rows; i = i + 4) {
+    rowsFunc(out, qw, i)
   }
 }
 
-// Batched matmul: process multiple input vectors against same weight matrix
-// Weight data is read once per row and reused across all batch elements
+// Batched matmul: several input vectors against the same weight matrix
 var PREFILL_BATCH_SIZE = 32
 
 function matmulQuantizedBatch(outs, xs, qw, batchSize) {
@@ -2354,68 +1983,42 @@ function matmulQuantizedBatch(outs, xs, qw, batchSize) {
   var cols = qw.cols
   var baseOffset = qw.dataOffset
   var rowSize = qw.rowSize
-  var dotQ8Func = qw.dotQ8Func
 
   if (qw.localI32 !== null) {
     matmulQ8_0LocalBatch(outs, xs, qw, batchSize)
   } else if (qw.deqRowFunc) {
-    // K-quant: dequantize 4 rows at a time, 4-row x 3-token tile
+    // K-quants and F16/BF16/F32: dequantize 4 rows at a time, 4-row x 3-token tile
     matmulKQuantLocalBatch(outs, xs, qw, batchSize)
   } else if (qw.unpackRowFunc) {
     // Block-32 formats with Q8 activations: unpack once, integer tile
     matmulBlock32Q8Batch(outs, xs, qw, batchSize)
-  } else if (dotQ8Func) {
-    var bQ8 = state.batchQ8
-    var bQ8i8 = state.batchQ8i8
-    for (var b = 0; b < batchSize; b = b + 1) {
-      quantizeToQ8_0Cache(xs[b], 0, bQ8[b], bQ8i8[b], 0, cols)
-    }
-    for (var i = 0; i < rows; i = i + 1) {
-      var rowOff = baseOffset + i * rowSize
-      for (var b = 0; b < batchSize; b = b + 1) {
-        outs[b][i] = dotQ8Func(bQ8[b], bQ8i8[b], rowOff, cols)
-      }
-    }
   } else {
-    var dotFunc = qw.dotFunc
     for (var i = 0; i < rows; i = i + 1) {
       var rowOff = baseOffset + i * rowSize
       for (var b = 0; b < batchSize; b = b + 1) {
-        outs[b][i] = dotFunc(xs[b], rowOff, cols)
+        outs[b][i] = vecDotQ8_0(xs[b], rowOff, cols)
       }
     }
   }
 }
 
-// Q8_0 matmul, single token: 4 rows at a time, 4 weights per Int32 load.
-//
-// A Q8_0 block is 34 bytes (FP16 scale + 32 int8 weights), so consecutive
-// blocks alternate between 4-byte-aligned and 2-byte-aligned starts. We walk
-// the row in PAIRS of blocks (68 bytes = 17 Int32 words): word 0 holds the
-// first scale plus weights 0-1, words 1-7 hold weights 2-29, word 8 holds
-// weights 30-31 plus the second scale, and words 9-16 hold the second block.
-// Each weight is sign-extracted from its word with a shift pair, which V8
-// turns into plain ALU ops instead of a byte load + bounds check per weight.
-//
-// The summation order is exactly the one of the original byte kernel: a
-// left-to-right chain over the 32 weights of a block, then sum += d * chain.
-// Each block is split into two 16-column groups; the second group lives in a
-// one-iteration loop on purpose: the loop header bounds the size of the basic
-// block V8 schedules at once, which stops it from hoisting every load of the
-// block pair up front and spilling the live values to the stack.
-//
-// Requires qw.localI32 (matrix start 4-byte aligned and an even number of
-// blocks per row). A Q8_0 matrix without it goes through the generic
-// per-row vecDotQ8_0 path in matmulQuantized instead.
+// Q8_0 matmul, single token: 4 rows at a time, 4 weights per Int32 load
+// (sign-extracted with a shift pair). Rows are walked in pairs of 34-byte
+// blocks (17 words: scale + weights 0-1, words 1-7 weights 2-29, word 8 weights
+// 30-31 + the next scale, words 9-16 the second block). Same summation order as
+// the byte kernel. The second 16-column group of a block sits in a
+// one-iteration loop on purpose (keeps V8 from hoisting every load and
+// spilling). Requires qw.localI32.
 function matmulQ8_0Local(out, x, qw) {
   var I32 = qw.localI32
+  var base = qw.base
   var rows = qw.rows
   var cols = qw.cols
   var rowWords = qw.rowSize >> 2
   var nbp = cols >> 6
   var rows4 = rows & ~3
   for (var i = 0; i < rows4; i = i + 4) {
-    var p0 = i * rowWords
+    var p0 = base + i * rowWords
     var p1 = p0 + rowWords
     var p2 = p1 + rowWords
     var p3 = p2 + rowWords
@@ -2896,12 +2499,12 @@ function matmulQ8_0Local(out, x, qw) {
     out[i + 3] = s3
   }
   for (var i = rows4; i < rows; i = i + 1) {
-    out[i] = dotRowQ8_0I32(x, I32, i * rowWords, nbp)
+    out[i] = dotRowQ8_0I32(x, I32, base + i * rowWords, nbp)
   }
 }
 
-// One row of a Q8_0 matrix against x, same Int32 block-pair layout and the
-// same summation order as matmulQ8_0Local. Used for the (rare) row remainder.
+// One row of a Q8_0 matrix against x, same layout and summation order as
+// matmulQ8_0Local (row remainder)
 function dotRowQ8_0I32(x, I32, p, nbp) {
   var s = 0.0
   var xb = 0
@@ -2946,9 +2549,8 @@ function dotRowQ8_0I32(x, I32, p, nbp) {
   return s
 }
 
-// Dequantize one Q8_0 row (even number of blocks) into dst[dstOff...] using
-// the Int32 block-pair layout. Products d * q are exact in double, so this
-// matches the byte-wise dequantizer bit for bit.
+// Dequantize one Q8_0 row (even number of blocks) into dst[dstOff...] through
+// the Int32 block-pair layout, bit-identical to the byte-wise dequantizer
 function deqRowQ8_0I32(I32, p, dst, dstOff, nbp) {
   var o = dstOff
   for (var b = 0; b < nbp; b = b + 1) {
@@ -2981,16 +2583,13 @@ function deqRowQ8_0I32(I32, p, dst, dstOff, nbp) {
   }
 }
 
-// Q8_0 batch matmul (prefill): dequantize 4 rows into the four row views of
-// matmulDeqBuf, then run a 4-row x 3-token tile over the columns, one column
-// per step (12 independent accumulators). Each x value is loaded once per
-// 4 rows and each weight once per 3 tokens. The per-row views (instead of
-// one buffer with row offsets) save an index add per weight load; the tile
-// shape is the largest one V8 keeps in registers without spilling.
-// Summation order per (row, token) is the plain left-to-right column order,
-// identical to the byte kernel.
+// Q8_0 batch matmul (prefill): dequantize 4 rows into the row views of
+// matmulDeqBuf, then a 4-row x 3-token tile, one column per step (12
+// accumulators, the largest shape V8 keeps in registers); same column order as
+// the byte kernel.
 function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
   var I32 = qw.localI32
+  var base = qw.base
   var rows = qw.rows
   var cols = qw.cols
   var rowWords = qw.rowSize >> 2
@@ -3002,7 +2601,7 @@ function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
   var buf2 = matmulDeqRows[2]
   var buf3 = matmulDeqRows[3]
   for (var i = 0; i < rows4; i = i + 4) {
-    var p = i * rowWords
+    var p = base + i * rowWords
     deqRowQ8_0I32(I32, p, buf0, 0, nbp)
     deqRowQ8_0I32(I32, p + rowWords, buf1, 0, nbp)
     deqRowQ8_0I32(I32, p + rowWords + rowWords, buf2, 0, nbp)
@@ -3121,7 +2720,7 @@ function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
   }
   // Remaining 1-3 rows
   for (var i = rows4; i < rows; i = i + 1) {
-    deqRowQ8_0I32(I32, i * rowWords, buf0, 0, nbp)
+    deqRowQ8_0I32(I32, base + i * rowWords, buf0, 0, nbp)
     for (var bt = 0; bt < batchSize; bt = bt + 1) {
       var xArr = xs[bt]
       var s = 0.0
@@ -3133,19 +2732,305 @@ function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
   }
 }
 
-// K-quant matmul: dequantize 4 rows into a scratch buffer, then flat dot product.
-// During prefill the scratch is matmulDeqBuf. During generation that buffer is
-// freed, so we borrow an idle buffer instead (no extra RAM): the logits buffer
-// while running the layers, and hb while computing the logits themselves.
-// Fewer than 4 rows per pass are processed when the borrowed buffer is small;
-// every row's dot product is computed in the same column order regardless.
-function matmulKQuantLocal(out, x, qw) {
+// ----------------------------------------------------------------------------
+// Fused single-token kernels: rows i .. i + 1 of a matrix against x, straight
+// from the matrix view. Each weight is computed as in its row dequantizer and
+// each row is summed left to right, so the results are bit-identical. Words are
+// shifted with >> (not >>>) so they stay int32 (JavaScriptCore keeps the loop
+// in integer registers).
+
+// F16 / BF16: two weights per Int32 load, converted through the 64K-entry
+// lookup table.
+function matmulF16Rows(out, x, qw, i) {
+  var I32 = qw.deqView
+  var half = qw.cols >> 1
+  var tab = qw.type === GGML_TYPE.F16 ? fp16Table : bf16Table
+  var o0 = (qw.base + i * half) | 0
+  var o1 = (o0 + half) | 0
+  var s0 = 0.0
+  var s1 = 0.0
+  for (var k = 0; k < half; k = k + 1) {
+    var a = x[k << 1]
+    var c = x[((k << 1) + 1) | 0]
+    var v = I32[(o0 + k) | 0]
+    s0 = s0 + a * tab[v & 0xffff]
+    s0 = s0 + c * tab[v >>> 16]
+    v = I32[(o1 + k) | 0]
+    s1 = s1 + a * tab[v & 0xffff]
+    s1 = s1 + c * tab[v >>> 16]
+  }
+  out[i] = s0
+  out[i + 1] = s1
+}
+
+// F32: through the Float32 view.
+function matmulF32Rows(out, x, qw, i) {
+  var F32 = qw.deqView
+  var cols = qw.cols
+  var o0 = (qw.base + i * cols) | 0
+  var o1 = (o0 + cols) | 0
+  var s0 = 0.0
+  var s1 = 0.0
+  for (var j = 0; j < cols; j = j + 1) {
+    var a = x[j]
+    s0 = s0 + a * F32[(o0 + j) | 0]
+    s1 = s1 + a * F32[(o1 + j) | 0]
+  }
+  out[i] = s0
+  out[i + 1] = s1
+}
+
+// Q4_K: 8 groups of 32 columns per block. Group c reads the 32 quant bytes
+// of pair c >> 1 (low nibbles when c is even, high nibbles when odd) with
+// scale/min number c.
+function matmulQ4_KRows(out, x, qw, i) {
+  var I32 = qw.deqView
+  var nb = qw.cols >> 8
+  var rowWords = qw.rowSize >> 2
+  var p0 = (qw.base + i * rowWords) | 0
+  var p1 = (p0 + rowWords) | 0
+  var s0 = 0.0
+  var s1 = 0.0
+  var xb = 0
+  for (var b = 0; b < nb; b = b + 1) {
+    var hA = I32[p0]
+    var dA = fp16Table[hA & 0xffff]
+    var nA = fp16Table[hA >>> 16]
+    var uA = I32[(p0 + 1) | 0]
+    var vA = I32[(p0 + 2) | 0]
+    var wA = I32[(p0 + 3) | 0]
+    var hB = I32[p1]
+    var dB = fp16Table[hB & 0xffff]
+    var nB = fp16Table[hB >>> 16]
+    var uB = I32[(p1 + 1) | 0]
+    var vB = I32[(p1 + 2) | 0]
+    var wB = I32[(p1 + 3) | 0]
+    for (var c = 0; c < 8; c = c + 1) {
+      var sm
+      sm = kScaleMin(c, uA, vA, wA)
+      var kA = dA * (sm & 0xff)
+      var mA = nA * (sm >>> 8)
+      sm = kScaleMin(c, uB, vB, wB)
+      var kB = dB * (sm & 0xff)
+      var mB = nB * (sm >>> 8)
+      var sh = (c & 1) << 2
+      var qo = (4 + ((c >> 1) << 3)) | 0
+      for (var k = 0; k < 8; k = k + 1) {
+        var j = (xb + (k << 2)) | 0
+        var x0 = x[j]
+        var x1 = x[(j + 1) | 0]
+        var x2 = x[(j + 2) | 0]
+        var x3 = x[(j + 3) | 0]
+        var q
+        q = I32[(p0 + qo + k) | 0] >> sh
+        s0 = s0 + x0 * (kA * (q & 0xf) - mA)
+        s0 = s0 + x1 * (kA * ((q >>> 8) & 0xf) - mA)
+        s0 = s0 + x2 * (kA * ((q >>> 16) & 0xf) - mA)
+        s0 = s0 + x3 * (kA * ((q >>> 24) & 0xf) - mA)
+        q = I32[(p1 + qo + k) | 0] >> sh
+        s1 = s1 + x0 * (kB * (q & 0xf) - mB)
+        s1 = s1 + x1 * (kB * ((q >>> 8) & 0xf) - mB)
+        s1 = s1 + x2 * (kB * ((q >>> 16) & 0xf) - mB)
+        s1 = s1 + x3 * (kB * ((q >>> 24) & 0xf) - mB)
+      }
+      xb = xb + 32
+    }
+    p0 = p0 + 36
+    p1 = p1 + 36
+  }
+  out[i] = s0
+  out[i + 1] = s1
+}
+
+// Q5_K: like Q4_K plus the fifth bit of every quant (bit c of the 32 high-bit
+// bytes), merged into the four quants of a word before they are extracted.
+function matmulQ5_KRows(out, x, qw, i) {
+  var I32 = qw.deqView
+  var nb = qw.cols >> 8
+  var rowWords = qw.rowSize >> 2
+  var p0 = (qw.base + i * rowWords) | 0
+  var p1 = (p0 + rowWords) | 0
+  var s0 = 0.0
+  var s1 = 0.0
+  var xb = 0
+  for (var b = 0; b < nb; b = b + 1) {
+    var hA = I32[p0]
+    var dA = fp16Table[hA & 0xffff]
+    var nA = fp16Table[hA >>> 16]
+    var uA = I32[(p0 + 1) | 0]
+    var vA = I32[(p0 + 2) | 0]
+    var wA = I32[(p0 + 3) | 0]
+    var hB = I32[p1]
+    var dB = fp16Table[hB & 0xffff]
+    var nB = fp16Table[hB >>> 16]
+    var uB = I32[(p1 + 1) | 0]
+    var vB = I32[(p1 + 2) | 0]
+    var wB = I32[(p1 + 3) | 0]
+    for (var c = 0; c < 8; c = c + 1) {
+      var sm
+      sm = kScaleMin(c, uA, vA, wA)
+      var kA = dA * (sm & 0xff)
+      var mA = nA * (sm >>> 8)
+      sm = kScaleMin(c, uB, vB, wB)
+      var kB = dB * (sm & 0xff)
+      var mB = nB * (sm >>> 8)
+      var sh = (c & 1) << 2
+      var qo = (12 + ((c >> 1) << 3)) | 0
+      for (var k = 0; k < 8; k = k + 1) {
+        var j = (xb + (k << 2)) | 0
+        var x0 = x[j]
+        var x1 = x[(j + 1) | 0]
+        var x2 = x[(j + 2) | 0]
+        var x3 = x[(j + 3) | 0]
+        var q
+        q =
+          ((I32[(p0 + qo + k) | 0] >> sh) & 0x0f0f0f0f) |
+          (((I32[(p0 + 4 + k) | 0] >> c) & 0x01010101) << 4)
+        s0 = s0 + x0 * (kA * (q & 0xff) - mA)
+        s0 = s0 + x1 * (kA * ((q >>> 8) & 0xff) - mA)
+        s0 = s0 + x2 * (kA * ((q >>> 16) & 0xff) - mA)
+        s0 = s0 + x3 * (kA * (q >>> 24) - mA)
+        q =
+          ((I32[(p1 + qo + k) | 0] >> sh) & 0x0f0f0f0f) |
+          (((I32[(p1 + 4 + k) | 0] >> c) & 0x01010101) << 4)
+        s1 = s1 + x0 * (kB * (q & 0xff) - mB)
+        s1 = s1 + x1 * (kB * ((q >>> 8) & 0xff) - mB)
+        s1 = s1 + x2 * (kB * ((q >>> 16) & 0xff) - mB)
+        s1 = s1 + x3 * (kB * (q >>> 24) - mB)
+      }
+      xb = xb + 32
+    }
+    p0 = p0 + 44
+    p1 = p1 + 44
+  }
+  out[i] = s0
+  out[i + 1] = s1
+}
+
+// Q3_K / Q6_K: 16 groups of 16 columns per block (group t: half h = t >> 3,
+// position g = (t >> 1) & 3, scale number t), 4 quants per DataView load (the
+// blocks are only 2-byte aligned): low bits merged with high bits (Q6_K: ql
+// nibbles + 2 qh bits; Q3_K: 2 qs bits + 1 mask bit).
+function matmulK16Rows(out, x, qw, i) {
+  var U16 = qw.deqView
+  var DV = rowsDataView
+  var sc = q3kScales
+  var q6 = qw.type === GGML_TYPE.Q6_K
+  var blockWords = q6 ? 105 : 55
+  var loMask = q6 ? 0x0f0f0f0f : 0x03030303
+  var hiMask = q6 ? 0x03030303 : 0x01010101
+  var hiUp = q6 ? 4 : 2
+  var bias = q6 ? 32 : 4
+  var scBias = q6 ? 0 : 32
+  var nb = qw.cols >> 8
+  var rowWords = qw.rowSize >> 1
+  // r: 16-bit word index of each row's block inside the matrix (what the
+  // DataView covers); vb: matrix start in the Uint16 view
+  var vb = qw.base
+  var r0 = i * rowWords
+  var r1 = r0 + rowWords
+  var s0 = 0.0
+  var s1 = 0.0
+  var xb = 0
+  for (var b = 0; b < nb; b = b + 1) {
+    var dA = fp16Table[U16[(vb + r0 + blockWords - 1) | 0]]
+    var dB = fp16Table[U16[(vb + r1 + blockWords - 1) | 0]]
+    if (q6) {
+      // 16 int8 scales in the 8 words before d
+      for (var t = 0; t < 8; t = t + 1) {
+        var w
+        w = U16[(vb + r0 + 96 + t) | 0]
+        sc[(0 << 4) + (t << 1)] = w
+        sc[(0 << 4) + (t << 1) + 1] = w >> 8
+        w = U16[(vb + r1 + 96 + t) | 0]
+        sc[(1 << 4) + (t << 1)] = w
+        sc[(1 << 4) + (t << 1) + 1] = w >> 8
+      }
+    } else {
+      q3kUnpackScales(U16, (vb + r0) | 0, 0 << 4)
+      q3kUnpackScales(U16, (vb + r1) | 0, 1 << 4)
+    }
+    for (var t = 0; t < 16; t = t + 1) {
+      var eA = dA * (sc[(0 << 4) + t] - scBias)
+      var eB = dB * (sc[(1 << 4) + t] - scBias)
+      var h = t >> 3
+      var g = (t >> 1) & 3
+      var ss = (t & 1) << 3
+      // Word offsets inside the block and bit shifts of the low / high bits
+      var lo = (16 + (h << 4) + ss) | 0
+      var ho = ss
+      var loShift = g << 1
+      var hiShift = (h << 2) + g
+      if (q6) {
+        lo = ((h << 5) + ((g & 1) << 4) + ss) | 0
+        ho = (64 + (h << 4) + ss) | 0
+        loShift = (g >> 1) << 2
+        hiShift = g << 1
+      }
+      for (var k = 0; k < 8; k = k + 2) {
+        var j = (xb + (k << 1)) | 0
+        var x0 = x[j]
+        var x1 = x[(j + 1) | 0]
+        var x2 = x[(j + 2) | 0]
+        var x3 = x[(j + 3) | 0]
+        var q
+        q =
+          ((DV.getInt32(((r0 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32(((r0 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s0 = s0 + x0 * (eA * ((q & 0xff) - bias))
+        s0 = s0 + x1 * (eA * (((q >>> 8) & 0xff) - bias))
+        s0 = s0 + x2 * (eA * (((q >>> 16) & 0xff) - bias))
+        s0 = s0 + x3 * (eA * ((q >>> 24) - bias))
+        q =
+          ((DV.getInt32(((r1 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32(((r1 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s1 = s1 + x0 * (eB * ((q & 0xff) - bias))
+        s1 = s1 + x1 * (eB * (((q >>> 8) & 0xff) - bias))
+        s1 = s1 + x2 * (eB * (((q >>> 16) & 0xff) - bias))
+        s1 = s1 + x3 * (eB * ((q >>> 24) - bias))
+      }
+      xb = xb + 16
+    }
+    r0 = r0 + blockWords
+    r1 = r1 + blockWords
+  }
+  out[i] = s0
+  out[i + 1] = s1
+}
+
+// DataView of the matrix being multiplied (Q3_K / Q6_K, see matmulRows)
+var rowsDataView = null
+
+// Single-token matmul through a fused kernel, 2 rows per call; the rows left
+// over go through the generic kernel below.
+function matmulRows(out, x, qw) {
+  var rowsFunc = qw.rowsFunc
+  var rowsN = qw.rows & ~1
+  if (qw.deqView.BYTES_PER_ELEMENT === 2) {
+    // Q3_K / Q6_K kernels read 4 bytes at a time through a DataView that only
+    // lives during the call
+    rowsDataView = new DataView(ggufData, qw.dataOffset, qw.rows * qw.rowSize)
+  }
+  for (var i = 0; i < rowsN; i = i + 2) {
+    rowsFunc(out, x, qw, i)
+  }
+  rowsDataView = null
+  if (rowsN < qw.rows) {
+    matmulKQuantLocal(out, x, qw, rowsN)
+  }
+}
+
+// K-quant matmul: dequantize 4 rows into a scratch buffer, then flat dot
+// product, from startRow on. Scratch: matmulDeqBuf during prefill, else an idle
+// buffer (logits while running the layers, hb while computing the logits),
+// fewer rows per pass if it is small.
+function matmulKQuantLocal(out, x, qw, startRow) {
   var rows = qw.rows
   var cols = qw.cols
   var rowSize = qw.rowSize
   var deqFunc = qw.deqRowFunc
   var buf = matmulDeqBuf
-  var rows4 = rows & ~3
+  var rows4 = startRow + ((rows - startRow) & ~3)
   if (buf === null) {
     buf = out === state.logits ? state.hb64 : state.logits64
     if (buf === null || buf.length < cols) {
@@ -3155,19 +3040,22 @@ function matmulKQuantLocal(out, x, qw) {
       buf = state.kqRowScratch
     }
     if (buf.length < 4 * cols) {
-      rows4 = 0
+      rows4 = startRow
     }
   }
   var off1 = cols
   var off2 = cols + cols
   var off3 = off2 + cols
   var view = qw.deqView
-  for (var i = 0; i < rows4; i = i + 4) {
-    var bo = i * rowSize
-    deqFunc(view, bo, buf, 0, cols)
-    deqFunc(view, bo + rowSize, buf, off1, cols)
-    deqFunc(view, bo + rowSize + rowSize, buf, off2, cols)
-    deqFunc(view, bo + rowSize + rowSize + rowSize, buf, off3, cols)
+  // Row length and position in elements of the view
+  var rowEl = rowSize / view.BYTES_PER_ELEMENT
+  var base = qw.base
+  for (var i = startRow; i < rows4; i = i + 4) {
+    var p = base + i * rowEl
+    deqFunc(view, p, buf, 0, cols)
+    deqFunc(view, p + rowEl, buf, off1, cols)
+    deqFunc(view, p + rowEl + rowEl, buf, off2, cols)
+    deqFunc(view, p + rowEl + rowEl + rowEl, buf, off3, cols)
     var s0 = 0.0
     var s1 = 0.0
     var s2 = 0.0
@@ -3185,7 +3073,7 @@ function matmulKQuantLocal(out, x, qw) {
     out[i + 3] = s3
   }
   for (var i = rows4; i < rows; i = i + 1) {
-    deqFunc(view, i * rowSize, buf, 0, cols)
+    deqFunc(view, base + i * rowEl, buf, 0, cols)
     var s = 0.0
     for (var j = 0; j < cols; j = j + 1) {
       s = s + x[j] * buf[j]
@@ -3194,12 +3082,10 @@ function matmulKQuantLocal(out, x, qw) {
   }
 }
 
-// K-quant batch matmul (prefill): dequantize 4 rows into the row views of
-// matmulDeqBuf, then a 4-row x 3-token one-column-per-step tile per group of
-// tokens (kQuantTile; a short last group reuses its last token for the missing
-// lanes and stores only the real ones). Same column-order sums as before, so
-// results are bit-identical; keeping the tile in its own small function keeps
-// V8's compiled code for it small.
+// K-quant / F16 / BF16 / F32 batch matmul (prefill): dequantize 4 rows into the
+// row views of matmulDeqBuf, then a 4-row x 3-token tile per group of tokens (a
+// short last group reuses its last token for the missing lanes); every sum runs
+// over the columns left to right.
 function kQuantTile(outs, xs, bt, nTok, i, cols) {
   var buf0 = matmulDeqRows[0]
   var buf1 = matmulDeqRows[1]
@@ -3273,12 +3159,15 @@ function matmulKQuantLocalBatch(outs, xs, qw, batchSize) {
   var buf2 = matmulDeqRows[2]
   var buf3 = matmulDeqRows[3]
   var view = qw.deqView
+  // Row length and position in elements of the view
+  var rowEl = rowSize / view.BYTES_PER_ELEMENT
+  var base = qw.base
   for (var i = 0; i < rows4; i = i + 4) {
-    var bo = i * rowSize
-    deqFunc(view, bo, buf0, 0, cols)
-    deqFunc(view, bo + rowSize, buf1, 0, cols)
-    deqFunc(view, bo + rowSize + rowSize, buf2, 0, cols)
-    deqFunc(view, bo + rowSize + rowSize + rowSize, buf3, 0, cols)
+    var p = base + i * rowEl
+    deqFunc(view, p, buf0, 0, cols)
+    deqFunc(view, p + rowEl, buf1, 0, cols)
+    deqFunc(view, p + rowEl + rowEl, buf2, 0, cols)
+    deqFunc(view, p + rowEl + rowEl + rowEl, buf3, 0, cols)
     for (var bt = 0; bt < batchSize; bt = bt + 3) {
       var nTok = batchSize - bt
       if (nTok > 3) {
@@ -3289,7 +3178,7 @@ function matmulKQuantLocalBatch(outs, xs, qw, batchSize) {
   }
   // Remaining 1-3 rows
   for (var i = rows4; i < rows; i = i + 1) {
-    deqFunc(view, i * rowSize, buf0, 0, cols)
+    deqFunc(view, base + i * rowEl, buf0, 0, cols)
     for (var bt = 0; bt < batchSize; bt = bt + 1) {
       var xArr = xs[bt]
       var s = 0.0
@@ -3466,8 +3355,7 @@ function accum(a, b, size) {
 // ----------------------------------------------------------------------------
 // GGUF parsing
 
-// Metadata keys confirmed unused by the engine. Skipping them avoids decoding
-// large string arrays (e.g. tokenizer.ggml.merges has ~280K strings in Llama models).
+// Metadata keys unused by the engine (skipped without decoding)
 var SKIP_METADATA_KEYS = {
   "tokenizer.ggml.merges": true,
   "tokenizer.ggml.pre": true,
@@ -3500,14 +3388,43 @@ var SKIP_METADATA_KEYS = {
   "general.size_label": true,
 }
 
-// Advance offset past a value without building any JS objects.
-// Used for metadata keys that the engine doesn't read.
+// Advance offset past n GGUF strings without decoding them and return the
+// longest one; 4 strings per iteration keeps JavaScriptCore from bringing up
+// its top compiler tier during the load.
+function skipStrings(n) {
+  var dv = dataView
+  var p = offset
+  var slen = 0
+  var maxLen = 0
+  var n4 = n & ~3
+  for (var i = 0; i < n4; i = i + 4) {
+    slen = dv.getUint32(p, true)
+    maxLen = slen > maxLen ? slen : maxLen
+    p = p + 8 + slen
+    slen = dv.getUint32(p, true)
+    maxLen = slen > maxLen ? slen : maxLen
+    p = p + 8 + slen
+    slen = dv.getUint32(p, true)
+    maxLen = slen > maxLen ? slen : maxLen
+    p = p + 8 + slen
+    slen = dv.getUint32(p, true)
+    maxLen = slen > maxLen ? slen : maxLen
+    p = p + 8 + slen
+  }
+  for (var i = n4; i < n; i = i + 1) {
+    slen = dv.getUint32(p, true)
+    maxLen = slen > maxLen ? slen : maxLen
+    p = p + 8 + slen
+  }
+  offset = p
+  return maxLen
+}
+
+// Advance offset past a value without building any JS objects
 function skipGGUFValue(type) {
   var arrType
   var arrLen
   var slen
-  var u8
-  var i
   switch (type) {
     case GGUF_TYPE.UINT8:
     case GGUF_TYPE.INT8:
@@ -3561,16 +3478,7 @@ function skipGGUFValue(type) {
       ) {
         offset = offset + arrLen * 8
       } else if (arrType === GGUF_TYPE.STRING) {
-        // Scan through variable-length strings without decoding them
-        u8 = ggufUint8
-        for (i = 0; i < arrLen; i = i + 1) {
-          slen =
-            u8[offset] |
-            (u8[offset + 1] << 8) |
-            (u8[offset + 2] << 16) |
-            (u8[offset + 3] << 24)
-          offset = offset + 8 + slen
-        }
+        skipStrings(arrLen)
       }
       break
   }
@@ -3645,6 +3553,20 @@ function parseGGUF(arrayBuffer) {
   }
 }
 
+// The token strings of the vocabulary stay in the file: this only notes where
+// the array starts and its longest string (the per-token tables are built by
+// ensureVocabTables on the first use)
+function readStringRefs(arrLen) {
+  var start = offset
+  var maxLen = skipStrings(arrLen)
+  return {
+    __stringRefs: true,
+    vocabOffset: start,
+    vocabCount: arrLen,
+    vocabMaxLen: maxLen,
+  }
+}
+
 function readGGUFValue(type) {
   switch (type) {
     case GGUF_TYPE.UINT8:
@@ -3699,35 +3621,7 @@ function readGGUFValue(type) {
         return arr
       }
       if (arrType === GGUF_TYPE.STRING) {
-        // Storing full cumulative offsets as Uint32Array[N+1] costs ~1 MB on a
-        // 262k-token vocab. Token byte lengths stay small (Gemma <=48, Llama
-        // <=256) so we keep Uint16 lengths + a sparse cumulative-offset
-        // checkpoint every SPARSE_STEP entries. Random access reconstructs
-        // the absolute offset by adding at most SPARSE_STEP-1 byte lengths
-        // from the nearest checkpoint - O(SPARSE_STEP) worst-case for
-        // vocabString (called only during token decode, a handful of times
-        // per generate), O(1) amortized when iterating sequentially.
-        var SPARSE_STEP = 256
-        var lengths = new Uint16Array(arrLen)
-        var sparseCum = new Uint32Array(((arrLen - 1) >> 8) + 1)
-        var u8 = ggufUint8
-        var p = offset
-        for (var i = 0; i < arrLen; i = i + 1) {
-          var slen = u8[p] | (u8[p + 1] << 8) | (u8[p + 2] << 16) | (u8[p + 3] << 24)
-          p = p + 8
-          if ((i & (SPARSE_STEP - 1)) === 0) {
-            sparseCum[i >> 8] = p
-          }
-          lengths[i] = slen
-          p = p + slen
-        }
-        offset = p
-        return {
-          __stringRefs: true,
-          vocabLengths: lengths,
-          vocabSparseCum: sparseCum,
-          vocabSparseStep: SPARSE_STEP,
-        }
+        return readStringRefs(arrLen)
       }
       var arr = new Array(arrLen)
       for (var i = 0; i < arrLen; i = i + 1) {
@@ -3744,10 +3638,9 @@ function readGGUFValue(type) {
 
 function loadModel(arrayBuffer) {
   // Reset vocab cache when loading a new model
-  trieNodeId = null
-  trieChildStart = null
-  trieEdgeChar = null
-  trieEdgeTarget = null
+  vocabHashHead = null
+  vocabHashNext = null
+  genScratch = null
 
   // Initialize cached buffer views for fast matmul access
   ggufUint8 = new Uint8Array(arrayBuffer)
@@ -3807,19 +3700,13 @@ function loadModel(arrayBuffer) {
   }
 
   var vocabRefs = meta["tokenizer.ggml.tokens"]
-  var vocabLengths
-  var vocabSparseCum
-  var vocabSparseStep = 256
-  var vocabSize
+  var vocabSize = 0
+  var vocabOffset = 0
+  var vocabMaxLen = 0
   if (vocabRefs && vocabRefs.__stringRefs) {
-    vocabLengths = vocabRefs.vocabLengths
-    vocabSparseCum = vocabRefs.vocabSparseCum
-    vocabSparseStep = vocabRefs.vocabSparseStep
-    vocabSize = vocabLengths.length
-  } else {
-    vocabLengths = new Uint16Array(0)
-    vocabSparseCum = new Uint32Array(1)
-    vocabSize = 0
+    vocabSize = vocabRefs.vocabCount
+    vocabOffset = vocabRefs.vocabOffset
+    vocabMaxLen = vocabRefs.vocabMaxLen
   }
 
   if (vocabSize > 0) {
@@ -3827,28 +3714,19 @@ function loadModel(arrayBuffer) {
   }
 
   tokenizer = {
-    vocabLengths: vocabLengths,
-    vocabSparseCum: vocabSparseCum,
-    vocabSparseStep: vocabSparseStep,
+    // Where the token strings start in the file and the longest one; the
+    // per-token tables and the end-of-turn token come from ensureVocabTables()
+    // on the first generate() call
+    vocabOffset: vocabOffset,
+    vocabMaxLen: vocabMaxLen,
+    vocabLengths: null,
+    vocabSparseCum: null,
     vocabSize: vocabSize,
     bosToken: meta["tokenizer.ggml.bos_token_id"] || 1,
     eosToken: meta["tokenizer.ggml.eos_token_id"] || 2,
     eotToken: -1,
-  }
-
-  // Look up model-specific end tokens once at init time
-  if (config.isGemma) {
-    var endTurn = findSpecialToken("<end_of_turn>")
-    if (endTurn < 0) {
-      endTurn = 107
-    }
-    tokenizer.eotToken = endTurn
-  } else {
-    var eot = findSpecialToken("<|eot_id|>")
-    if (eot < 0) {
-      eot = 128009
-    }
-    tokenizer.eotToken = eot
+    // Ids of the special tokens looked up so far (findSpecialToken)
+    specialTokens: {},
   }
 
   postMessage({ type: "progress", message: "Loading weights..." })
@@ -3869,6 +3747,8 @@ function loadWeights(gguf) {
   var baseOffset = gguf.tensorDataOffset
   var w = {}
   w.hasKQuant = false
+  // Some layer matrix goes through the Q8_0 Int32 kernels (see generate)
+  w.q8Layers = false
 
   // Load tensor as dequantized float (for small tensors like norms and embeddings)
   function loadTensorFloat(name) {
@@ -3877,72 +3757,107 @@ function loadWeights(gguf) {
       return null
     }
     var off = baseOffset + t.offset
-    // Fast path: an F32 tensor stored at a 4-byte-aligned offset in the GGUF
-    // buffer can be exposed as a zero-copy Float32Array view. Gemma and Llama
-    // norms are F32 and align to the 32-byte GGUF tensor alignment, so this
-    // eliminates the per-layer 1152-float copy (~520 KB total on gemma-3-1b)
-    // while behaving identically to the dequantized path for readers.
+    // Aligned F32 tensor (every norm): zero-copy view
     if (t.type === GGML_TYPE.F32 && (off & 3) === 0) {
       return new Float32Array(ggufData, off, t.nElements)
     }
     return dequantizeTensor(off, t.nElements, t.type)
   }
 
+  // View a matrix is read through (kind 0: Int32Array, 1: Uint16Array, 2:
+  // Float32Array): one shared view per kind over the whole file, the matrix
+  // position in elements in `base`; files too big for int32 indices get a view
+  // per matrix.
+  var sharedViews = [null, null, null]
+  function matrixView(rec, off, totalBytes, kind) {
+    var Ctor = kind === 0 ? Int32Array : kind === 1 ? Uint16Array : Float32Array
+    var elemBytes = Ctor.BYTES_PER_ELEMENT
+    if (ggufData.byteLength / elemBytes >= 2147483648) {
+      return new Ctor(ggufData, off, totalBytes / elemBytes)
+    }
+    rec.base = (off / elemBytes) | 0
+    if (sharedViews[kind] === null) {
+      sharedViews[kind] = new Ctor(
+        ggufData,
+        0,
+        Math.floor(ggufData.byteLength / elemBytes)
+      )
+    }
+    return sharedViews[kind]
+  }
+
+  // Kernels of the tensor types, looked up once per type
+  var typeKernels = []
+
   // Load tensor keeping it quantized (for large weight matrices)
-  // Returns a QuantizedTensor object with pre-computed rowSize and dotFunc
+  // Returns a QuantizedTensor object with pre-computed rowSize and kernels
   function loadTensorQuantized(name, rows, cols) {
     var t = tensors[name]
     if (!t) {
       return null
     }
-    var rs = getRowSize(cols, t.type)
+    var type = t.type
+    var kernels = typeKernels[type]
+    if (!kernels) {
+      kernels = {
+        deqRowFunc: getDeqRowFunc(type),
+        unpackRowFunc: getUnpackRowFunc(type),
+        rowsFunc: getRowsFunc(type),
+      }
+      typeKernels[type] = kernels
+    }
+    var rs = getRowSize(cols, type)
     var off = baseOffset + t.offset
     var totalBytes = rows * rs
     var result = {
       dataOffset: off,
-      type: t.type,
+      type: type,
       rows: rows,
       cols: cols,
       rowSize: rs,
-      dotFunc: getVecDotFunc(t.type),
-      dotQ8Func: getVecDotQ8Func(t.type),
-      deqRowFunc: getDeqRowFunc(t.type),
-      unpackRowFunc: getUnpackRowFunc(t.type),
-      dotQ8RowsFunc: getDotQ8RowsFunc(t.type),
-      // Views over this matrix (indices relative to it, so any model size
-      // works): Q8_0 kernels read Int32 words, the block-32 formats with Q8
-      // activations read Uint16 words, the K-quant dequantizers read Int32
-      // (Q2_K/Q4_K/Q5_K) or Uint16 (Q3_K/Q6_K) words.
+      deqRowFunc: kernels.deqRowFunc,
+      unpackRowFunc: kernels.unpackRowFunc,
+      rowsFunc: kernels.rowsFunc,
+      // Views the matrix is read through (Int32: Q8_0 kernels, Uint16: block-32
+      // kernels, deqView: row dequantizers) and its position in them
       localI32: null,
       localU16: null,
       deqView: null,
+      base: 0,
     }
-    if (result.deqRowFunc) {
+    if (type === GGML_TYPE.Q8_0) {
+      // Rows with an odd number of blocks keep the byte-wise kernel
+      if (((off | rs) & 3) === 0) {
+        result.localI32 = matrixView(result, off, totalBytes, 0)
+      }
+      return result
+    }
+    // The other formats are read through 16/32-bit words, the block-32 ones
+    // 4 rows at a time. GGUF aligns tensor data to 32 bytes, so this only
+    // rejects a corrupt file or a shape no model has.
+    var block32 = result.unpackRowFunc !== null
+    var halfFloat =
+      type === GGML_TYPE.F16 || type === GGML_TYPE.BF16 || type === 30
+    if (
+      (off & 3) !== 0 ||
+      (block32 ? (rows & 3) !== 0 : result.deqRowFunc === null) ||
+      (halfFloat && (cols & 1) !== 0)
+    ) {
+      throw new Error("Unsupported tensor layout: " + name)
+    }
+    if (block32) {
+      result.localU16 = matrixView(result, off, totalBytes, 1)
+    } else {
       w.hasKQuant = true
-      result.deqView = makeDeqView(t.type, off, totalBytes, name)
-    }
-    if (t.type === GGML_TYPE.Q8_0 && (off & 3) === 0 && (rs & 3) === 0) {
-      result.localI32 = new Int32Array(ggufData, off, totalBytes >> 2)
-    }
-    if (result.dotQ8RowsFunc !== null && (off & 1) === 0) {
-      result.localU16 = new Uint16Array(ggufData, off, totalBytes >> 1)
+      var kind = 0
+      if (type === GGML_TYPE.Q3_K || type === GGML_TYPE.Q6_K) {
+        kind = 1
+      } else if (type === GGML_TYPE.F32) {
+        kind = 2
+      }
+      result.deqView = matrixView(result, off, totalBytes, kind)
     }
     return result
-  }
-
-  // View used by the K-quant row dequantizers of one matrix. GGUF aligns
-  // tensor data to 32 bytes, so the checks only guard against a corrupt file.
-  function makeDeqView(type, off, totalBytes, name) {
-    if (type === GGML_TYPE.Q3_K || type === GGML_TYPE.Q6_K) {
-      if ((off & 1) !== 0) {
-        throw new Error("Unaligned K-quant tensor: " + name)
-      }
-      return new Uint16Array(ggufData, off, totalBytes >> 1)
-    }
-    if ((off & 3) !== 0) {
-      throw new Error("Unaligned K-quant tensor: " + name)
-    }
-    return new Int32Array(ggufData, off, totalBytes >> 2)
   }
 
   function loadLayerTensorFloat(layer, suffix) {
@@ -3952,7 +3867,11 @@ function loadWeights(gguf) {
 
   function loadLayerTensorQuantized(layer, suffix, rows, cols) {
     var name = "blk." + layer + "." + suffix
-    return loadTensorQuantized(name, rows, cols)
+    var result = loadTensorQuantized(name, rows, cols)
+    if (result !== null && result.localI32 !== null) {
+      w.q8Layers = true
+    }
+    return result
   }
 
   var headSize = config.headDim
@@ -3961,34 +3880,17 @@ function loadWeights(gguf) {
 
   postMessage({ type: "progress", message: "Loading embeddings..." })
   // Token embeddings - keep quantized to save memory, dequantize on-demand
-  var embTensor = tensors["token_embd.weight"]
-  w.tokenEmbedding = {
-    dataOffset: baseOffset + embTensor.offset,
-    type: embTensor.type,
-    rows: config.vocabSize,
-    cols: config.dim,
-    rowSize: getRowSize(config.dim, embTensor.type),
-    deqRowFunc: getDeqRowFunc(embTensor.type),
-    deqView: null,
-  }
-  if (w.tokenEmbedding.deqRowFunc) {
-    w.tokenEmbedding.deqView = makeDeqView(
-      embTensor.type,
-      w.tokenEmbedding.dataOffset,
-      config.vocabSize * w.tokenEmbedding.rowSize,
-      "token_embd.weight"
-    )
-  }
+  w.tokenEmbedding = loadTensorQuantized(
+    "token_embd.weight",
+    config.vocabSize,
+    config.dim
+  )
 
   // Use per-layer arrays
   w.layers = []
 
-  for (var l = 0; l < config.nLayers; l = l + 1) {
-    postMessage({
-      type: "progress",
-      message: "Loading layer " + (l + 1) + "/" + config.nLayers + "...",
-    })
-
+  // Tensors of one layer (kept out of the loop below so the loop stays small)
+  function loadLayer(l) {
     var layer = {}
 
     // RMS norm weights - small, dequantize
@@ -4030,50 +3932,40 @@ function loadWeights(gguf) {
       layer.ffnPostNorm = loadLayerTensorFloat(l, "post_ffw_norm.weight")
     }
 
-    w.layers.push(layer)
+    return layer
+  }
+
+  for (var l = 0; l < config.nLayers; l = l + 1) {
+    postMessage({
+      type: "progress",
+      message: "Loading layer " + (l + 1) + "/" + config.nLayers + "...",
+    })
+
+    w.layers.push(loadLayer(l))
   }
 
   // Final norm - small, dequantize
   w.rmsFinalWeight = loadTensorFloat("output_norm.weight")
 
   // Output projection - may be tied to embeddings or separate
-  var outputTensor = tensors["output.weight"]
-  if (outputTensor) {
-    // Load as quantized tensor
+  if (tensors["output.weight"]) {
     w.wcls = loadTensorQuantized("output.weight", config.vocabSize, config.dim)
   } else {
-    // Use tied embeddings - reference the same quantized embedding tensor
-    var embOff = w.tokenEmbedding.dataOffset
-    var embRowSize = w.tokenEmbedding.rowSize
-    var embType = w.tokenEmbedding.type
-    w.wcls = {
-      dataOffset: embOff,
-      type: embType,
-      rows: config.vocabSize,
-      cols: config.dim,
-      rowSize: embRowSize,
-      dotFunc: getVecDotFunc(embType),
-      dotQ8Func: getVecDotQ8Func(embType),
-      deqRowFunc: getDeqRowFunc(embType),
-      unpackRowFunc: getUnpackRowFunc(embType),
-      dotQ8RowsFunc: getDotQ8RowsFunc(embType),
-      localI32: null,
-      localU16: null,
-      deqView: w.tokenEmbedding.deqView,
-    }
-    var embTotalBytes = config.vocabSize * embRowSize
-    if (w.wcls.deqRowFunc) {
-      w.hasKQuant = true
-    }
-    if (embType === GGML_TYPE.Q8_0 && (embOff & 3) === 0 && (embRowSize & 3) === 0) {
-      w.wcls.localI32 = new Int32Array(ggufData, embOff, embTotalBytes >> 2)
-    }
-    if (w.wcls.dotQ8RowsFunc !== null && (embOff & 1) === 0) {
-      w.wcls.localU16 = new Uint16Array(ggufData, embOff, embTotalBytes >> 1)
-    }
+    // Tied embeddings: the classifier is the embedding matrix itself
+    w.wcls = w.tokenEmbedding
   }
 
   return w
+}
+
+// RoPE frequencies of one head: 1 / theta^(2i / headSize)
+function ropeFrequencies(theta, headSize) {
+  var ropeSize = headSize / 2
+  var freqs = new Float32Array(ropeSize)
+  for (var i = 0; i < ropeSize; i = i + 1) {
+    freqs[i] = 1.0 / Math.pow(theta, (i * 2) / headSize)
+  }
+  return freqs
 }
 
 function createRunState(p) {
@@ -4082,60 +3974,22 @@ function createRunState(p) {
   var qDim = p.nHeads * headSize
   var maxDim = Math.max(p.dim, qDim)
 
-  // RoPE frequencies (ropeSize floats each). These depend only on the head
-  // geometry and rope theta, so they're computed once at load. We no longer
-  // pre-compute cos/sin for every position of the context window - that cost
-  // seqLen*ropeSize*4 bytes per table × 4 tables (~4 MB at seqLen=2048 for
-  // Gemma SWA), most of it never touched. Instead, cos/sin are filled just in
-  // time for the small set of positions actually processed in the current
-  // forward pass (1 position for single-token gen, up to PREFILL_BATCH_SIZE
-  // positions for prefill), into the ropeCosAll/ropeSinAll/... buffers below.
+  // RoPE frequencies (ropeSize floats each); cos/sin are filled per forward
+  // pass by fillRopeBuffers()
   var ropeSize = headSize / 2
-  var ropeFreqs = new Float32Array(ropeSize)
-  for (var i = 0; i < ropeSize; i = i + 1) {
-    ropeFreqs[i] = 1.0 / Math.pow(p.ropeTheta, (i * 2) / headSize)
-  }
-  var ropeSwaFreqs
+  var ropeFreqs = ropeFrequencies(p.ropeTheta, headSize)
+  var ropeSwaFreqs = ropeFreqs
   if (p.isGemma) {
-    var swaTheta = p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0
-    ropeSwaFreqs = new Float32Array(ropeSize)
-    for (var i = 0; i < ropeSize; i = i + 1) {
-      ropeSwaFreqs[i] = 1.0 / Math.pow(swaTheta, (i * 2) / headSize)
-    }
-  } else {
-    ropeSwaFreqs = ropeFreqs
+    ropeSwaFreqs = ropeFrequencies(
+      p.ropeThetaSwa > 0 ? p.ropeThetaSwa : 10000.0,
+      headSize
+    )
   }
 
-  // Scratch buffers for the current forward pass's cos/sin values. Indexed as
-  // [batchIdx * ropeSize + i] - batchIdx is 0 for single-token generation.
-  var ropeScratchSize = PREFILL_BATCH_SIZE * ropeSize
-  var ropeCosAll = new Float32Array(ropeScratchSize)
-  var ropeSinAll = new Float32Array(ropeScratchSize)
-  var ropeCosSwaAll
-  var ropeSinSwaAll
-  if (p.isGemma) {
-    ropeCosSwaAll = new Float32Array(ropeScratchSize)
-    ropeSinSwaAll = new Float32Array(ropeScratchSize)
-  } else {
-    ropeCosSwaAll = ropeCosAll
-    ropeSinSwaAll = ropeSinAll
-  }
-
-  // Q8_0 KV cache: 34 bytes per 32 floats
-  // Per-head layout: [layer][kv_head][position][head_data] for cache locality
-  //
-  // Capacity starts small and doubles via ensureKvCapacity() as generation
-  // advances (capped at seqLen). Most inference runs touch only a fraction of
-  // the configured seqLen - sizing for the full window up front wastes ~27 MB
-  // on gemma-3-1b with contextSize=2048 for a typical ~70-position chat turn.
-  // The initial cap trades a handful of doubling copies during prefill
-  // (each O(bytes-already-written), sub-millisecond) for lower sustained RAM.
+  // Q8_0 KV cache: 34 bytes per 32 floats, layout
+  // [layer][kv_head][position][head_data]. It starts empty and grows on demand
+  // (ensureKvCapacity) up to seqLen.
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
-  // Initial KV cache is empty - `ensureKvCapacity` allocates at the top of
-  // the first forward pass, which would happen anyway to cover the first
-  // prefill batch. Starting at capacity 0 removes the load-time KV alloc
-  // entirely (~430 KB on gemma-3-1b) without shifting any work onto the
-  // generation path (same grow that would happen on batch 1).
   var initialCap = 0
   var headSeqBytes = 0
   var kvCacheLayerBytes = 0
@@ -4151,46 +4005,28 @@ function createRunState(p) {
   xQ8Buf = null
   xQ8Int8Buf = null
 
-  // matmulDeqBuf (4 rows × maxCols Float64, ~216 KB) is used only by the
-  // batch-matmul path during prefill. Leave it null here and let
-  // ensureBatchBuffers allocate it alongside the other prefill scratch
-  // buffers; freeBatchBuffers releases it after prefill.
+  // Bytes of the generate() scratch: the largest of the hash table
+  // (buildVocabHash), the prefill batch buffers (ensureBatchBuffers) and
+  // the logits
+  var hashBuckets = 256
+  while (hashBuckets * 4 < p.vocabSize) {
+    hashBuckets = hashBuckets << 1
+  }
+  var batchTokenBytes =
+    (p.dim + maxDim + p.dim + qDim + kvDim + kvDim + p.hiddenDim + p.hiddenDim) * 4 +
+    ((xQ8Size + 7) & ~7)
+  var scratchBytes = Math.max(
+    (hashBuckets + p.vocabSize) * 4,
+    maxCols * 32 + PREFILL_BATCH_SIZE * batchTokenBytes,
+    p.vocabSize * 4
+  )
 
   // Q8_0 buffer for quantized Q heads (for Q8 attention scoring)
   var qQ8TotalBytes = p.nHeads * headBytesQ8
   var qQ8Buffer = new ArrayBuffer(qQ8TotalBytes)
 
-  // Pre-compute head offset tables to avoid repeated multiplication in attention loop
-  var kvMul = p.nHeads / p.nKvHeads
-  var headQOffsets = new Int32Array(p.nHeads)
-  var headKvIdx = new Int32Array(p.nHeads)
-  var headAttOffsets = new Int32Array(p.nHeads)
-  var headKvByteOffsets = new Int32Array(p.nHeads)
-  for (var h = 0; h < p.nHeads; h = h + 1) {
-    headQOffsets[h] = h * headSize
-    headKvIdx[h] = (h / kvMul) | 0
-    headAttOffsets[h] = h * p.seqLen
-    headKvByteOffsets[h] = ((h / kvMul) | 0) * headSeqBytes
-  }
-
-  // Pre-compute per-layer RoPE table references (avoid modulo check per layer)
-  var ropeCosLayer = new Array(p.nLayers)
-  var ropeSinLayer = new Array(p.nLayers)
-  for (var l = 0; l < p.nLayers; l = l + 1) {
-    var isSwa = p.swaPattern > 0 && l % p.swaPattern < p.swaPattern - 1
-    if (p.isGemma && isSwa) {
-      ropeCosLayer[l] = ropeCosSwaAll
-      ropeSinLayer[l] = ropeSinSwaAll
-    } else {
-      ropeCosLayer[l] = ropeCosAll
-      ropeSinLayer[l] = ropeSinAll
-    }
-  }
-
-  // Batch buffers for prefill are allocated lazily on first prefill call (via
-  // ensureBatchBuffers). For sessions that never prefill more than a single
-  // token at a time this saves ~2.5 MB permanently. Placeholders are left as
-  // empty arrays so the state shape stays stable.
+  // Prefill batch buffers: allocated on first prefill (ensureBatchBuffers),
+  // these arrays are the placeholders
   var batchX = new Array(PREFILL_BATCH_SIZE)
   var batchXb = new Array(PREFILL_BATCH_SIZE)
   var batchXb2 = new Array(PREFILL_BATCH_SIZE)
@@ -4213,14 +4049,13 @@ function createRunState(p) {
     q: new Float32Array(qDim),
     k: new Float32Array(kvDim),
     v: new Float32Array(kvDim),
-    att: new Float32Array(p.nHeads * p.seqLen),
-    // logits is allocated lazily on first forward pass that needs it (see
-    // ensureLogits()). Saves 1 MB of zeroed arraybuf between load and
-    // generate for large vocabularies (Gemma: 262k × 4 B = 1 MB).
+    // Attention scores, nHeads x kvCapacity: (re)allocated by
+    // ensureKvCapacity together with the KV cache.
+    att: null,
+    // Allocated on the first forward pass that needs it (ensureLogits)
     logits: null,
     logits64: null,
-    // Float64 view over hb: idle scratch for a K-quant output matrix during
-    // generation (hb is dead once the last layer's FFN has finished).
+    // Float64 view over hb: idle scratch for a K-quant output matmul
     hb64: null,
     // Fallback one-row K-quant scratch, only if no idle buffer is wide enough.
     kqRowScratch: null,
@@ -4233,6 +4068,7 @@ function createRunState(p) {
     _batchXQ8Size: xQ8Size,
     _batchMatmulDeqCols: maxCols,
     _batchBuffersReady: false,
+    scratchBytes: scratchBytes,
     // Q8_0 KV cache - Uint8 view for reading FP16 scale
     keyCache: new Uint8Array(keyCacheBuffer),
     valueCache: new Uint8Array(valueCacheBuffer),
@@ -4244,27 +4080,31 @@ function createRunState(p) {
     qQ8i8: new Int8Array(qQ8Buffer),
     // Cache layout info
     headSeqBytes: headSeqBytes,
-    // RoPE scratch buffers filled just-in-time by fillRopeBuffers(). Indexed
-    // as [batchIdx * ropeSize + i]. ropeCosAll === ropeCosSwaAll for non-Gemma.
-    ropeCosAll: ropeCosAll,
-    ropeSinAll: ropeSinAll,
-    ropeCosSwaAll: ropeCosSwaAll,
-    ropeSinSwaAll: ropeSinSwaAll,
+    // RoPE scratch filled by fillRopeBuffers(), [batchIdx * ropeSize + i];
+    // sized by setRopeSlots() (1 position, PREFILL_BATCH_SIZE during prefill).
+    // Non-Gemma: SwaAll === All.
+    ropeCosAll: null,
+    ropeSinAll: null,
+    ropeCosSwaAll: null,
+    ropeSinSwaAll: null,
     ropeFreqs: ropeFreqs,
     ropeSwaFreqs: ropeSwaFreqs,
     ropeSize: ropeSize,
-    // Per-layer RoPE table references (avoid modulo check per layer)
-    ropeCosLayer: ropeCosLayer,
-    ropeSinLayer: ropeSinLayer,
     // Cached constants to avoid recomputation in transformer
     headSize: headSize,
     kvDim: kvDim,
     qDim: qDim,
     kvMul: p.nHeads / p.nKvHeads,
-    // Q8_0 cache: layer size in bytes (nKvHeads * kvCapacity * headBytesQ8).
-    // Grows via ensureKvCapacity() as positions advance.
+    // Layer size in bytes of the Q8_0 cache (nKvHeads * kvCapacity *
+    // headBytesQ8)
     kvCacheLayerSize: kvCacheLayerBytes,
     kvCapacity: initialCap,
+    // Token of every cached position (kvTokens[0 .. kvCount - 1]); generate()
+    // keeps the positions whose tokens match the start of the next prompt.
+    kvTokens: new Int32Array(0),
+    kvCount: 0,
+    // How many of the leading positions were written by the batched prefill
+    kvBatch: 0,
     attnScale: 1.0 / Math.sqrt(headSize),
     embedScale: Math.sqrt(p.dim),
     // Cache config values to avoid property lookups in hot loops
@@ -4285,11 +4125,6 @@ function createRunState(p) {
     // Pre-allocated buffers for top-k sampling
     topKIndices: new Int32Array(topK),
     topKValues: new Float32Array(topK),
-    // Pre-computed head offset tables
-    headQOffsets: headQOffsets,
-    headKvIdx: headKvIdx,
-    headAttOffsets: headAttOffsets,
-    headKvByteOffsets: headKvByteOffsets,
     headBytesQ8: headBytesQ8,
     // Batch buffers for prefill
     batchX: batchX,
@@ -4304,15 +4139,28 @@ function createRunState(p) {
     batchQ8i8: batchQ8i8,
   }
   runState.hb64 = new Float64Array(hbBuf.buffer, 0, p.hiddenDim >> 1)
+  setRopeSlots(runState, 1)
   return runState
+}
+
+// (Re)allocate the RoPE cos/sin scratch for `slots` positions per forward pass
+function setRopeSlots(s, slots) {
+  var n = slots * s.ropeSize
+  s.ropeCosAll = new Float32Array(n)
+  s.ropeSinAll = new Float32Array(n)
+  if (s.isGemma) {
+    s.ropeCosSwaAll = new Float32Array(n)
+    s.ropeSinSwaAll = new Float32Array(n)
+  } else {
+    s.ropeCosSwaAll = s.ropeCosAll
+    s.ropeSinSwaAll = s.ropeSinAll
+  }
 }
 
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
-// Allocate the prefill batch buffers the first time prefill is called. For
-// single-token-only workloads (or before the first prefill) these 2.5 MB of
-// Float32/Uint8 arrays sit idle otherwise.
+// Allocate the prefill batch buffers (2.5 MB) on first prefill
 function ensureBatchBuffers(s) {
   if (s._batchBuffersReady) {
     return
@@ -4324,37 +4172,47 @@ function ensureBatchBuffers(s) {
   var kvDim = s._batchKvDim
   var hiddenDim = s._batchHiddenDim
   var xQ8Size = s._batchXQ8Size
-  for (var b = 0; b < n; b = b + 1) {
-    s.batchX[b] = new Float32Array(dim)
-    s.batchXb[b] = new Float32Array(maxDim)
-    s.batchXb2[b] = new Float32Array(dim)
-    s.batchQ[b] = new Float32Array(qDim)
-    s.batchK[b] = new Float32Array(kvDim)
-    s.batchV[b] = new Float32Array(kvDim)
-    s.batchHb[b] = new Float32Array(hiddenDim)
-    s.batchHb2[b] = new Float32Array(hiddenDim)
-    var bQ8Buf = new ArrayBuffer(xQ8Size)
-    s.batchQ8[b] = new Uint8Array(bQ8Buf)
-    s.batchQ8i8[b] = new Int8Array(bQ8Buf)
-  }
-  // matmulDeqBuf is a global read by the batch-matmul kernels; allocate it
-  // here since it's only needed during prefill.
   var deqCols = s._batchMatmulDeqCols
-  matmulDeqBuf = new Float64Array(4 * deqCols)
-  matmulDeqI8 = new Int8Array(matmulDeqBuf.buffer)
+  ensureGenScratch(s)
+  var buf = genScratch
+  // matmulDeqBuf is a global read by the batch-matmul kernels: the first
+  // 32 * deqCols bytes of the scratch, then one block per token
+  matmulDeqBuf = new Float64Array(buf, 0, 4 * deqCols)
+  matmulDeqI8 = new Int8Array(buf, 0, 32 * deqCols)
   matmulDeqRows = [
-    new Float64Array(matmulDeqBuf.buffer, 0, deqCols),
-    new Float64Array(matmulDeqBuf.buffer, deqCols * 8, deqCols),
-    new Float64Array(matmulDeqBuf.buffer, deqCols * 16, deqCols),
-    new Float64Array(matmulDeqBuf.buffer, deqCols * 24, deqCols),
+    new Float64Array(buf, 0, deqCols),
+    new Float64Array(buf, deqCols * 8, deqCols),
+    new Float64Array(buf, deqCols * 16, deqCols),
+    new Float64Array(buf, deqCols * 24, deqCols),
   ]
+  var off = deqCols * 32
+  for (var b = 0; b < n; b = b + 1) {
+    s.batchX[b] = new Float32Array(buf, off, dim)
+    off = off + dim * 4
+    s.batchXb[b] = new Float32Array(buf, off, maxDim)
+    off = off + maxDim * 4
+    s.batchXb2[b] = new Float32Array(buf, off, dim)
+    off = off + dim * 4
+    s.batchQ[b] = new Float32Array(buf, off, qDim)
+    off = off + qDim * 4
+    s.batchK[b] = new Float32Array(buf, off, kvDim)
+    off = off + kvDim * 4
+    s.batchV[b] = new Float32Array(buf, off, kvDim)
+    off = off + kvDim * 4
+    s.batchHb[b] = new Float32Array(buf, off, hiddenDim)
+    off = off + hiddenDim * 4
+    s.batchHb2[b] = new Float32Array(buf, off, hiddenDim)
+    off = off + hiddenDim * 4
+    s.batchQ8[b] = new Uint8Array(buf, off, xQ8Size)
+    s.batchQ8i8[b] = new Int8Array(buf, off, xQ8Size)
+    off = off + ((xQ8Size + 7) & ~7)
+  }
+  setRopeSlots(s, PREFILL_BATCH_SIZE)
   s._batchBuffersReady = true
 }
 
-// Release the prefill batch buffers after a generate call finishes prefill.
-// Single-token generation doesn't read any of them, so they just sit until
-// the next generate reallocates via ensureBatchBuffers - tradeoff is a <1 ms
-// alloc cost per generate for 2.5 MB of RAM reclaimed between calls.
+// Release the prefill batch buffers once prefill is over (single-token
+// generation doesn't use them)
 function freeBatchBuffers(s) {
   if (!s._batchBuffersReady) {
     return
@@ -4375,28 +4233,31 @@ function freeBatchBuffers(s) {
   matmulDeqBuf = null
   matmulDeqRows = null
   matmulDeqI8 = null
+  setRopeSlots(s, 1)
   s._batchBuffersReady = false
 }
 
-// Allocate the vocabSize-sized logits buffer lazily on the first forward pass
-// that actually needs it. 1 MB for Gemma's 262k vocab.
+// Allocate the vocabSize-sized logits buffer on the first forward pass that
+// needs it
 function ensureLogits(s) {
   if (s.logits === null) {
-    s.logits = new Float32Array(s.vocabSize)
-    // Float64 view over the same bytes: idle scratch for K-quant matmuls
-    // while the layers run (the logits are only written at the very end).
-    s.logits64 = new Float64Array(s.logits.buffer, 0, s.vocabSize >> 1)
+    ensureGenScratch(s)
+    s.logits = new Float32Array(genScratch, 0, s.vocabSize)
+    // Float64 view over the same bytes: idle scratch for K-quant matmuls while
+    // the layers run
+    s.logits64 = new Float64Array(genScratch, 0, s.vocabSize >> 1)
   }
 }
 
-// Grow the KV cache buffers in place when the next forward pass would index
-// past the currently-allocated capacity. Doubles capacity each grow (capped
-// at seqLen). We copy each [layer][kv_head] head-slice to its new, wider
-// position in the rebuilt buffer so written-to-date positions stay intact;
-// new positions are left zero-initialized. Called from the top of each
-// transformer* function before any cache reads/writes, so in-function cached
-// references like `var keyCache = s.keyCache` remain valid for the duration
-// of the pass.
+function ensureGenScratch(s) {
+  if (genScratch === null) {
+    genScratch = new ArrayBuffer(s.scratchBytes)
+  }
+}
+
+// Grow the KV cache (doubling, capped at seqLen) when the next forward pass
+// needs positions past its capacity; the positions written so far are copied to
+// their place in the new buffer.
 function ensureKvCapacity(s, needed) {
   var cap = s.kvCapacity
   if (needed <= cap) {
@@ -4446,22 +4307,16 @@ function ensureKvCapacity(s, needed) {
   s.headSeqBytes = newHeadSeq
   s.kvCacheLayerSize = newLayerBytes
   s.kvCapacity = newCap
-
-  // Rebuild per-head byte-offset table (headSeqBytes changed)
-  var hk = s.headKvByteOffsets
-  var kvMul = s.kvMul
-  for (var h = 0; h < s.nHeads; h = h + 1) {
-    hk[h] = ((h / kvMul) | 0) * newHeadSeq
-  }
+  var newTokens = new Int32Array(newCap)
+  newTokens.set(s.kvTokens)
+  s.kvTokens = newTokens
+  // Scores of one position against every cached position (plain scratch,
+  // nothing to carry over)
+  s.att = new Float32Array(s.nHeads * newCap)
 }
 
-// Fill the RoPE cos/sin scratch buffers for a contiguous block of positions
-// starting at `startPos`, length `batchSize`. Writes into s.ropeCos/SinAll
-// (and the SWA variants for Gemma). Indexed as [b * ropeSize + i] where b is
-// the batch slot - hot loops read this with ropeBase = b * ropeSize. For
-// single-token generation, pass batchSize=1 and use ropeBase=0. The total
-// cos/sin call count per forward pass is just 2 * batchSize * ropeSize (×2
-// for Gemma SWA) - <0.1% of generation time vs the 4 MB table saved.
+// Fill the RoPE cos/sin scratch for batchSize positions starting at startPos,
+// indexed [b * ropeSize + i] (b: batch slot)
 function fillRopeBuffers(s, startPos, batchSize) {
   var ropeSize = s.ropeSize
   var freqs = s.ropeFreqs
@@ -4493,11 +4348,8 @@ function fillRopeBuffers(s, startPos, batchSize) {
 }
 
 // ----------------------------------------------------------------------------
-// Per-token element loops of the transformer, kept out of the transformer
-// functions on purpose: V8 compiles a separate on-stack-replacement version of
-// a function for each long-running loop it hits, so these loops living in
-// small functions keeps the compiled code of the big transformer functions
-// small. The arithmetic is exactly the one that used to be inline.
+// Per-token element loops of the transformer. They live in small functions so
+// the compiled code of the big transformer functions stays small.
 
 // SwiGLU gate: hb = silu(hb) * hb2 with silu(x) = 0.5 * x * (1 + tanh(x / 2))
 function siluGate(hbArr, hb2Arr, n) {
@@ -4617,17 +4469,16 @@ function zeroFloats(arr, n) {
   }
 }
 
-// GQA-batched attention with Q8 scoring for one layer and one position:
-// scores every Q head of a KV group against the cached keys (position-first
-// for cache locality), softmax per head over [startT, pos], then accumulates
-// the Q8 values into xbArr. Shared by the four transformer functions.
+// GQA-batched attention with Q8 scoring for one layer and position: every Q
+// head of a KV group against the cached keys, softmax per head over [startT,
+// pos], the Q8 values accumulated into xbArr.
 function attendQ8(s, loff, pos, startT, xbArr) {
   var nKvHeads = s.nKvHeads
   var kvMul = s.kvMul
   var headSeqBytes = s.headSeqBytes
   var headBytesQ8 = s.headBytesQ8
   var headSize = s.headSize
-  var seqLen = s.seqLen
+  var attStride = s.kvCapacity
   var sAtt = s.att
   var qQ8 = s.qQ8
   var qQ8i8 = s.qQ8i8
@@ -4643,7 +4494,7 @@ function attendQ8(s, loff, pos, startT, xbArr) {
       var kOff = kBase + t * headBytesQ8
       for (var mh = 0; mh < kvMul; mh = mh + 1) {
         var h = kvH * kvMul + mh
-        sAtt[h * seqLen + t] = dotQ8_0_Q8_0Cache(
+        sAtt[h * attStride + t] = dotQ8_0_Q8_0Cache(
           qQ8,
           qQ8i8,
           h * headBytesQ8,
@@ -4658,7 +4509,7 @@ function attendQ8(s, loff, pos, startT, xbArr) {
     // Softmax + value accumulation per Q head
     for (var mh = 0; mh < kvMul; mh = mh + 1) {
       var h = kvH * kvMul + mh
-      var attOffset = h * seqLen
+      var attOffset = h * attStride
 
       // Softmax
       var softmaxStart = attOffset + startT
@@ -4697,304 +4548,47 @@ function attendQ8(s, loff, pos, startT, xbArr) {
   }
 }
 
-// Llama-optimized transformer: fused attnScale in RoPE, SiLU via tanh,
-// per-head KV layout, Q8 attention, GQA batching, pre-quantized matmul
-function transformerLlama(token, pos, computeLogits) {
+// Single-token matmuls of two or three matrices over the same input: when all
+// of them take Q8_0 activations, x is quantized once for all.
+function matmulSameInput(x, cols, o1, q1, o2, q2, o3, q3) {
+  if (q1.unpackRowFunc && q2.unpackRowFunc && (q3 === null || q3.unpackRowFunc)) {
+    ensureXQ8Buf()
+    quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
+    matmulQuantizedPreQ8(o1, q1)
+    matmulQuantizedPreQ8(o2, q2)
+    if (q3 !== null) {
+      matmulQuantizedPreQ8(o3, q3)
+    }
+  } else {
+    matmulQuantized(o1, x, q1)
+    matmulQuantized(o2, x, q2)
+    if (q3 !== null) {
+      matmulQuantized(o3, x, q3)
+    }
+  }
+}
+
+// Gemma final logit soft-capping
+function softcapLogits(logits, n, cap) {
+  for (var i = 0; i < n; i = i + 1) {
+    logits[i] = cap * fastTanh(logits[i] / cap)
+  }
+}
+
+// Transformer forward pass, Llama and Gemma (per-head KV layout, Q8 attention,
+// GQA batching; Gemma adds QK norms, NEOX RoPE, sliding-window attention, GELU
+// and post-norms), in two shapes.
+// transformer: one token at position pos (generation and the last prompt
+// token), through the single-token kernels, plus the final norm and the logits.
+function transformer(token, pos, computeLogits) {
   var w = weights
   var s = state
-  ensureKvCapacity(s, pos + 1)
-  var dim = s.dim
-  var headSize = s.headSize
-  var kvDim = s.kvDim
-  var qDim = s.qDim
-  var hiddenDim = s.hiddenDim
-  var nLayers = s.nLayers
-  var nKvHeads = s.nKvHeads
-  var invDim = s.invDim
-  var kvMul = s.kvMul
-  var headBytesQ8 = s.headBytesQ8
-  var headSeqBytes = s.headSeqBytes
-  var attnScale = s.attnScale
-  var seqLen = s.seqLen
-
-  var xArr = s.x
-  var xbArr = s.xb
-  var xb2Arr = s.xb2
-  var qArr = s.q
-  var kArr = s.k
-  var vArr = s.v
-  var sAtt = s.att
-  var keyCache = s.keyCache
-  var valueCache = s.valueCache
-  var keyCacheInt8 = s.keyCacheInt8
-  var valueCacheInt8 = s.valueCacheInt8
-  var qQ8 = s.qQ8
-  var qQ8i8 = s.qQ8i8
-
-  // Embedding
-  var emb = w.tokenEmbedding
-  embedToken(xArr, token)
-
-  // Fill RoPE scratch buffers for just this token's position (slot 0).
-  fillRopeBuffers(s, pos, 1)
-
-  for (var l = 0; l < nLayers; l = l + 1) {
-    var lw = w.layers[l]
-
-    rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
-
-    // QKV matmuls - quantize once, reuse (#1+2)
-    if (
-      lw.wq.dotQ8Func &&
-      !lw.wq.deqRowFunc &&
-      lw.wk.dotQ8Func &&
-      !lw.wk.deqRowFunc &&
-      lw.wv.dotQ8Func &&
-      !lw.wv.deqRowFunc
-    ) {
-      ensureXQ8Buf()
-      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
-      matmulQuantizedPreQ8(qArr, lw.wq)
-      matmulQuantizedPreQ8(kArr, lw.wk)
-      matmulQuantizedPreQ8(vArr, lw.wv)
-    } else {
-      matmulQuantized(qArr, xbArr, lw.wq)
-      matmulQuantized(kArr, xbArr, lw.wk)
-      matmulQuantized(vArr, xbArr, lw.wv)
-    }
-
-    // RoPE with fused attnScale on Q (#18)
-    var half = headSize >> 1
-    var ropeCos = s.ropeCosLayer[l]
-    var ropeSin = s.ropeSinLayer[l]
-    ropeLlama(qArr, kArr, qDim, kvDim, half, ropeCos, ropeSin, 0, attnScale)
-
-    // Per-head KV cache write (#20)
-    var loff = l * s.kvCacheLayerSize
-    for (var h = 0; h < nKvHeads; h = h + 1) {
-      var headOff = loff + h * headSeqBytes + pos * headBytesQ8
-      quantizeToQ8_0Cache(
-        kArr,
-        h * headSize,
-        keyCache,
-        keyCacheInt8,
-        headOff,
-        headSize
-      )
-      quantizeToQ8_0Cache(
-        vArr,
-        h * headSize,
-        valueCache,
-        valueCacheInt8,
-        headOff,
-        headSize
-      )
-    }
-
-    // Quantize all Q heads to Q8_0 in one batch call (#15)
-    quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
-
-    zeroFloats(xbArr, qDim)
-
-    attendQ8(s, loff, pos, 0, xbArr)
-
-    // Attention output
-    matmulQuantized(xb2Arr, xbArr, lw.wo)
-    accum(xArr, xb2Arr, dim)
-
-    // FFN
-    rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
-
-    var hbArr = s.hb
-    var hb2Arr = s.hb2
-
-    // FFN gate and up - quantize once, reuse (#1+2)
-    if (
-      lw.w1.dotQ8Func &&
-      !lw.w1.deqRowFunc &&
-      lw.w3.dotQ8Func &&
-      !lw.w3.deqRowFunc
-    ) {
-      ensureXQ8Buf()
-      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
-      matmulQuantizedPreQ8(hbArr, lw.w1)
-      matmulQuantizedPreQ8(hb2Arr, lw.w3)
-    } else {
-      matmulQuantized(hbArr, xbArr, lw.w1)
-      matmulQuantized(hb2Arr, xbArr, lw.w3)
-    }
-
-    // SiLU gate (#17)
-    siluGate(hbArr, hb2Arr, hiddenDim)
-
-    // FFN down
-    matmulQuantized(xbArr, hbArr, lw.w2)
-    accum(xArr, xbArr, dim)
-  }
-
-  // Final norm
-  rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
-
-  // Classifier into logits
-  if (computeLogits !== false) {
+  if (w.hasKQuant) {
+    // K-quant matmuls borrow the logits buffer as scratch during generation
     ensureLogits(s)
-    matmulQuantized(s.logits, xArr, w.wcls)
   }
-}
-
-// Batched prefill transformer for Llama: processes multiple prompt tokens per
-// layer pass, reading weight data once and reusing across all batch elements
-function transformerPrefillLlama(allTokens, startPos, batchSize) {
-  var w = weights
-  var s = state
-  ensureKvCapacity(s, startPos + batchSize)
-  ensureBatchBuffers(s)
-  var dim = s.dim
-  var headSize = s.headSize
-  var kvDim = s.kvDim
-  var qDim = s.qDim
-  var hiddenDim = s.hiddenDim
-  var nLayers = s.nLayers
-  var nKvHeads = s.nKvHeads
-  var invDim = s.invDim
-  var kvMul = s.kvMul
-  var headBytesQ8 = s.headBytesQ8
-  var headSeqBytes = s.headSeqBytes
-  var attnScale = s.attnScale
-  var seqLen = s.seqLen
-
-  var keyCache = s.keyCache
-  var valueCache = s.valueCache
-  var keyCacheInt8 = s.keyCacheInt8
-  var valueCacheInt8 = s.valueCacheInt8
-  var qQ8 = s.qQ8
-  var qQ8i8 = s.qQ8i8
-  var sAtt = s.att
-
-  var bX = s.batchX
-  var bXb = s.batchXb
-  var bXb2 = s.batchXb2
-  var bQ = s.batchQ
-  var bK = s.batchK
-  var bV = s.batchV
-  var bHb = s.batchHb
-  var bHb2 = s.batchHb2
-
-  // Embed all tokens in batch
-  var emb = w.tokenEmbedding
-  for (var b = 0; b < batchSize; b = b + 1) {
-    embedToken(bX[b], allTokens[startPos + b])
-  }
-
-  // Fill RoPE scratch buffers for all positions in this prefill batch.
-  fillRopeBuffers(s, startPos, batchSize)
-
-  for (var l = 0; l < nLayers; l = l + 1) {
-    var lw = w.layers[l]
-    // Prefill tokens only feed later positions through the KV cache, so the
-    // last layer needs nothing beyond K and V: Q, attention, wo and the FFN
-    // would only produce a hidden state that no one reads.
-    var kvOnly = l === nLayers - 1
-
-    // Batch rmsnorm
-    for (var b = 0; b < batchSize; b = b + 1) {
-      rmsnorm(bXb[b], bX[b], lw.rmsAttWeight, dim, invDim)
-    }
-
-    // Batch QKV matmuls - read weights once, compute for all batch elements
-    if (!kvOnly) {
-      matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
-    }
-    matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
-    matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
-
-    // Per-token: RoPE, KV cache write, attention
-    var half = headSize >> 1
-    var ropeCos = s.ropeCosLayer[l]
-    var ropeSin = s.ropeSinLayer[l]
-    var loff = l * s.kvCacheLayerSize
-
-    for (var b = 0; b < batchSize; b = b + 1) {
-      var pos = startPos + b
-      var qArr = bQ[b]
-      var kArr = bK[b]
-      var vArr = bV[b]
-      var xbArr = bXb[b]
-
-      // RoPE with fused attnScale on Q (ropeBase indexes into per-batch scratch)
-      ropeLlama(qArr, kArr, qDim, kvDim, half, ropeCos, ropeSin, b * s.ropeSize, attnScale)
-
-      // Per-head KV cache write
-      for (var h = 0; h < nKvHeads; h = h + 1) {
-        var headOff = loff + h * headSeqBytes + pos * headBytesQ8
-        quantizeToQ8_0Cache(
-          kArr,
-          h * headSize,
-          keyCache,
-          keyCacheInt8,
-          headOff,
-          headSize
-        )
-        quantizeToQ8_0Cache(
-          vArr,
-          h * headSize,
-          valueCache,
-          valueCacheInt8,
-          headOff,
-          headSize
-        )
-      }
-
-      if (kvOnly) {
-        continue
-      }
-
-      // Quantize all Q heads to Q8_0
-      quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
-
-      zeroFloats(xbArr, qDim)
-
-      attendQ8(s, loff, pos, 0, xbArr)
-    }
-
-    if (kvOnly) {
-      break
-    }
-
-    // Batch wo matmul
-    matmulQuantizedBatch(bXb2, bXb, lw.wo, batchSize)
-    for (var b = 0; b < batchSize; b = b + 1) {
-      accum(bX[b], bXb2[b], dim)
-    }
-
-    // Batch FFN rmsnorm
-    for (var b = 0; b < batchSize; b = b + 1) {
-      rmsnorm(bXb[b], bX[b], lw.rmsFfnWeight, dim, invDim)
-    }
-
-    // Batch FFN matmuls
-    matmulQuantizedBatch(bHb, bXb, lw.w1, batchSize)
-    matmulQuantizedBatch(bHb2, bXb, lw.w3, batchSize)
-
-    // Per-token SiLU gate
-    for (var b = 0; b < batchSize; b = b + 1) {
-      siluGate(bHb[b], bHb2[b], hiddenDim)
-    }
-
-    // Batch FFN down matmul
-    matmulQuantizedBatch(bXb, bHb, lw.w2, batchSize)
-    for (var b = 0; b < batchSize; b = b + 1) {
-      accum(bX[b], bXb[b], dim)
-    }
-  }
-}
-
-// Gemma-optimized transformer: per-head KV layout, Q8 attention,
-// GQA batching, pre-quantized matmul, SWA, QK norms, post-norms
-function transformerGemma(token, pos, computeLogits) {
-  var w = weights
-  var s = state
   ensureKvCapacity(s, pos + 1)
+  var isGemma = s.isGemma
   var dim = s.dim
   var headSize = s.headSize
   var qDim = s.qDim
@@ -5005,11 +4599,8 @@ function transformerGemma(token, pos, computeLogits) {
   var nKvHeads = s.nKvHeads
   var invDim = s.invDim
   var invHeadSize = s.invHeadSize
-  var kvMul = s.kvMul
-  var headBytesQ8 = s.headBytesQ8
-  var headSeqBytes = s.headSeqBytes
   var attnScale = s.attnScale
-  var seqLen = s.seqLen
+  var half = headSize >> 1
 
   var xArr = s.x
   var xbArr = s.xb
@@ -5017,27 +4608,22 @@ function transformerGemma(token, pos, computeLogits) {
   var qArr = s.q
   var kArr = s.k
   var vArr = s.v
-  var sAtt = s.att
-  var keyCache = s.keyCache
-  var valueCache = s.valueCache
-  var keyCacheInt8 = s.keyCacheInt8
-  var valueCacheInt8 = s.valueCacheInt8
-  var qQ8 = s.qQ8
-  var qQ8i8 = s.qQ8i8
+  var hbArr = s.hb
+  var hb2Arr = s.hb2
 
-  // Embedding (scaling fused into first rmsnorm)
-  var emb = w.tokenEmbedding
+  // Embedding (Gemma: scaling fused into the first rmsnorm)
   embedToken(xArr, token)
 
-  // Fill RoPE scratch buffers for this token's position (slot 0). Gemma has
-  // distinct main and SWA tables filled in the same call.
+  // Fill the RoPE scratch buffers for this position (slot 0)
   fillRopeBuffers(s, pos, 1)
 
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
-    if (l === 0) {
-      // First layer: fused embed scale + rmsnorm (3 passes -> 2)
+    if (!isGemma) {
+      rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
+    } else if (l === 0) {
+      // First layer: fused embed scale + rmsnorm
       rmsnormGemmaFusedScale(
         xbArr,
         xArr,
@@ -5051,72 +4637,46 @@ function transformerGemma(token, pos, computeLogits) {
       rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
     }
 
-    // QKV matmuls - quantize once, reuse (#1+2)
-    if (
-      lw.wq.dotQ8Func &&
-      !lw.wq.deqRowFunc &&
-      lw.wk.dotQ8Func &&
-      !lw.wk.deqRowFunc &&
-      lw.wv.dotQ8Func &&
-      !lw.wv.deqRowFunc
-    ) {
-      ensureXQ8Buf()
-      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
-      matmulQuantizedPreQ8(qArr, lw.wq)
-      matmulQuantizedPreQ8(kArr, lw.wk)
-      matmulQuantizedPreQ8(vArr, lw.wv)
-    } else {
-      matmulQuantized(qArr, xbArr, lw.wq)
-      matmulQuantized(kArr, xbArr, lw.wk)
-      matmulQuantized(vArr, xbArr, lw.wv)
-    }
+    // QKV matmuls
+    matmulSameInput(xbArr, dim, qArr, lw.wq, kArr, lw.wk, vArr, lw.wv)
 
-    // Gemma QK norms
-    if (lw.attnQNorm && lw.attnKNorm) {
-      for (var h = 0; h < nHeads; h = h + 1) {
-        rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
-      }
-      for (var h = 0; h < nKvHeads; h = h + 1) {
-        rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
-      }
-    }
-
-    // Fused RoPE + Q attention scaling
-    var half = headSize >> 1
-    var ropeCos = s.ropeCosLayer[l]
-    var ropeSin = s.ropeSinLayer[l]
-    ropeNeox(qArr, nHeads, headSize, half, ropeCos, ropeSin, 0, attnScale)
-    ropeNeox(kArr, nKvHeads, headSize, half, ropeCos, ropeSin, 0, 1.0)
-
-    // Per-head KV cache write (#20)
+    // QK norms, RoPE, KV cache write, attention
     var loff = l * s.kvCacheLayerSize
-    for (var h = 0; h < nKvHeads; h = h + 1) {
-      var headOff = loff + h * headSeqBytes + pos * headBytesQ8
-      quantizeToQ8_0Cache(
-        kArr,
-        h * headSize,
-        keyCache,
-        keyCacheInt8,
-        headOff,
-        headSize
-      )
-      quantizeToQ8_0Cache(
-        vArr,
-        h * headSize,
-        valueCache,
-        valueCacheInt8,
-        headOff,
-        headSize
-      )
+    var isSwaLayer =
+      isGemma && s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
+    var ropeCos = isSwaLayer ? s.ropeCosSwaAll : s.ropeCosAll
+    var ropeSin = isSwaLayer ? s.ropeSinSwaAll : s.ropeSinAll
+
+    if (isGemma) {
+      if (lw.attnQNorm && lw.attnKNorm) {
+        for (var h = 0; h < nHeads; h = h + 1) {
+          rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+        }
+        for (var h = 0; h < nKvHeads; h = h + 1) {
+          rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
+        }
+      }
+      // NEOX RoPE with fused attnScale on Q
+      ropeNeox(qArr, nHeads, headSize, half, ropeCos, ropeSin, 0, attnScale)
+      ropeNeox(kArr, nKvHeads, headSize, half, ropeCos, ropeSin, 0, 1.0)
+    } else {
+      // RoPE with fused attnScale on Q
+      ropeLlama(qArr, kArr, qDim, s.kvDim, half, ropeCos, ropeSin, 0, attnScale)
     }
 
-    // Quantize all Q heads to Q8_0 in one batch call (#15)
-    quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
+    // Per-head KV cache write
+    for (var h = 0; h < nKvHeads; h = h + 1) {
+      var headOff = loff + h * s.headSeqBytes + pos * s.headBytesQ8
+      quantizeToQ8_0Cache(kArr, h * headSize, s.keyCache, s.keyCacheInt8, headOff, headSize)
+      quantizeToQ8_0Cache(vArr, h * headSize, s.valueCache, s.valueCacheInt8, headOff, headSize)
+    }
+
+    // Quantize all Q heads to Q8_0
+    quantizeToQ8_0Cache(qArr, 0, s.qQ8, s.qQ8i8, 0, qDim)
 
     zeroFloats(xbArr, qDim)
 
     // SWA window enforcement
-    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
     var startT =
       isSwaLayer && config.swaWindow > 0
         ? Math.max(0, pos - config.swaWindow + 1)
@@ -5126,75 +4686,66 @@ function transformerGemma(token, pos, computeLogits) {
 
     // Attention output
     matmulQuantized(xb2Arr, xbArr, lw.wo)
-
-    if (lw.attnPostNorm) {
+    if (isGemma && lw.attnPostNorm) {
       rmsnormGemma(xb2Arr, xb2Arr, lw.attnPostNorm, dim, eps, invDim)
     }
-
     accum(xArr, xb2Arr, dim)
 
     // FFN
-    rmsnormGemma(xbArr, xArr, lw.rmsFfnWeight, dim, eps, invDim)
-
-    var hbArr = s.hb
-    var hb2Arr = s.hb2
-
-    // FFN gate and up - quantize once, reuse (#1+2)
-    if (
-      lw.w1.dotQ8Func &&
-      !lw.w1.deqRowFunc &&
-      lw.w3.dotQ8Func &&
-      !lw.w3.deqRowFunc
-    ) {
-      ensureXQ8Buf()
-      quantizeToQ8_0Cache(xbArr, 0, xQ8Buf, xQ8Int8Buf, 0, dim)
-      matmulQuantizedPreQ8(hbArr, lw.w1)
-      matmulQuantizedPreQ8(hb2Arr, lw.w3)
+    if (isGemma) {
+      rmsnormGemma(xbArr, xArr, lw.rmsFfnWeight, dim, eps, invDim)
     } else {
-      matmulQuantized(hbArr, xbArr, lw.w1)
-      matmulQuantized(hb2Arr, xbArr, lw.w3)
+      rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
     }
-
-    // GELU gate
-    geluGate(hbArr, hb2Arr, hiddenDim)
-
-    // FFN down
+    matmulSameInput(xbArr, dim, hbArr, lw.w1, hb2Arr, lw.w3, null, null)
+    if (isGemma) {
+      geluGate(hbArr, hb2Arr, hiddenDim)
+    } else {
+      siluGate(hbArr, hb2Arr, hiddenDim)
+    }
     matmulQuantized(xbArr, hbArr, lw.w2)
-
-    if (lw.ffnPostNorm) {
+    if (isGemma && lw.ffnPostNorm) {
       rmsnormGemma(xbArr, xbArr, lw.ffnPostNorm, dim, eps, invDim)
     }
-
     accum(xArr, xbArr, dim)
   }
 
   // Final norm
-  rmsnormGemma(xArr, xArr, w.rmsFinalWeight, dim, eps, invDim)
+  if (isGemma) {
+    rmsnormGemma(xArr, xArr, w.rmsFinalWeight, dim, eps, invDim)
+  } else {
+    rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
+  }
 
   // Classifier into logits
   if (computeLogits !== false) {
     ensureLogits(s)
     matmulQuantized(s.logits, xArr, w.wcls)
-
-    if (config.finalLogitSoftcapping > 0) {
-      var cap = config.finalLogitSoftcapping
-      var vocabSize = s.vocabSize
-      for (var i = 0; i < vocabSize; i = i + 1) {
-        s.logits[i] = cap * fastTanh(s.logits[i] / cap)
-      }
+    if (isGemma && config.finalLogitSoftcapping > 0) {
+      softcapLogits(s.logits, s.vocabSize, config.finalLogitSoftcapping)
     }
+  }
+
+  // Note which token this pass left in the KV cache
+  s.kvTokens[pos] = token
+  s.kvCount = pos + 1
+  if (s.kvBatch > pos) {
+    s.kvBatch = pos
   }
 }
 
-// Batched prefill transformer for Gemma: same batching strategy with
-// Gemma-specific features (QK norms, NEOX RoPE, SWA, GELU, post-norms)
-function transformerPrefillGemma(allTokens, startPos, batchSize) {
+// transformerPrefill: the prompt tokens allTokens[startPos .. startPos + n - 1]
+// in one batch. Every weight matrix is read once for the whole batch and only
+// the KV cache is produced.
+function transformerPrefill(allTokens, startPos, n) {
   var w = weights
   var s = state
-  ensureKvCapacity(s, startPos + batchSize)
+  ensureKvCapacity(s, startPos + n)
   ensureBatchBuffers(s)
+  var isGemma = s.isGemma
   var dim = s.dim
   var headSize = s.headSize
+  var kvDim = s.kvDim
   var qDim = s.qDim
   var hiddenDim = s.hiddenDim
   var eps = s.rmsNormEps
@@ -5203,11 +4754,10 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
   var nKvHeads = s.nKvHeads
   var invDim = s.invDim
   var invHeadSize = s.invHeadSize
-  var kvMul = s.kvMul
   var headBytesQ8 = s.headBytesQ8
   var headSeqBytes = s.headSeqBytes
   var attnScale = s.attnScale
-  var seqLen = s.seqLen
+  var half = headSize >> 1
 
   var keyCache = s.keyCache
   var valueCache = s.valueCache
@@ -5215,8 +4765,8 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
   var valueCacheInt8 = s.valueCacheInt8
   var qQ8 = s.qQ8
   var qQ8i8 = s.qQ8i8
-  var sAtt = s.att
 
+  // One buffer of each kind per token
   var bX = s.batchX
   var bXb = s.batchXb
   var bXb2 = s.batchXb2
@@ -5226,21 +4776,24 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
   var bHb = s.batchHb
   var bHb2 = s.batchHb2
 
-  // Embed all tokens in batch (scaling fused into first rmsnorm)
-  var emb = w.tokenEmbedding
-  for (var b = 0; b < batchSize; b = b + 1) {
+  // Embedding (Gemma: scaling fused into the first rmsnorm)
+  for (var b = 0; b < n; b = b + 1) {
     embedToken(bX[b], allTokens[startPos + b])
   }
 
-  // Fill RoPE scratch buffers for all positions in this prefill batch.
-  fillRopeBuffers(s, startPos, batchSize)
+  // Fill the RoPE scratch buffers for the positions of this pass
+  fillRopeBuffers(s, startPos, n)
 
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
+    // The last layer only has to leave K and V in the cache
+    var kvOnly = l === nLayers - 1
 
-    // Batch rmsnorm (fused embed scale for first layer)
-    if (l === 0) {
-      for (var b = 0; b < batchSize; b = b + 1) {
+    for (var b = 0; b < n; b = b + 1) {
+      if (!isGemma) {
+        rmsnorm(bXb[b], bX[b], lw.rmsAttWeight, dim, invDim)
+      } else if (l === 0) {
+        // First layer: fused embed scale + rmsnorm
         rmsnormGemmaFusedScale(
           bXb[b],
           bX[b],
@@ -5250,92 +4803,59 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
           invDim,
           s.embedScale
         )
-      }
-    } else {
-      for (var b = 0; b < batchSize; b = b + 1) {
+      } else {
         rmsnormGemma(bXb[b], bX[b], lw.rmsAttWeight, dim, eps, invDim)
       }
     }
 
-    // Last layer of a prefill batch: only K and V are consumed (see the
-    // Llama prefill); skip Q, attention, wo and the FFN.
-    var kvOnly = l === nLayers - 1
-
-    // Batch QKV matmuls
+    // QKV matmuls
     if (!kvOnly) {
-      matmulQuantizedBatch(bQ, bXb, lw.wq, batchSize)
+      matmulQuantizedBatch(bQ, bXb, lw.wq, n)
     }
-    matmulQuantizedBatch(bK, bXb, lw.wk, batchSize)
-    matmulQuantizedBatch(bV, bXb, lw.wv, batchSize)
+    matmulQuantizedBatch(bK, bXb, lw.wk, n)
+    matmulQuantizedBatch(bV, bXb, lw.wv, n)
 
-    // Per-token: QK norms, RoPE, KV cache write, attention
-    var half = headSize >> 1
-    var ropeCos = s.ropeCosLayer[l]
-    var ropeSin = s.ropeSinLayer[l]
+    // Per token: QK norms, RoPE, KV cache write, attention
     var loff = l * s.kvCacheLayerSize
+    var isSwaLayer =
+      isGemma && s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
+    var ropeCos = isSwaLayer ? s.ropeCosSwaAll : s.ropeCosAll
+    var ropeSin = isSwaLayer ? s.ropeSinSwaAll : s.ropeSinAll
 
-    // SWA window enforcement
-    var isSwaLayer = s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
-
-    for (var b = 0; b < batchSize; b = b + 1) {
+    for (var b = 0; b < n; b = b + 1) {
       var pos = startPos + b
       var qArr = bQ[b]
       var kArr = bK[b]
       var vArr = bV[b]
       var xbArr = bXb[b]
+      var ropeBase = b * s.ropeSize
 
-      // Gemma QK norms
-      if (lw.attnQNorm && lw.attnKNorm) {
-        if (!kvOnly) {
-          for (var h = 0; h < nHeads; h = h + 1) {
-            rmsnormGemmaAt(
-              qArr,
-              h * headSize,
-              lw.attnQNorm,
-              headSize,
-              eps,
-              invHeadSize
-            )
+      if (isGemma) {
+        if (lw.attnQNorm && lw.attnKNorm) {
+          if (!kvOnly) {
+            for (var h = 0; h < nHeads; h = h + 1) {
+              rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+            }
+          }
+          for (var h = 0; h < nKvHeads; h = h + 1) {
+            rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
           }
         }
-        for (var h = 0; h < nKvHeads; h = h + 1) {
-          rmsnormGemmaAt(
-            kArr,
-            h * headSize,
-            lw.attnKNorm,
-            headSize,
-            eps,
-            invHeadSize
-          )
+        // NEOX RoPE with fused attnScale on Q
+        if (!kvOnly) {
+          ropeNeox(qArr, nHeads, headSize, half, ropeCos, ropeSin, ropeBase, attnScale)
         }
+        ropeNeox(kArr, nKvHeads, headSize, half, ropeCos, ropeSin, ropeBase, 1.0)
+      } else {
+        // RoPE with fused attnScale on Q
+        ropeLlama(qArr, kArr, qDim, kvDim, half, ropeCos, ropeSin, ropeBase, attnScale)
       }
-
-      // NEOX RoPE with fused attnScale on Q (ropeBase indexes per-batch scratch)
-      var ropeBase = b * s.ropeSize
-      if (!kvOnly) {
-        ropeNeox(qArr, nHeads, headSize, half, ropeCos, ropeSin, ropeBase, attnScale)
-      }
-      ropeNeox(kArr, nKvHeads, headSize, half, ropeCos, ropeSin, ropeBase, 1.0)
 
       // Per-head KV cache write
       for (var h = 0; h < nKvHeads; h = h + 1) {
         var headOff = loff + h * headSeqBytes + pos * headBytesQ8
-        quantizeToQ8_0Cache(
-          kArr,
-          h * headSize,
-          keyCache,
-          keyCacheInt8,
-          headOff,
-          headSize
-        )
-        quantizeToQ8_0Cache(
-          vArr,
-          h * headSize,
-          valueCache,
-          valueCacheInt8,
-          headOff,
-          headSize
-        )
+        quantizeToQ8_0Cache(kArr, h * headSize, keyCache, keyCacheInt8, headOff, headSize)
+        quantizeToQ8_0Cache(vArr, h * headSize, valueCache, valueCacheInt8, headOff, headSize)
       }
 
       if (kvOnly) {
@@ -5347,7 +4867,7 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
 
       zeroFloats(xbArr, qDim)
 
-      // SWA start position
+      // SWA window enforcement
       var startT =
         isSwaLayer && config.swaWindow > 0
           ? Math.max(0, pos - config.swaWindow + 1)
@@ -5360,81 +4880,65 @@ function transformerPrefillGemma(allTokens, startPos, batchSize) {
       break
     }
 
-    // Batch wo matmul
-    matmulQuantizedBatch(bXb2, bXb, lw.wo, batchSize)
-
-    // Post-attention norm (per-token)
-    if (lw.attnPostNorm) {
-      for (var b = 0; b < batchSize; b = b + 1) {
+    // Attention output
+    matmulQuantizedBatch(bXb2, bXb, lw.wo, n)
+    for (var b = 0; b < n; b = b + 1) {
+      if (isGemma && lw.attnPostNorm) {
         rmsnormGemma(bXb2[b], bXb2[b], lw.attnPostNorm, dim, eps, invDim)
       }
-    }
-
-    for (var b = 0; b < batchSize; b = b + 1) {
       accum(bX[b], bXb2[b], dim)
     }
 
-    // Batch FFN rmsnorm
-    for (var b = 0; b < batchSize; b = b + 1) {
-      rmsnormGemma(bXb[b], bX[b], lw.rmsFfnWeight, dim, eps, invDim)
-    }
-
-    // Batch FFN matmuls
-    matmulQuantizedBatch(bHb, bXb, lw.w1, batchSize)
-    matmulQuantizedBatch(bHb2, bXb, lw.w3, batchSize)
-
-    // Per-token GELU gate
-    for (var b = 0; b < batchSize; b = b + 1) {
-      geluGate(bHb[b], bHb2[b], hiddenDim)
-    }
-
-    // Batch FFN down matmul
-    matmulQuantizedBatch(bXb, bHb, lw.w2, batchSize)
-
-    // Post-FFN norm (per-token)
-    if (lw.ffnPostNorm) {
-      for (var b = 0; b < batchSize; b = b + 1) {
-        rmsnormGemma(bXb[b], bXb[b], lw.ffnPostNorm, dim, eps, invDim)
+    // FFN
+    for (var b = 0; b < n; b = b + 1) {
+      if (isGemma) {
+        rmsnormGemma(bXb[b], bX[b], lw.rmsFfnWeight, dim, eps, invDim)
+      } else {
+        rmsnorm(bXb[b], bX[b], lw.rmsFfnWeight, dim, invDim)
       }
     }
-
-    for (var b = 0; b < batchSize; b = b + 1) {
+    matmulQuantizedBatch(bHb, bXb, lw.w1, n)
+    matmulQuantizedBatch(bHb2, bXb, lw.w3, n)
+    for (var b = 0; b < n; b = b + 1) {
+      if (isGemma) {
+        geluGate(bHb[b], bHb2[b], hiddenDim)
+      } else {
+        siluGate(bHb[b], bHb2[b], hiddenDim)
+      }
+    }
+    matmulQuantizedBatch(bXb, bHb, lw.w2, n)
+    for (var b = 0; b < n; b = b + 1) {
+      if (isGemma && lw.ffnPostNorm) {
+        rmsnormGemma(bXb[b], bXb[b], lw.ffnPostNorm, dim, eps, invDim)
+      }
       accum(bX[b], bXb[b], dim)
     }
   }
+
+  // Note which tokens this pass left in the KV cache
+  for (var b = 0; b < n; b = b + 1) {
+    s.kvTokens[startPos + b] = allTokens[startPos + b]
+  }
+  s.kvCount = startPos + n
+  if (s.kvBatch >= startPos) {
+    s.kvBatch = startPos + n
+  }
 }
 
-// Dequantize one token's embedding row into dst. K-quant embeddings go
-// through the embedding matrix's view; the other formats keep the generic
-// absolute-offset dequantizers.
+// Dequantize one token's embedding row into dst (through the matrix view when
+// the format has a row dequantizer)
 function embedToken(dst, token) {
   var emb = weights.tokenEmbedding
   if (emb.deqRowFunc) {
-    emb.deqRowFunc(emb.deqView, token * emb.rowSize, dst, 0, emb.cols)
+    emb.deqRowFunc(
+      emb.deqView,
+      emb.base + (token * emb.rowSize) / emb.deqView.BYTES_PER_ELEMENT,
+      dst,
+      0,
+      emb.cols
+    )
   } else {
     dequantizeRow(dst, emb.dataOffset + token * emb.rowSize, emb.cols, emb.type)
-  }
-}
-
-// Dispatch to model-specific transformer (#21)
-function transformer(token, pos, computeLogits) {
-  if (weights.hasKQuant) {
-    // K-quant matmuls borrow the logits buffer as scratch during generation
-    ensureLogits(state)
-  }
-  if (state.isGemma) {
-    transformerGemma(token, pos, computeLogits)
-  } else {
-    transformerLlama(token, pos, computeLogits)
-  }
-}
-
-// Dispatch to model-specific batched prefill
-function transformerPrefill(allTokens, startPos, batchSize) {
-  if (state.isGemma) {
-    transformerPrefillGemma(allTokens, startPos, batchSize)
-  } else {
-    transformerPrefillLlama(allTokens, startPos, batchSize)
   }
 }
 
@@ -5572,13 +5076,9 @@ function sample(logits, temp) {
 // ----------------------------------------------------------------------------
 // Tokenizer
 
-// Vocab strings are stored as byte offsets + lengths into ggufUint8 and decoded
-// on demand. The number of actual decodes is tiny (a few per generated token +
-// one-shot at trie build), so the cost is negligible while the heap savings
-// relative to holding 262k decoded JS strings are substantial.
-// Reconstruct the absolute ggufUint8 offset of token i from the sparse
-// checkpoints + dense lengths array. Worst case 255 byte adds (sparse step
-// is 256 entries; the rebuild loop in buildSortedVocab uses the same shift).
+// Vocab strings stay as bytes in the GGUF buffer and are decoded on demand.
+// Offset of token i: its sparse checkpoint plus the lengths of the tokens
+// before it in the bucket (at most 255 adds).
 function vocabOffsetOf(i) {
   var bucket = i >> 8
   var base = tokenizer.vocabSparseCum[bucket]
@@ -5595,6 +5095,7 @@ function vocabString(i) {
   if (i < 0 || i >= n) {
     return ""
   }
+  ensureVocabTables()
   var len = tokenizer.vocabLengths[i]
   if (len === 0) {
     return ""
@@ -5603,24 +5104,14 @@ function vocabString(i) {
   return decodeUTF8(ggufUint8.subarray(off, off + len))
 }
 
-// Flat typed-array trie for vocabulary lookup, keyed by UTF-8 bytes. The build
-// walks ggufUint8 directly - no per-token string decode, no Uint16 char codes -
-// which avoids the ~35 MB transient heap spike that decoding 262k vocab
-// strings used to cause. Edges are stored in CSR form (contiguous per parent,
-// sorted by byte value thanks to the lex-sorted token order) so we can drop
-// the edgeNext pointer entirely.
-// Per node: token id (or -1), and childStart offset into the edge arrays.
-//           Children of node n are at [childStart[n], childStart[n+1]).
-// Per edge: byte value (0-255) and target node index.
-var trieNodeId = null
-var trieChildStart = null
-var trieEdgeChar = null
-var trieEdgeTarget = null
+// Tokenizer lookup: chained hash table over the bytes of every non-empty token,
+// built on the first bpeEncode() of a generate() call and released once the
+// prompt is encoded (head[hash & mask] = highest id of the chain, next[id] =
+// the next lower one, -1 ends it).
+var vocabHashHead = null
+var vocabHashNext = null
 
-// Encode a JS string to UTF-8 bytes. Used when walking the byte trie with
-// input produced by textToSentencePiece / textToTiktoken / special-token
-// lookups. Worst-case buffer is len*3 (any surrogate pair produces 4 bytes but
-// consumes 2 code units, so *3 bounds both paths).
+// Encode a JS string to UTF-8 bytes (buffer bound: 3 bytes per code unit)
 function encodeStringToUTF8(str) {
   var len = str.length
   var bytes = new Uint8Array(len * 3 + 1)
@@ -5660,303 +5151,112 @@ function encodeStringToUTF8(str) {
   return bytes.subarray(0, bi)
 }
 
-// The trie build below is split into one function per pass on purpose: each
-// pass is a long loop over the 262k-token vocabulary, and V8 compiles a
-// separate on-stack-replacement version of the enclosing function for every
-// such loop. Small functions keep that compiled code small (it stays alive for
-// the lifetime of the engine).
-
-// Expand the sparse cumulative-offset checkpoints into a full offsets array.
-function vocabExpandOffsets(vocabLen, lengths, sparseCum) {
-  var offsets = new Uint32Array(vocabLen)
-  for (var bk = 0; bk < sparseCum.length; bk = bk + 1) {
-    var acc = sparseCum[bk]
-    var end = (bk + 1) << 8
-    if (end > vocabLen) {
-      end = vocabLen
-    }
-    for (var i = bk << 8; i < end; i = i + 1) {
-      offsets[i] = acc
-      acc = acc + lengths[i] + 8
-    }
-  }
-  return offsets
-}
-
-// Number of non-empty tokens and the longest token length.
-function vocabCountNonEmpty(vocabLen, lengths, result) {
-  var count = 0
-  var maxLen = 0
-  for (var i = 0; i < vocabLen; i = i + 1) {
-    var li = lengths[i]
-    if (li > 0) {
-      count = count + 1
-      if (li > maxLen) {
-        maxLen = li
-      }
-    }
-  }
-  result[0] = count
-  result[1] = maxLen
-}
-
-// Indices of the non-empty tokens as a plain array (sorted in place later).
-function vocabNonEmptyIndices(vocabLen, lengths, count) {
-  var idxArr = new Array(count)
-  var w = 0
-  for (var i = 0; i < vocabLen; i = i + 1) {
-    if (lengths[i] > 0) {
-      idxArr[w] = i
-      w = w + 1
-    }
-  }
-  return idxArr
-}
-
-// Byte-wise sort over ggufUint8 ranges. We precompute a big-endian uint32
-// "sort key" holding each token's first four bytes (zero-padded if
-// shorter); the comparator resolves most pairs with a single unsigned
-// uint32 compare, only falling back to a byte loop past index 4 when the
-// first four bytes tie. Shaves ~20% off sort time vs inner-looping bytes
-// from offset 0 on every comparison.
-function vocabSortIndices(idxArr, count, vocabLen, lengths, offsets, u8) {
-  var sortKey = new Uint32Array(vocabLen)
-  for (var i = 0; i < count; i = i + 1) {
-    var idx = idxArr[i]
-    var len = lengths[idx]
-    var off = offsets[idx]
-    var b0 = u8[off]
-    var b1 = len > 1 ? u8[off + 1] : 0
-    var b2 = len > 2 ? u8[off + 2] : 0
-    var b3 = len > 3 ? u8[off + 3] : 0
-    sortKey[idx] = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) >>> 0
-  }
-  idxArr.sort(function (a, b) {
-    var ka = sortKey[a]
-    var kb = sortKey[b]
-    if (ka !== kb) {
-      return ka < kb ? -1 : 1
-    }
-    var la = lengths[a]
-    var lb = lengths[b]
-    if (la < 5 || lb < 5) {
-      return la - lb
-    }
-    var oa = offsets[a]
-    var ob = offsets[b]
-    var ml = la < lb ? la : lb
-    for (var k = 4; k < ml; k = k + 1) {
-      var d = u8[oa + k] - u8[ob + k]
-      if (d !== 0) {
-        return d
-      }
-    }
-    return la - lb
-  })
-}
-
-// Pass 1: count unique trie nodes (root + bytes beyond LCP with prev token).
-function trieCountNodes(idxArr, count, lengths, offsets, u8) {
-  var totalNodes = 1
-  var prevOff = 0
-  var prevLen = 0
-  for (var m = 0; m < count; m = m + 1) {
-    var idx = idxArr[m]
-    var off = offsets[idx]
-    var sLen = lengths[idx]
-    var minLen = prevLen < sLen ? prevLen : sLen
-    var lcp = 0
-    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
-      lcp = lcp + 1
-    }
-    totalNodes = totalNodes + (sLen - lcp)
-    prevOff = off
-    prevLen = sLen
-  }
-  return totalNodes
-}
-
-// Pass 2: assign node ids via simulated walk (identical to Pass 3 ordering)
-// and count children per node into childStart[parent+1].
-function trieCountChildren(idxArr, count, lengths, offsets, u8, childStart, path) {
-  path[0] = 0
-  var nodeIdx = 1
-  var prevOff = 0
-  var prevLen = 0
-  for (var m = 0; m < count; m = m + 1) {
-    var idx = idxArr[m]
-    var off = offsets[idx]
-    var sLen = lengths[idx]
-    var minLen = prevLen < sLen ? prevLen : sLen
-    var lcp = 0
-    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
-      lcp = lcp + 1
-    }
-    for (var j = lcp; j < sLen; j = j + 1) {
-      var parent = path[j]
-      childStart[parent + 1] = childStart[parent + 1] + 1
-      var newNode = nodeIdx
-      nodeIdx = nodeIdx + 1
-      path[j + 1] = newNode
-    }
-    prevOff = off
-    prevLen = sLen
-  }
-}
-
-// Pass 3: fill edges. Since tokens are sorted lex by byte, children at each
-// parent are emitted in ascending byte order, which matches the CSR layout.
-// A per-node write cursor tracks the next free slot within [childStart[n]..].
-function trieFillEdges(
-  idxArr,
-  count,
-  lengths,
-  offsets,
-  u8,
-  writeCursor,
-  edgeChar,
-  edgeTarget,
-  nodeId,
-  path
-) {
-  path[0] = 0
-  var nodeIdx = 1
-  var prevOff = 0
-  var prevLen = 0
-  for (var m = 0; m < count; m = m + 1) {
-    var idx = idxArr[m]
-    var off = offsets[idx]
-    var sLen = lengths[idx]
-    var minLen = prevLen < sLen ? prevLen : sLen
-    var lcp = 0
-    while (lcp < minLen && u8[prevOff + lcp] === u8[off + lcp]) {
-      lcp = lcp + 1
-    }
-    for (var j = lcp; j < sLen; j = j + 1) {
-      var parent = path[j]
-      var newNode = nodeIdx
-      nodeIdx = nodeIdx + 1
-      var w = writeCursor[parent]
-      writeCursor[parent] = w + 1
-      edgeChar[w] = u8[off + j]
-      edgeTarget[w] = newNode
-      path[j + 1] = newNode
-    }
-    nodeId[path[sLen]] = idx
-    prevOff = off
-    prevLen = sLen
-  }
-}
-
-function fillInt32(arr, n, value) {
-  for (var i = 0; i < n; i = i + 1) {
-    arr[i] = value
-  }
-}
-
-function buildSortedVocab() {
-  if (trieNodeId) {
+function buildVocabHash() {
+  if (vocabHashHead) {
     return
   }
-
   var vocabLen = tokenizer.vocabSize
   var lengths = tokenizer.vocabLengths
-  var u8 = ggufUint8
-
-  // Full offsets array for the duration of trie construction. Peak heap is
-  // temporarily ~1 MB higher (262k x 4 B) during build, released when this
-  // function returns; the permanent storage stays at ~516 KB (lengths +
-  // sparse checkpoints).
-  var offsets = vocabExpandOffsets(vocabLen, lengths, tokenizer.vocabSparseCum)
-
-  // Collect indices of non-empty tokens. We sort these lex by UTF-8 byte value
-  // so the trie can be built in O(totalBytes) via prev-token LCP - no per-char
-  // child scan, and no string decoding.
-  var countMax = [0, 0]
-  vocabCountNonEmpty(vocabLen, lengths, countMax)
-  var count = countMax[0]
-  var maxLen = countMax[1]
-  var idxArr = vocabNonEmptyIndices(vocabLen, lengths, count)
-  vocabSortIndices(idxArr, count, vocabLen, lengths, offsets, u8)
-
-  var totalNodes = trieCountNodes(idxArr, count, lengths, offsets, u8)
-  var totalEdges = totalNodes - 1
-
-  // Allocate CSR structure. `childStart[n+1]` is first used as a child counter
-  // for node n, then prefix-summed into start offsets. edgeChar is Uint8.
-  var nodeId = new Int32Array(totalNodes)
-  fillInt32(nodeId, totalNodes, -1)
-  var childStart = new Int32Array(totalNodes + 1)
-  var edgeChar = new Uint8Array(totalEdges)
-  var edgeTarget = new Int32Array(totalEdges)
-  var path = new Int32Array(maxLen + 1)
-
-  trieCountChildren(idxArr, count, lengths, offsets, u8, childStart, path)
-
-  // Prefix-sum counts into cumulative start offsets.
-  for (var n = 1; n <= totalNodes; n = n + 1) {
-    childStart[n] = childStart[n] + childStart[n - 1]
-  }
-
-  var writeCursor = new Int32Array(totalNodes)
-  for (var i = 0; i < totalNodes; i = i + 1) {
-    writeCursor[i] = childStart[i]
-  }
-  trieFillEdges(
-    idxArr,
-    count,
-    lengths,
-    offsets,
-    u8,
-    writeCursor,
-    edgeChar,
-    edgeTarget,
-    nodeId,
-    path
-  )
-
-  trieNodeId = nodeId
-  trieChildStart = childStart
-  trieEdgeChar = edgeChar
-  trieEdgeTarget = edgeTarget
-}
-
-// Linear byte-scan over the vocab. Avoids triggering buildSortedVocab() -
-// the ~7.8 MB trie stays unbuilt until the first bpeEncode call. This
-// function runs a handful of times at load (eos/eot lookup) and a few times
-// per generate (chat-template tokens) on a 262k-entry vocab; each call is
-// a length-filtered UTF-8 byte compare and finishes in well under 1 ms.
-function findSpecialToken(tokenStr) {
-  var target = encodeStringToUTF8(tokenStr)
-  var tLen = target.length
-  var u8 = ggufUint8
-  var lengths = tokenizer.vocabLengths
   var sparseCum = tokenizer.vocabSparseCum
-  var vocabSize = tokenizer.vocabSize
-  // Iterate linearly, maintaining the running offset ourselves. `off` is
-  // anchored at each sparse-bucket boundary from sparseCum (256-entry step,
-  // hardcoded to the shift below) to stay in sync with buildSortedVocab.
+  var u8 = ggufUint8
+  // Power-of-two bucket count, about 4 tokens per chain
+  var buckets = 256
+  while (buckets * 4 < vocabLen) {
+    buckets = buckets << 1
+  }
+  var mask = buckets - 1
+  ensureGenScratch(state)
+  var head = new Int32Array(genScratch, 0, buckets)
+  var next = new Int32Array(genScratch, buckets * 4, vocabLen)
+  for (var b = 0; b < buckets; b = b + 1) {
+    head[b] = -1
+  }
+  // Running byte offset of token i, re-anchored at every sparse checkpoint
+  // (same walk as findSpecialToken)
   var off = 0
-  for (var i = 0; i < vocabSize; i = i + 1) {
+  for (var i = 0; i < vocabLen; i = i + 1) {
     if ((i & 255) === 0) {
       off = sparseCum[i >> 8]
     }
     var li = lengths[i]
-    if (li === tLen) {
-      var match = true
-      for (var k = 0; k < tLen; k = k + 1) {
-        if (u8[off + k] !== target[k]) {
-          match = false
-          break
-        }
+    if (li > 0) {
+      var h = 0
+      for (var k = 0; k < li; k = k + 1) {
+        h = ((h << 5) - h + u8[off + k]) | 0
       }
-      if (match) {
-        return i
-      }
+      next[i] = head[h & mask]
+      head[h & mask] = i
     }
     off = off + li + 8
   }
-  return -1
+  vocabHashHead = head
+  vocabHashNext = next
+}
+
+// First use of the vocabulary (first generate() call): per-token byte lengths
+// (Uint8 when every token is shorter than 256 bytes), one offset checkpoint
+// every 256 tokens, and the model-specific end-of-turn token
+function ensureVocabTables() {
+  var t = tokenizer
+  if (t.vocabLengths !== null) {
+    return
+  }
+  var n = t.vocabSize
+  var lengths = t.vocabMaxLen < 256 ? new Uint8Array(n) : new Uint16Array(n)
+  var sparseCum = new Uint32Array(((n - 1) >> 8) + 1)
+  var dv = dataView
+  var p = t.vocabOffset
+  for (var i = 0; i < n; i = i + 1) {
+    var slen = dv.getUint32(p, true)
+    p = p + 8
+    if ((i & 255) === 0) {
+      // Checkpoint: where the bytes of token i start
+      sparseCum[i >> 8] = p
+    }
+    lengths[i] = slen
+    p = p + slen
+  }
+  t.vocabLengths = lengths
+  t.vocabSparseCum = sparseCum
+  if (config.isGemma) {
+    var endTurn = findSpecialToken("<end_of_turn>")
+    t.eotToken = endTurn < 0 ? 107 : endTurn
+  } else {
+    var eot = findSpecialToken("<|eot_id|>")
+    t.eotToken = eot < 0 ? 128009 : eot
+  }
+}
+
+// Id of a special token given its text: a linear scan of the token strings in
+// the file, done once per text (the few lookups of a model are cached)
+function findSpecialToken(tokenStr) {
+  var cache = tokenizer.specialTokens
+  if (cache[tokenStr] !== undefined) {
+    return cache[tokenStr]
+  }
+  var target = encodeStringToUTF8(tokenStr)
+  var tLen = target.length
+  var u8 = ggufUint8
+  var dv = dataView
+  var n = tokenizer.vocabSize
+  var p = tokenizer.vocabOffset
+  var id = -1
+  for (var i = 0; i < n && id < 0; i = i + 1) {
+    var li = dv.getUint32(p, true)
+    p = p + 8
+    if (li === tLen) {
+      var k = 0
+      while (k < tLen && u8[p + k] === target[k]) {
+        k = k + 1
+      }
+      if (k === tLen) {
+        id = i
+      }
+    }
+    p = p + li
+  }
+  cache[tokenStr] = id
+  return id
 }
 
 // Build tiktoken byte-to-unicode mapping (OpenAI's bytes_to_unicode)
@@ -6187,8 +5487,44 @@ function decodeToken(token) {
   return decodeUTF8(bytes)
 }
 
+// Longest token whose bytes are a prefix of bytes[pos .. pos + limit), or -1:
+// the hash of every prefix is looked up as it grows, the last hit wins.
+function vocabLongestMatch(bytes, pos, limit) {
+  var head = vocabHashHead
+  var next = vocabHashNext
+  var mask = head.length - 1
+  var lengths = tokenizer.vocabLengths
+  var sparseCum = tokenizer.vocabSparseCum
+  var u8 = ggufUint8
+  var best = -1
+  var h = 0
+  for (var n = 1; n <= limit; n = n + 1) {
+    h = ((h << 5) - h + bytes[pos + n - 1]) | 0
+    var id = head[h & mask]
+    while (id !== -1) {
+      if (lengths[id] === n) {
+        // Offset of token id (vocabOffsetOf)
+        var off = sparseCum[id >> 8]
+        for (var j = id & ~255; j < id; j = j + 1) {
+          off = off + lengths[j] + 8
+        }
+        var k = 0
+        while (k < n && u8[off + k] === bytes[pos + k]) {
+          k = k + 1
+        }
+        if (k === n) {
+          best = id
+          break
+        }
+      }
+      id = next[id]
+    }
+  }
+  return best
+}
+
 function bpeEncode(text) {
-  buildSortedVocab()
+  buildVocabHash()
 
   // Convert text based on tokenizer type
   var encodedText
@@ -6200,47 +5536,23 @@ function bpeEncode(text) {
 
   var tokens = []
 
-  // Convert encodedText to UTF-8 bytes - the trie is byte-keyed.
+  // Convert encodedText to UTF-8 bytes - the vocabulary is matched by bytes.
   var bytes = encodeStringToUTF8(encodedText)
   var byteLen = bytes.length
   var pos = 0
 
-  // Hoist trie arrays into locals to help V8 bounds-check elimination
-  var tNodeId = trieNodeId
-  var tChildStart = trieChildStart
-  var tEdgeChar = trieEdgeChar
-  var tEdgeTarget = trieEdgeTarget
+  var maxLen = tokenizer.vocabMaxLen
+  var lengths = tokenizer.vocabLengths
 
   while (pos < byteLen) {
-    // Walk trie for longest byte-prefix match at current position
-    var node = 0
-    var bestId = -1
-    var bestLen = 0
-    for (var j = pos; j < byteLen; j = j + 1) {
-      var ch = bytes[j]
-      var s = tChildStart[node]
-      var e = tChildStart[node + 1]
-      var next = -1
-      for (var k = s; k < e; k = k + 1) {
-        if (tEdgeChar[k] === ch) {
-          next = tEdgeTarget[k]
-          break
-        }
-      }
-      if (next === -1) {
-        break
-      }
-      node = next
-      var nid = tNodeId[node]
-      if (nid >= 0) {
-        bestId = nid
-        bestLen = j - pos + 1
-      }
+    var limit = byteLen - pos
+    if (limit > maxLen) {
+      limit = maxLen
     }
-
+    var bestId = vocabLongestMatch(bytes, pos, limit)
     if (bestId !== -1) {
       tokens.push(bestId)
-      pos = pos + bestLen
+      pos = pos + lengths[bestId]
     } else {
       // No prefix match - skip this byte
       pos = pos + 1
@@ -6399,6 +5711,8 @@ function encodeGemma3Chat(chatHistory, sysPrompt) {
 // Generation
 
 function generate(chatHistory) {
+  ensureFp16Table()
+  ensureVocabTables()
   var promptTokens
   if (config.isGemma) {
     promptTokens = encodeGemma3Chat(chatHistory, systemPrompt)
@@ -6406,14 +5720,9 @@ function generate(chatHistory) {
     promptTokens = encodeLlama3Chat(chatHistory, systemPrompt)
   }
 
-  // Release the vocab trie - it's only needed while turning text into token
-  // IDs. The transformer and sampler work on IDs alone, so we can free ~7-8 MB
-  // of typed arrays before the long generation phase starts. The next
-  // generate() call will lazy-rebuild via buildSortedVocab on first bpeEncode.
-  trieNodeId = null
-  trieChildStart = null
-  trieEdgeChar = null
-  trieEdgeTarget = null
+  // Release the vocabulary lookup table (only needed to encode the prompt)
+  vocabHashHead = null
+  vocabHashNext = null
 
   if (promptTokens.length === 0) {
     promptTokens = [tokenizer.bosToken]
@@ -6435,6 +5744,32 @@ function generate(chatHistory) {
   if (effectiveMaxTokens <= 0 || effectiveMaxTokens > config.seqLen) {
     effectiveMaxTokens = config.seqLen
   }
+
+  // Reuse the KV cache of the previous call: the positions whose tokens match
+  // the start of this prompt keep their keys and values. The last prompt token
+  // always runs again (its logits are needed). With Q8_0 layer matrices only
+  // the positions written by the batched prefill are kept: the single-token
+  // Q8_0 kernel sums in another order, so a position it wrote is not
+  // bit-identical to a prefilled one.
+  var kvTokens = state.kvTokens
+  var reuse = state.kvCount
+  if (weights.q8Layers && reuse > state.kvBatch) {
+    reuse = state.kvBatch
+  }
+  if (reuse > state.kvCapacity) {
+    reuse = state.kvCapacity
+  }
+  if (reuse > numPromptTokens - 1) {
+    reuse = numPromptTokens - 1
+  }
+  while (pos < reuse && kvTokens[pos] === promptTokens[pos]) {
+    pos = pos + 1
+  }
+  state.kvCount = pos
+  if (state.kvBatch > pos) {
+    state.kvBatch = pos
+  }
+  token = promptTokens[pos]
 
   // Batched prefill: process all prompt tokens except the last in batches
   if (numPromptTokens > 1) {
@@ -6540,11 +5875,17 @@ function generate(chatHistory) {
     }
   }
 
-  // Release the vocab-sized logits buffer between generate calls. ensureLogits
-  // re-allocates it on the next forward pass for <1 ms, freeing ~1 MB of
-  // Float32Array backing memory while the engine is idle between turns.
+  // A prompt longer than the context window ran past the end of the KV cache:
+  // nothing of it can be trusted by the next call.
+  if (numPromptTokens - 1 > config.seqLen) {
+    state.kvCount = 0
+    state.kvBatch = 0
+  }
+
+  // Release the scratch of this call (logits included)
   state.logits = null
   state.logits64 = null
+  genScratch = null
 
   postMessage({ type: "complete", output: output })
 
