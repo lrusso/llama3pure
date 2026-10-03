@@ -233,6 +233,7 @@ typedef struct {
 typedef float (*cached_q8_func)(const block_q8_0*, const void*, int);
 typedef float (*cached_dot_func)(const float*, const void*, int);
 typedef void (*deq_row_func)(const void* src, float* dst, int k);
+typedef void (*rows4_func)(const void* src, size_t row_size, float* restrict dst, int k);
 
 // Quantized tensor - keeps weights in compressed form
 typedef struct {
@@ -246,6 +247,7 @@ typedef struct {
     cached_q8_func q8_func;        // cached Q8_0 input dot function
     cached_dot_func dot_func;      // cached float input dot function
     deq_row_func deq_func;        // cached dequantize-row function (Q8_0 + K-quants)
+    rows4_func rows4_func;        // cached 4-row float conversion (F16, BF16, F32)
 } QuantizedTensor;
 
 typedef struct {
@@ -300,6 +302,7 @@ typedef struct {
     float* rope_sin_all;     // (seq_len * head_size/2) - sin for all positions (dense layers)
     float* rope_cos_swa_all; // (seq_len * head_size/2) - cos for all positions (SWA layers)
     float* rope_sin_swa_all; // (seq_len * head_size/2) - sin for all positions (SWA layers)
+    int rope_filled;         // positions [0, rope_filled) of the sin/cos tables are computed
     // cached constants to avoid recomputation in transformer
     int head_size;
     int kv_dim;
@@ -343,6 +346,12 @@ static size_t mapped_size = 0;
 static float** weight_allocations = NULL;
 static int num_weight_allocations = 0;
 
+// One block shared by the three phases of a run, which never overlap:
+// tokenization (vocabulary lookup tables), prefill (batch buffers) and
+// generation (logits). Sized for the largest of the three.
+static void* run_scratch = NULL;
+static size_t run_scratch_size = 0;
+
 void malloc_run_state(RunState* s, Config* p) {
     // Use explicit head_dim for Gemma3, computed for others
     int head_size = p->head_dim > 0 ? p->head_dim : p->dim / p->n_heads;
@@ -361,7 +370,7 @@ void malloc_run_state(RunState* s, Config* p) {
     s->k = calloc(kv_dim, sizeof(float));
     s->v = calloc(kv_dim, sizeof(float));
     s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
-    s->logits = calloc(p->vocab_size, sizeof(float));
+    s->logits = NULL;  // set by use_logits_buffer() once the prefill is done
     // Q8_0 KV cache: 34 bytes per 32 floats
     // Per-head layout: [layer][kv_head][position][head_data] for cache locality
     int head_q8_bytes_init = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
@@ -392,30 +401,17 @@ void malloc_run_state(RunState* s, Config* p) {
         s->rope_freqs_swa[i] = 1.0f / powf(swa_theta, (float)(i * 2) / (float)head_size);
     }
 
-    // Pre-compute RoPE sin/cos for ALL positions (eliminates sin/cos from transformer hot loop)
+    // RoPE sin/cos tables for all positions (eliminates sin/cos from transformer hot loop).
+    // Only allocated here: rope_fill() computes the rows of a position the first
+    // time it is used, so the pages of unused positions are never touched.
     int seq_len = p->seq_len;
+    s->rope_filled = 0;
     s->rope_cos_all = calloc((size_t)seq_len * rope_size, sizeof(float));
     s->rope_sin_all = calloc((size_t)seq_len * rope_size, sizeof(float));
-    for (int pos = 0; pos < seq_len; pos++) {
-        int base = pos * rope_size;
-        for (int i = 0; i < rope_size; i++) {
-            float val = pos * s->rope_freqs[i];
-            s->rope_cos_all[base + i] = cosf(val);
-            s->rope_sin_all[base + i] = sinf(val);
-        }
-    }
-    // Pre-compute SWA sin/cos for all positions (only for Gemma models)
+    // SWA sin/cos tables (only for Gemma models)
     if (p->is_gemma3) {
         s->rope_cos_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
         s->rope_sin_swa_all = calloc((size_t)seq_len * rope_size, sizeof(float));
-        for (int pos = 0; pos < seq_len; pos++) {
-            int base = pos * rope_size;
-            for (int i = 0; i < rope_size; i++) {
-                float val = pos * s->rope_freqs_swa[i];
-                s->rope_cos_swa_all[base + i] = cosf(val);
-                s->rope_sin_swa_all[base + i] = sinf(val);
-            }
-        }
     } else {
         s->rope_cos_swa_all = s->rope_cos_all;
         s->rope_sin_swa_all = s->rope_sin_all;
@@ -467,38 +463,86 @@ void malloc_run_state(RunState* s, Config* p) {
         }
     }
 
-    // Batch buffers for prefill
+    // Batch buffers for prefill: carved out of the scratch block by use_prefill_buffers()
     s->max_dim = max_dim;
-
-    s->batch_x   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->dim, sizeof(float));
-    s->batch_xb  = (float*)calloc((size_t)PREFILL_BATCH_SIZE * max_dim, sizeof(float));
-    s->batch_xb2 = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->dim, sizeof(float));
-    s->batch_q   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * q_dim, sizeof(float));
-    s->batch_k   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * kv_dim, sizeof(float));
-    s->batch_v   = (float*)calloc((size_t)PREFILL_BATCH_SIZE * kv_dim, sizeof(float));
-    s->batch_hb  = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->hidden_dim, sizeof(float));
-    s->batch_hb2 = (float*)calloc((size_t)PREFILL_BATCH_SIZE * p->hidden_dim, sizeof(float));
 
     int max_cols = p->dim;
     if (q_dim > max_cols) max_cols = q_dim;
     if (p->hidden_dim > max_cols) max_cols = p->hidden_dim;
     s->batch_q8_stride = (max_cols + QK8_0 - 1) / QK8_0;
-    s->batch_q8 = (block_q8_0*)calloc((size_t)PREFILL_BATCH_SIZE * s->batch_q8_stride, sizeof(block_q8_0));
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
-     || !s->k || !s->v || !s->att || !s->logits || !s->key_cache
+     || !s->k || !s->v || !s->att || !s->key_cache
      || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
      || !s->rope_cos_all || !s->rope_sin_all || !s->rope_cos_swa_all || !s->rope_sin_swa_all
      || !s->head_q_offsets || !s->head_att_offsets
      || !s->head_kv_indices || !s->head_kv_byte_offsets
      || !s->qQ8
-     || !s->rope_cos_layer || !s->rope_sin_layer
-     || !s->batch_x || !s->batch_xb || !s->batch_xb2
-     || !s->batch_q || !s->batch_k || !s->batch_v
-     || !s->batch_hb || !s->batch_hb2 || !s->batch_q8) {
+     || !s->rope_cos_layer || !s->rope_sin_layer) {
         fprintf(stderr, "malloc failed!\n");
         exit(1);
     }
+}
+
+// Compute the RoPE sin/cos rows of the positions below `upto` that are not filled yet
+static void rope_fill(RunState* s, int upto) {
+    int rope_size = s->head_size / 2;
+    int has_swa = (s->rope_cos_swa_all != s->rope_cos_all);
+    for (int pos = s->rope_filled; pos < upto; pos++) {
+        int base = pos * rope_size;
+        for (int i = 0; i < rope_size; i++) {
+            float val = pos * s->rope_freqs[i];
+            s->rope_cos_all[base + i] = cosf(val);
+            s->rope_sin_all[base + i] = sinf(val);
+        }
+        if (has_swa) {
+            for (int i = 0; i < rope_size; i++) {
+                float val = pos * s->rope_freqs_swa[i];
+                s->rope_cos_swa_all[base + i] = cosf(val);
+                s->rope_sin_swa_all[base + i] = sinf(val);
+            }
+        }
+    }
+    if (upto > s->rope_filled) s->rope_filled = upto;
+}
+
+// Bytes of the prefill batch buffers (PREFILL_BATCH_SIZE rows of each)
+static size_t prefill_buffers_size(RunState* s, Config* p) {
+    size_t row_floats = (size_t)p->dim * 2 + s->max_dim + s->q_dim + (size_t)s->kv_dim * 2 + (size_t)p->hidden_dim * 2;
+    return (size_t)PREFILL_BATCH_SIZE * (row_floats * sizeof(float) + (size_t)s->batch_q8_stride * sizeof(block_q8_0));
+}
+
+// Prefill phase: the batch buffers take the scratch block
+static void use_prefill_buffers(RunState* s, Config* p) {
+    memset(run_scratch, 0, prefill_buffers_size(s, p));
+    float* next = (float*)run_scratch;
+    s->batch_x = next;
+    next += (size_t)PREFILL_BATCH_SIZE * p->dim;
+    s->batch_xb = next;
+    next += (size_t)PREFILL_BATCH_SIZE * s->max_dim;
+    s->batch_xb2 = next;
+    next += (size_t)PREFILL_BATCH_SIZE * p->dim;
+    s->batch_q = next;
+    next += (size_t)PREFILL_BATCH_SIZE * s->q_dim;
+    s->batch_k = next;
+    next += (size_t)PREFILL_BATCH_SIZE * s->kv_dim;
+    s->batch_v = next;
+    next += (size_t)PREFILL_BATCH_SIZE * s->kv_dim;
+    s->batch_hb = next;
+    next += (size_t)PREFILL_BATCH_SIZE * p->hidden_dim;
+    s->batch_hb2 = next;
+    next += (size_t)PREFILL_BATCH_SIZE * p->hidden_dim;
+    s->batch_q8 = (block_q8_0*)next;
+}
+
+// Generation phase: the logits take the scratch block
+static void use_logits_buffer(RunState* s, Config* p) {
+    s->batch_x = s->batch_xb = s->batch_xb2 = NULL;
+    s->batch_q = s->batch_k = s->batch_v = NULL;
+    s->batch_hb = s->batch_hb2 = NULL;
+    s->batch_q8 = NULL;
+    s->logits = (float*)run_scratch;
+    memset(s->logits, 0, (size_t)p->vocab_size * sizeof(float));
 }
 
 void free_run_state(RunState* s) {
@@ -511,7 +555,6 @@ void free_run_state(RunState* s) {
     free(s->k);
     free(s->v);
     free(s->att);
-    free(s->logits);
     free(s->key_cache);
     free(s->value_cache);
     free(s->rope_freqs);
@@ -527,15 +570,6 @@ void free_run_state(RunState* s) {
     free(s->qQ8);
     free(s->rope_cos_layer);
     free(s->rope_sin_layer);
-    free(s->batch_x);
-    free(s->batch_xb);
-    free(s->batch_xb2);
-    free(s->batch_q);
-    free(s->batch_k);
-    free(s->batch_v);
-    free(s->batch_hb);
-    free(s->batch_hb2);
-    free(s->batch_q8);
 }
 
 // ----------------------------------------------------------------------------
@@ -2390,14 +2424,345 @@ static void matmul_b32_q8_0_batch(float* xout, const QuantizedTensor* qw, int ba
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interleaved-row matmul kernels (every format with a row dequantizer or a
+// float conversion)
+//
+// The weight rows are turned into floats four at a time, interleaved by row
+// (dst[4 * j + r] = row r, column j), so the running sums of four rows sit in
+// one vector register and advance together, one column per step. Every sum is
+// the sequential one, in column order, of the kernels this replaces:
+//  - Q8_0 and the K-quants ("fused"): sum += w * x as a single expression, the
+//    multiply-add of the dequantize-then-dot kernels below;
+//  - F16, BF16 and F32 ("split"): the product is rounded first and then added,
+//    which is what the per-row dot products (vec_dot_f16 and friends) compile
+//    to when the row length is a multiple of 4; tensors with any other row
+//    length keep using them.
+// Rows left over after the groups go through the previous kernels.
+
+// AArch64 has the half -> single conversion as an instruction, four values at
+// a time once the loop is vectorized. It gives the same floats as fp16_table
+// for every input except that a signaling NaN comes out quiet.
+#if defined(__aarch64__) && defined(__GNUC__)
+typedef __fp16 fp16_elem;
+#define FP16_ELEM_TO_FP32(v) ((float)(v))
+#else
+typedef uint16_t fp16_elem;
+#define FP16_ELEM_TO_FP32(v) fp16_to_fp32(v)
+#endif
+
+static void rows4_f16(const void* src, size_t row_size, float* restrict dst, int k) {
+    const fp16_elem* restrict r0 = (const fp16_elem*)src;
+    const fp16_elem* restrict r1 = (const fp16_elem*)((const char*)src + row_size);
+    const fp16_elem* restrict r2 = (const fp16_elem*)((const char*)src + 2 * row_size);
+    const fp16_elem* restrict r3 = (const fp16_elem*)((const char*)src + 3 * row_size);
+    for (int j = 0; j < k; j++) {
+        dst[4 * j] = FP16_ELEM_TO_FP32(r0[j]);
+        dst[4 * j + 1] = FP16_ELEM_TO_FP32(r1[j]);
+        dst[4 * j + 2] = FP16_ELEM_TO_FP32(r2[j]);
+        dst[4 * j + 3] = FP16_ELEM_TO_FP32(r3[j]);
+    }
+}
+
+static void rows4_bf16(const void* src, size_t row_size, float* restrict dst, int k) {
+    const uint16_t* restrict r0 = (const uint16_t*)src;
+    const uint16_t* restrict r1 = (const uint16_t*)((const char*)src + row_size);
+    const uint16_t* restrict r2 = (const uint16_t*)((const char*)src + 2 * row_size);
+    const uint16_t* restrict r3 = (const uint16_t*)((const char*)src + 3 * row_size);
+    for (int j = 0; j < k; j++) {
+        dst[4 * j] = bf16_to_fp32(r0[j]);
+        dst[4 * j + 1] = bf16_to_fp32(r1[j]);
+        dst[4 * j + 2] = bf16_to_fp32(r2[j]);
+        dst[4 * j + 3] = bf16_to_fp32(r3[j]);
+    }
+}
+
+static void rows4_f32(const void* src, size_t row_size, float* restrict dst, int k) {
+    const float* restrict r0 = (const float*)src;
+    const float* restrict r1 = (const float*)((const char*)src + row_size);
+    const float* restrict r2 = (const float*)((const char*)src + 2 * row_size);
+    const float* restrict r3 = (const float*)((const char*)src + 3 * row_size);
+    for (int j = 0; j < k; j++) {
+        dst[4 * j] = r0[j];
+        dst[4 * j + 1] = r1[j];
+        dst[4 * j + 2] = r2[j];
+        dst[4 * j + 3] = r3[j];
+    }
+}
+
+// Get the 4-row float conversion for a tensor (NULL: not a float format, or
+// rows whose length is not a multiple of 4)
+static inline rows4_func get_rows4_func(enum ggml_type type, int n_cols) {
+    if (n_cols & 3) return NULL;
+    switch (type) {
+        case GGML_TYPE_F16:   return rows4_f16;
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_BF16_ALT: return rows4_bf16;
+        case GGML_TYPE_F32:   return rows4_f32;
+        default:              return NULL;
+    }
+}
+
+// Columns converted per step: one K-quant block, 8 Q8_0 blocks (the converted
+// rows of a step stay in the L1 cache)
+#define ROWS4_CHUNK 256
+
+// cn columns of 4 consecutive weight rows -> interleaved floats. `rows` points
+// at the first of those columns in the first row; dequantized formats go
+// through a small stack buffer.
+static inline void rows4_convert(const QuantizedTensor* qw, const char* rows, int cn, float* restrict dst) {
+    if (qw->rows4_func) {
+        qw->rows4_func(rows, qw->row_size, dst, cn);
+    } else {
+        float rowbuf[4 * ROWS4_CHUNK];
+        deq_row_func dfunc = qw->deq_func;
+        size_t row_size = qw->row_size;
+        dfunc(rows, rowbuf, cn);
+        dfunc(rows + row_size, rowbuf + cn, cn);
+        dfunc(rows + 2 * row_size, rowbuf + 2 * cn, cn);
+        dfunc(rows + 3 * row_size, rowbuf + 3 * cn, cn);
+        rows4_f32(rowbuf, (size_t)cn * sizeof(float), dst, cn);
+    }
+}
+
+// Four floats handled as one value: a vector type where the compiler has them
+// (GCC, clang: one register, one instruction per step), a plain struct otherwise.
+// A step of four running sums is s += w * xv with xv the same for the four:
+//  - FUSED4_STEP: a single expression (the compiler may contract it into a
+//    multiply-add, exactly as it does for the scalar sum += w * x);
+//  - SPLIT4_STEP: the product is rounded before the add (two statements, so
+//    it is never contracted).
+#if defined(__GNUC__)
+typedef float float4 __attribute__((vector_size(16)));
+#define FUSED4_STEP(s, w, xv) ((s) += (w) * (xv))
+#define SPLIT4_STEP(s, w, xv) do { float4 p_ = (w) * (xv); (s) += p_; } while (0)
+#else
+typedef struct { float v[4]; } float4;
+#define FUSED4_STEP(s, w, xv) do { \
+    (s).v[0] += (w).v[0] * (xv); (s).v[1] += (w).v[1] * (xv); \
+    (s).v[2] += (w).v[2] * (xv); (s).v[3] += (w).v[3] * (xv); \
+} while (0)
+#define SPLIT4_STEP(s, w, xv) do { \
+    float p0_ = (w).v[0] * (xv), p1_ = (w).v[1] * (xv), p2_ = (w).v[2] * (xv), p3_ = (w).v[3] * (xv); \
+    (s).v[0] += p0_; (s).v[1] += p1_; (s).v[2] += p2_; (s).v[3] += p3_; \
+} while (0)
+#endif
+
+static inline float4 load4(const float* p) {
+    float4 v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+static inline void store4(float* p, float4 v) {
+    memcpy(p, &v, sizeof(v));
+}
+
+// 32 running sums (8 groups of 4 rows, buf + 4 * cn * group) over cn columns of one token
+#define DOT32_BODY(STEP) \
+    const float* b1 = buf + 4 * cn; \
+    const float* b2 = buf + 8 * cn; \
+    const float* b3 = buf + 12 * cn; \
+    const float* b4 = buf + 16 * cn; \
+    const float* b5 = buf + 20 * cn; \
+    const float* b6 = buf + 24 * cn; \
+    const float* b7 = buf + 28 * cn; \
+    float4 a0 = load4(sums), a1 = load4(sums + 4), a2 = load4(sums + 8), a3 = load4(sums + 12); \
+    float4 a4 = load4(sums + 16), a5 = load4(sums + 20), a6 = load4(sums + 24), a7 = load4(sums + 28); \
+    for (int j = 0; j < cn; j++) { \
+        float xj = x[j]; \
+        STEP(a0, load4(buf + 4 * j), xj); \
+        STEP(a1, load4(b1 + 4 * j), xj); \
+        STEP(a2, load4(b2 + 4 * j), xj); \
+        STEP(a3, load4(b3 + 4 * j), xj); \
+        STEP(a4, load4(b4 + 4 * j), xj); \
+        STEP(a5, load4(b5 + 4 * j), xj); \
+        STEP(a6, load4(b6 + 4 * j), xj); \
+        STEP(a7, load4(b7 + 4 * j), xj); \
+    } \
+    store4(sums, a0); store4(sums + 4, a1); store4(sums + 8, a2); store4(sums + 12, a3); \
+    store4(sums + 16, a4); store4(sums + 20, a5); store4(sums + 24, a6); store4(sums + 28, a7);
+
+static void dot32_fused(float* sums, const float* buf, int cn, const float* x) {
+    DOT32_BODY(FUSED4_STEP)
+}
+
+static void dot32_split(float* sums, const float* buf, int cn, const float* x) {
+    DOT32_BODY(SPLIT4_STEP)
+}
+
+// 64 running sums (8 tokens x 8 rows: sums[8 * token + row], the rows as two
+// interleaved groups wa and wb) over cn columns
+#define DOT8X8_BODY(STEP) \
+    const float* x0 = xt[0]; \
+    const float* x1 = xt[1]; \
+    const float* x2 = xt[2]; \
+    const float* x3 = xt[3]; \
+    const float* x4 = xt[4]; \
+    const float* x5 = xt[5]; \
+    const float* x6 = xt[6]; \
+    const float* x7 = xt[7]; \
+    float4 a0 = load4(sums), a1 = load4(sums + 4), a2 = load4(sums + 8), a3 = load4(sums + 12); \
+    float4 a4 = load4(sums + 16), a5 = load4(sums + 20), a6 = load4(sums + 24), a7 = load4(sums + 28); \
+    float4 a8 = load4(sums + 32), a9 = load4(sums + 36), a10 = load4(sums + 40), a11 = load4(sums + 44); \
+    float4 a12 = load4(sums + 48), a13 = load4(sums + 52), a14 = load4(sums + 56), a15 = load4(sums + 60); \
+    for (int j = 0; j < cn; j++) { \
+        float4 w0 = load4(wa + 4 * j); \
+        float4 w1 = load4(wb + 4 * j); \
+        float xv; \
+        xv = x0[j]; STEP(a0, w0, xv); STEP(a1, w1, xv); \
+        xv = x1[j]; STEP(a2, w0, xv); STEP(a3, w1, xv); \
+        xv = x2[j]; STEP(a4, w0, xv); STEP(a5, w1, xv); \
+        xv = x3[j]; STEP(a6, w0, xv); STEP(a7, w1, xv); \
+        xv = x4[j]; STEP(a8, w0, xv); STEP(a9, w1, xv); \
+        xv = x5[j]; STEP(a10, w0, xv); STEP(a11, w1, xv); \
+        xv = x6[j]; STEP(a12, w0, xv); STEP(a13, w1, xv); \
+        xv = x7[j]; STEP(a14, w0, xv); STEP(a15, w1, xv); \
+    } \
+    store4(sums, a0); store4(sums + 4, a1); store4(sums + 8, a2); store4(sums + 12, a3); \
+    store4(sums + 16, a4); store4(sums + 20, a5); store4(sums + 24, a6); store4(sums + 28, a7); \
+    store4(sums + 32, a8); store4(sums + 36, a9); store4(sums + 40, a10); store4(sums + 44, a11); \
+    store4(sums + 48, a12); store4(sums + 52, a13); store4(sums + 56, a14); store4(sums + 60, a15);
+
+static void dot8x8_fused(float* sums, const float* wa, const float* wb, int cn, const float* const* xt) {
+    DOT8X8_BODY(FUSED4_STEP)
+}
+
+static void dot8x8_split(float* sums, const float* wa, const float* wb, int cn, const float* const* xt) {
+    DOT8X8_BODY(SPLIT4_STEP)
+}
+
+// Single-token matmul: 32 rows per pass, converted in column chunks into the
+// per-thread deq_buf (8 interleaved groups of 4 rows)
+static void matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    int block_size = get_block_size(qw->type);
+    size_t type_size = get_type_size(qw->type);
+    int fused = (qw->deq_func != NULL);
+
+    // Column chunks are whole blocks; the 32 converted rows of a chunk fit the thread's region
+    int chunk = deq_buf_stride / 32;
+    if (chunk > ROWS4_CHUNK) chunk = ROWS4_CHUNK;
+    chunk -= chunk % block_size;
+
+    int ngroups = chunk > 0 ? d / 32 : 0;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 32;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        float sums[32] = {0};
+        for (int c0 = 0; c0 < n; c0 += chunk) {
+            int cn = n - c0;
+            if (cn > chunk) cn = chunk;
+            size_t boff = (size_t)(c0 / block_size) * type_size;
+            for (int q = 0; q < 8; q++) {
+                rows4_convert(qw, data + (size_t)(i + 4 * q) * row_size + boff, cn, buf + q * 4 * cn);
+            }
+            if (fused) {
+                dot32_fused(sums, buf, cn, x + c0);
+            } else {
+                dot32_split(sums, buf, cn, x + c0);
+            }
+        }
+        memcpy(xout + i, sums, sizeof(sums));
+    }
+
+    int done = ngroups * 32;
+    if (done < d) {
+        if (fused) {
+            QuantizedTensor tail = *qw;
+            tail.data = (void*)(data + (size_t)done * row_size);
+            tail.rows = d - done;
+            matmul_deq_16row(xout + done, x, &tail);
+        } else {
+            cached_dot_func dot_func = qw->dot_func;
+            for (int r = done; r < d; r++) {
+                xout[r] = dot_func(x, data + (size_t)r * row_size, n);
+            }
+        }
+    }
+}
+
+// Prefill matmul: 8 rows per pass, converted in column chunks and multiplied
+// with the tokens of the batch 8 at a time (a last group with fewer tokens
+// repeats its first one and drops the extra results)
+static void matmul_rows8_batch(float* xout, const float* x, const QuantizedTensor* qw,
+                               int batch_size, int in_stride, int out_stride) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    int block_size = get_block_size(qw->type);
+    size_t type_size = get_type_size(qw->type);
+    int fused = (qw->deq_func != NULL);
+
+    int chunk = deq_buf_stride / 8;
+    if (chunk > ROWS4_CHUNK) chunk = ROWS4_CHUNK;
+    chunk -= chunk % block_size;
+
+    int ngroups = (chunk > 0 && batch_size <= PREFILL_BATCH_SIZE) ? d / 8 : 0;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * 8;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        float sums[(PREFILL_BATCH_SIZE + 7) / 8][64];
+        memset(sums, 0, sizeof(sums));
+        for (int c0 = 0; c0 < n; c0 += chunk) {
+            int cn = n - c0;
+            if (cn > chunk) cn = chunk;
+            size_t boff = (size_t)(c0 / block_size) * type_size;
+            rows4_convert(qw, data + (size_t)i * row_size + boff, cn, buf);
+            rows4_convert(qw, data + (size_t)(i + 4) * row_size + boff, cn, buf + 4 * cn);
+            for (int b = 0; b < batch_size; b += 8) {
+                const float* xt[8];
+                for (int t = 0; t < 8; t++) {
+                    xt[t] = x + (size_t)(b + t < batch_size ? b + t : b) * in_stride + c0;
+                }
+                if (fused) {
+                    dot8x8_fused(sums[b / 8], buf, buf + 4 * cn, cn, xt);
+                } else {
+                    dot8x8_split(sums[b / 8], buf, buf + 4 * cn, cn, xt);
+                }
+            }
+        }
+        for (int b = 0; b < batch_size; b++) {
+            memcpy(xout + (size_t)b * out_stride + i, sums[b / 8] + 8 * (b % 8), 8 * sizeof(float));
+        }
+    }
+
+    int done = ngroups * 8;
+    if (done < d) {
+        if (fused) {
+            QuantizedTensor tail = *qw;
+            tail.data = (void*)(data + (size_t)done * row_size);
+            tail.rows = d - done;
+            matmul_deq_batch_4row(xout + done, x, &tail, batch_size, in_stride, out_stride);
+        } else {
+            cached_dot_func dot_func = qw->dot_func;
+            for (int r = done; r < d; r++) {
+                const void* row = data + (size_t)r * row_size;
+                for (int b = 0; b < batch_size; b++) {
+                    xout[b * out_stride + r] = dot_func(x + b * in_stride, row, n);
+                }
+            }
+        }
+    }
+}
+
 // Fused quantized matrix-vector multiplication
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
 // Uses Q8_0 quantized input path when available for integer dot products
 void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
-    // Dequantizable types (Q8_0, K-quants): 16-row dequantize-then-dot kernel
-    if (qw->deq_func && deq_buf) {
-        matmul_deq_16row(xout, x, qw);
+    // Dequantizable types (Q8_0, K-quants) and float formats (F16, BF16, F32):
+    // 32-row convert-then-dot kernel
+    if ((qw->deq_func || qw->rows4_func) && deq_buf) {
+        matmul_rows32(xout, x, qw);
         return;
     }
 
@@ -2446,7 +2811,9 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 }
 
-// Single-token matmul for the dequantizable types (Q8_0 and the K-quants):
+// Single-token matmul for the dequantizable types (Q8_0 and the K-quants),
+// used by matmul_rows32 for the rows left over after its 32-row groups and
+// when the per-thread deq_buf cannot hold one of its chunks:
 // 16 rows per pass. Dequantizes the 16 rows into the
 // per-thread deq_buf (in column chunks when 16 full rows do not fit) and runs 16
 // independent multiply-accumulate chains, so the CPU can overlap four times
@@ -2578,7 +2945,9 @@ void matmul_deq_4row(float* xout, const float* x, const QuantizedTensor* qw) {
     }
 }
 
-// Optimized batch matmul: dequantize 4 rows once, 4-token sharing dot product
+// Batch matmul used by matmul_rows8_batch for the rows left over after its
+// 8-row groups and when the per-thread deq_buf cannot hold one of its chunks:
+// dequantize 4 rows once, 4-token sharing dot product
 // (16 independent multiply-accumulate chains, one per row and token; each chain
 // is the same sequential sum += w * x as the single-token kernels)
 void matmul_deq_batch_4row(float* xout, const float* x, const QuantizedTensor* qw,
@@ -2711,9 +3080,10 @@ void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
 void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* qw,
                             int batch_size, int in_stride, int out_stride,
                             block_q8_0* q8_bufs, int q8_stride) {
-    // Dequantize-then-4row-batch path (Q8_0 + K-quants)
-    if (qw->deq_func && deq_buf) {
-        matmul_deq_batch_4row(xout, x, qw, batch_size, in_stride, out_stride);
+    // Dequantizable types (Q8_0, K-quants) and float formats (F16, BF16, F32):
+    // 8 rows x 8 tokens per pass
+    if ((qw->deq_func || qw->rows4_func) && deq_buf) {
+        matmul_rows8_batch(xout, x, qw, batch_size, in_stride, out_stride);
         return;
     }
 
@@ -2746,6 +3116,11 @@ void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* 
         }
     } else {
         cached_dot_func dot_func = qw->dot_func;
+        if (!dot_func) {
+            fprintf(stderr, "Unsupported quantization type in matmul: %d\n", qw->type);
+            exit(1);
+        }
+
         int i;
         #pragma omp parallel for private(i)
         for (i = 0; i < d; i++) {
@@ -2795,9 +3170,10 @@ typedef struct {
     GGUFKeyValue* kv;
     GGUFTensor* tensors;
     void* tensor_data_start;
-    // Tokenizer vocabulary from GGUF
-    char** vocab_tokens;
-    float* vocab_scores;
+    // Tokenizer vocabulary from GGUF: the token strings back to back, each one
+    // NUL-terminated (handed over to the tokenizer by init_tokenizer_from_gguf)
+    char* vocab_data;
+    uint32_t* vocab_offsets;  // (vocab_size + 1) start of every token in vocab_data
     uint64_t vocab_size;
 } GGUFFile;
 
@@ -2815,6 +3191,151 @@ char* read_gguf_string(FILE* f) {
     }
     str[len] = '\0';
     return str;
+}
+
+int read_gguf_value(FILE* f, enum gguf_type type, GGUFKeyValue* kv);
+
+// Block reader for the long string arrays of the header (the vocabulary has
+// hundreds of thousands of strings): one fread per block instead of two per string
+typedef struct {
+    FILE* f;
+    size_t at;    // next unread byte of buf
+    size_t have;  // bytes of buf that are valid
+    unsigned char buf[65536];
+} GGUFBlockReader;
+
+// Copy (or, with dst == NULL, skip) the next n bytes of the file
+static int block_reader_take(GGUFBlockReader* r, char* dst, uint64_t n) {
+    while (n > 0) {
+        if (r->at == r->have) {
+            r->have = fread(r->buf, 1, sizeof(r->buf), r->f);
+            r->at = 0;
+            if (r->have == 0) return 0;
+        }
+        size_t part = r->have - r->at;
+        if (part > n) part = (size_t)n;
+        if (dst) {
+            memcpy(dst, r->buf + r->at, part);
+            dst += part;
+        }
+        r->at += part;
+        n -= part;
+    }
+    return 1;
+}
+
+// Give back to the FILE the bytes that were read ahead
+static int block_reader_close(GGUFBlockReader* r) {
+    if (r->have == r->at) return 1;
+    return fseek(r->f, -(long)(r->have - r->at), SEEK_CUR) == 0;
+}
+
+// Skip the elements of a GGUF array: one seek for the fixed-size types, the
+// strings through the block reader (no allocation per element)
+static int skip_gguf_array(FILE* f, uint32_t arr_type, uint64_t arr_len) {
+    uint64_t elem_size = 0;
+    switch (arr_type) {
+        case GGUF_TYPE_UINT8:
+        case GGUF_TYPE_INT8:
+        case GGUF_TYPE_BOOL:
+            elem_size = 1; break;
+        case GGUF_TYPE_UINT16:
+        case GGUF_TYPE_INT16:
+            elem_size = 2; break;
+        case GGUF_TYPE_UINT32:
+        case GGUF_TYPE_INT32:
+        case GGUF_TYPE_FLOAT32:
+            elem_size = 4; break;
+        case GGUF_TYPE_UINT64:
+        case GGUF_TYPE_INT64:
+        case GGUF_TYPE_FLOAT64:
+            elem_size = 8; break;
+        case GGUF_TYPE_STRING: {
+            GGUFBlockReader reader;
+            reader.f = f;
+            reader.at = reader.have = 0;
+            for (uint64_t i = 0; i < arr_len; i++) {
+                uint64_t len;
+                if (!block_reader_take(&reader, (char*)&len, sizeof(uint64_t))) return 0;
+                if (!block_reader_take(&reader, NULL, len)) return 0;
+            }
+            return block_reader_close(&reader);
+        }
+        default:
+            // Nested arrays: element by element
+            for (uint64_t i = 0; i < arr_len; i++) {
+                GGUFKeyValue dummy;
+                if (!read_gguf_value(f, arr_type, &dummy)) return 0;
+            }
+            return 1;
+    }
+    return fseek(f, arr_len * elem_size, SEEK_CUR) == 0;
+}
+
+// Read the tokenizer.ggml.tokens array into one block: the token strings back
+// to back, each NUL-terminated, plus the offset of every token (a token ends
+// at its first NUL byte, like the C strings this replaces)
+static int read_gguf_vocab(FILE* f, GGUFFile* gguf) {
+    uint32_t arr_type;
+    uint64_t arr_len;
+    if (fread(&arr_type, sizeof(uint32_t), 1, f) != 1) return 0;
+    if (fread(&arr_len, sizeof(uint64_t), 1, f) != 1) return 0;
+    if (arr_type != GGUF_TYPE_STRING || gguf->vocab_data) {
+        return skip_gguf_array(f, arr_type, arr_len);
+    }
+
+    if (debug_mode) {
+        printf("Loading vocabulary from GGUF: %llu tokens\n", (unsigned long long)arr_len);
+    }
+
+    // The capacity is only address space until it is written
+    size_t capacity = (size_t)arr_len * 16 + 64;
+    size_t used = 0;
+    char* data = (char*)malloc(capacity);
+    uint32_t* offsets = (uint32_t*)malloc((size_t)(arr_len + 1) * sizeof(uint32_t));
+    int ok = (data != NULL && offsets != NULL);
+
+    GGUFBlockReader reader;
+    reader.f = f;
+    reader.at = reader.have = 0;
+    for (uint64_t j = 0; ok && j < arr_len; j++) {
+        uint64_t len;
+        if (!block_reader_take(&reader, (char*)&len, sizeof(uint64_t))
+            || len > 0x7FFFFFFF || used + len + 1 > 0xFFFFFFFFu) {
+            ok = 0;
+            break;
+        }
+        if (used + len + 1 > capacity) {
+            capacity = capacity * 2 + (size_t)len + 1;
+            char* grown = (char*)realloc(data, capacity);
+            if (!grown) {
+                ok = 0;
+                break;
+            }
+            data = grown;
+        }
+        if (!block_reader_take(&reader, data + used, len)) {
+            ok = 0;
+            break;
+        }
+        data[used + len] = '\0';
+        offsets[j] = (uint32_t)used;
+        used += strlen(data + used) + 1;
+    }
+    if (ok && !block_reader_close(&reader)) ok = 0;
+
+    if (!ok) {
+        free(data);
+        free(offsets);
+        return 0;
+    }
+
+    offsets[arr_len] = (uint32_t)used;
+    char* shrunk = (char*)realloc(data, used > 0 ? used : 1);
+    gguf->vocab_data = shrunk ? shrunk : data;
+    gguf->vocab_offsets = offsets;
+    gguf->vocab_size = arr_len;
+    return 1;
 }
 
 // Read a GGUF value based on type
@@ -2847,20 +3368,14 @@ int read_gguf_value(FILE* f, enum gguf_type type, GGUFKeyValue* kv) {
             kv->value.str = read_gguf_string(f);
             return kv->value.str != NULL;
         case GGUF_TYPE_ARRAY:
-            // Skip arrays for now (used for tokenizer)
+            // Arrays are skipped (the tokenizer vocabulary is read by read_gguf_vocab)
             {
                 uint32_t arr_type;
                 uint64_t arr_len;
                 if (fread(&arr_type, sizeof(uint32_t), 1, f) != 1) return 0;
                 if (fread(&arr_len, sizeof(uint64_t), 1, f) != 1) return 0;
-                // Skip array contents
-                for (uint64_t i = 0; i < arr_len; i++) {
-                    GGUFKeyValue dummy;
-                    if (!read_gguf_value(f, arr_type, &dummy)) return 0;
-                    if (arr_type == GGUF_TYPE_STRING) free(dummy.value.str);
-                }
+                return skip_gguf_array(f, arr_type, arr_len);
             }
-            return 1;
         default:
             return 0;
     }
@@ -2923,6 +3438,8 @@ const char* get_gguf_string(GGUFFile* gguf, const char* key) {
     return kv->value.str;
 }
 
+void free_gguf_file(GGUFFile* gguf);
+
 // Parse GGUF file header and metadata
 GGUFFile* parse_gguf_file(const char* filename) {
     FILE* f = fopen(filename, "rb");
@@ -2984,61 +3501,62 @@ GGUFFile* parse_gguf_file(const char* filename) {
 
     // Allocate and read key-value pairs
     gguf->kv = calloc(gguf->n_kv, sizeof(GGUFKeyValue));
+    if (!gguf->kv && gguf->n_kv > 0) goto fail;
     for (uint64_t i = 0; i < gguf->n_kv; i++) {
         gguf->kv[i].key = read_gguf_string(f);
         if (!gguf->kv[i].key) {
             fprintf(stderr, "Failed to read key %llu\n", (unsigned long long)i);
-            // Cleanup and return
-            fclose(f);
-            return NULL;
+            goto fail;
         }
 
         uint32_t type;
         if (fread(&type, sizeof(uint32_t), 1, f) != 1) {
             fprintf(stderr, "Failed to read type for key: %s\n", gguf->kv[i].key);
-            fclose(f);
-            return NULL;
+            goto fail;
         }
 
-        if (!read_gguf_value(f, type, &gguf->kv[i])) {
+        int value_ok;
+        if (type == GGUF_TYPE_ARRAY && strcmp(gguf->kv[i].key, "tokenizer.ggml.tokens") == 0) {
+            // Tokenizer vocabulary: the only array that is kept
+            gguf->kv[i].type = GGUF_TYPE_ARRAY;
+            value_ok = read_gguf_vocab(f, gguf);
+        } else {
+            value_ok = read_gguf_value(f, type, &gguf->kv[i]);
+        }
+        if (!value_ok) {
             fprintf(stderr, "Failed to read value for key: %s\n", gguf->kv[i].key);
-            fclose(f);
-            return NULL;
+            goto fail;
         }
     }
 
     // Allocate and read tensor info
     gguf->tensors = calloc(gguf->n_tensors, sizeof(GGUFTensor));
+    if (!gguf->tensors && gguf->n_tensors > 0) goto fail;
     for (uint64_t i = 0; i < gguf->n_tensors; i++) {
         gguf->tensors[i].name = read_gguf_string(f);
         if (!gguf->tensors[i].name) {
             fprintf(stderr, "Failed to read tensor name %llu\n", (unsigned long long)i);
-            fclose(f);
-            return NULL;
+            goto fail;
         }
 
         if (fread(&gguf->tensors[i].n_dims, sizeof(uint32_t), 1, f) != 1) {
-            fclose(f);
-            return NULL;
+            goto fail;
         }
 
         for (uint32_t j = 0; j < gguf->tensors[i].n_dims; j++) {
             if (fread(&gguf->tensors[i].ne[j], sizeof(uint64_t), 1, f) != 1) {
-                fclose(f);
-                return NULL;
+                goto fail;
             }
         }
 
         uint32_t type;
         if (fread(&type, sizeof(uint32_t), 1, f) != 1) {
-            fclose(f);
-            return NULL;
+            goto fail;
         }
         gguf->tensors[i].type = type;
 
         if (fread(&gguf->tensors[i].offset, sizeof(uint64_t), 1, f) != 1) {
-            fclose(f);
-            return NULL;
+            goto fail;
         }
     }
 
@@ -3048,6 +3566,7 @@ GGUFFile* parse_gguf_file(const char* filename) {
     int64_t tensor_data_offset = ((header_end + alignment - 1) / alignment) * alignment;
 
     fclose(f);
+    f = NULL;
 
     // Memory map the file for tensor data access
 #if defined _WIN32
@@ -3056,27 +3575,27 @@ GGUFFile* parse_gguf_file(const char* filename) {
                                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile == INVALID_HANDLE_VALUE) {
             fprintf(stderr, "Failed to open file for mmap\n");
-            return NULL;
+            goto fail;
         }
         LARGE_INTEGER file_size_li;
         if (!GetFileSizeEx(hFile, &file_size_li)) {
             fprintf(stderr, "Failed to get file size\n");
             CloseHandle(hFile);
-            return NULL;
+            goto fail;
         }
         size_t file_size = (size_t)file_size_li.QuadPart;
         HANDLE hMapping = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
         CloseHandle(hFile);
         if (!hMapping) {
             fprintf(stderr, "Failed to create file mapping\n");
-            return NULL;
+            goto fail;
         }
         mapped_data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
         CloseHandle(hMapping);
         mapped_size = file_size;
         if (!mapped_data) {
             fprintf(stderr, "Failed to map view of file\n");
-            return NULL;
+            goto fail;
         }
     }
 #else
@@ -3084,7 +3603,7 @@ GGUFFile* parse_gguf_file(const char* filename) {
         int fd = open(filename, O_RDONLY);
         if (fd == -1) {
             fprintf(stderr, "Failed to open file for mmap\n");
-            return NULL;
+            goto fail;
         }
         off_t file_size = lseek(fd, 0, SEEK_END);
         lseek(fd, 0, SEEK_SET);
@@ -3094,7 +3613,7 @@ GGUFFile* parse_gguf_file(const char* filename) {
         if (mapped_data == MAP_FAILED) {
             fprintf(stderr, "Failed to mmap file\n");
             mapped_data = NULL;
-            return NULL;
+            goto fail;
         }
     }
 #endif
@@ -3106,143 +3625,39 @@ GGUFFile* parse_gguf_file(const char* filename) {
         gguf->tensors[i].data = (char*)gguf->tensor_data_start + gguf->tensors[i].offset;
     }
 
-    // Initialize vocab pointers to NULL
-    gguf->vocab_tokens = NULL;
-    gguf->vocab_scores = NULL;
-    gguf->vocab_size = 0;
-
     return gguf;
-}
 
-// Load tokenizer vocabulary from GGUF file
-// This re-reads the file to extract the tokenizer.ggml.tokens and tokenizer.ggml.scores arrays
-int load_gguf_tokenizer(GGUFFile* gguf, const char* filename) {
-    FILE* f = fopen(filename, "rb");
-    if (!f) return 0;
-
-    // Skip magic and version
-    fseek(f, 8, SEEK_SET);
-
-    uint64_t n_tensors, n_kv;
-    if (fread(&n_tensors, sizeof(uint64_t), 1, f) != 1) { fclose(f); return 0; }
-    if (fread(&n_kv, sizeof(uint64_t), 1, f) != 1) { fclose(f); return 0; }
-
-    // Scan through key-value pairs looking for tokenizer arrays
-    for (uint64_t i = 0; i < n_kv; i++) {
-        char* key = read_gguf_string(f);
-        if (!key) { fclose(f); return 0; }
-
-        uint32_t type;
-        if (fread(&type, sizeof(uint32_t), 1, f) != 1) { free(key); fclose(f); return 0; }
-
-        if (type == GGUF_TYPE_ARRAY) {
-            uint32_t arr_type;
-            uint64_t arr_len;
-            if (fread(&arr_type, sizeof(uint32_t), 1, f) != 1) { free(key); fclose(f); return 0; }
-            if (fread(&arr_len, sizeof(uint64_t), 1, f) != 1) { free(key); fclose(f); return 0; }
-
-            if (strcmp(key, "tokenizer.ggml.tokens") == 0 && arr_type == GGUF_TYPE_STRING) {
-                // Read token strings
-                if (debug_mode) {
-                    printf("Loading vocabulary from GGUF: %llu tokens\n", (unsigned long long)arr_len);
-                }
-                gguf->vocab_size = arr_len;
-                gguf->vocab_tokens = (char**)malloc(arr_len * sizeof(char*));
-                if (!gguf->vocab_tokens) { free(key); fclose(f); return 0; }
-
-                for (uint64_t j = 0; j < arr_len; j++) {
-                    gguf->vocab_tokens[j] = read_gguf_string(f);
-                    if (!gguf->vocab_tokens[j]) {
-                        // Cleanup on failure
-                        for (uint64_t k = 0; k < j; k++) free(gguf->vocab_tokens[k]);
-                        free(gguf->vocab_tokens);
-                        gguf->vocab_tokens = NULL;
-                        free(key);
-                        fclose(f);
-                        return 0;
-                    }
-                }
-            } else if (strcmp(key, "tokenizer.ggml.scores") == 0 && arr_type == GGUF_TYPE_FLOAT32) {
-                // Read token scores
-                if (!gguf->vocab_scores) {
-                    gguf->vocab_scores = (float*)malloc(arr_len * sizeof(float));
-                }
-                if (gguf->vocab_scores) {
-                    if (fread(gguf->vocab_scores, sizeof(float), arr_len, f) != arr_len) {
-                        free(gguf->vocab_scores);
-                        gguf->vocab_scores = NULL;
-                    }
-                }
-            } else {
-                // Skip other arrays (batch-seek for fixed-size types)
-                switch (arr_type) {
-                    case GGUF_TYPE_UINT8:
-                    case GGUF_TYPE_INT8:
-                    case GGUF_TYPE_BOOL:
-                        fseek(f, arr_len * 1, SEEK_CUR); break;
-                    case GGUF_TYPE_UINT16:
-                    case GGUF_TYPE_INT16:
-                        fseek(f, arr_len * 2, SEEK_CUR); break;
-                    case GGUF_TYPE_UINT32:
-                    case GGUF_TYPE_INT32:
-                    case GGUF_TYPE_FLOAT32:
-                        fseek(f, arr_len * 4, SEEK_CUR); break;
-                    case GGUF_TYPE_UINT64:
-                    case GGUF_TYPE_INT64:
-                    case GGUF_TYPE_FLOAT64:
-                        fseek(f, arr_len * 8, SEEK_CUR); break;
-                    case GGUF_TYPE_STRING:
-                        for (uint64_t j = 0; j < arr_len; j++) {
-                            char* s = read_gguf_string(f);
-                            free(s);
-                        }
-                        break;
-                    default: break;
-                }
-            }
-        } else {
-            // Skip non-array values
-            GGUFKeyValue dummy;
-            read_gguf_value(f, type, &dummy);
-            if (type == GGUF_TYPE_STRING) free(dummy.value.str);
-        }
-        free(key);
-    }
-
-    fclose(f);
-
-    // If we didn't get scores, initialize them to 0
-    if (gguf->vocab_tokens && !gguf->vocab_scores) {
-        gguf->vocab_scores = (float*)calloc(gguf->vocab_size, sizeof(float));
-    }
-
-    return (gguf->vocab_tokens != NULL);
+fail:
+    // Release everything that was read before the error
+    if (f) fclose(f);
+    free_gguf_file(gguf);
+    return NULL;
 }
 
 void free_gguf_file(GGUFFile* gguf) {
     if (!gguf) return;
 
-    for (uint64_t i = 0; i < gguf->n_kv; i++) {
-        free(gguf->kv[i].key);
-        if (gguf->kv[i].type == GGUF_TYPE_STRING) {
-            free(gguf->kv[i].value.str);
+    // kv / tensors are NULL when the header could not be read that far
+    if (gguf->kv) {
+        for (uint64_t i = 0; i < gguf->n_kv; i++) {
+            free(gguf->kv[i].key);
+            if (gguf->kv[i].type == GGUF_TYPE_STRING) {
+                free(gguf->kv[i].value.str);
+            }
         }
+        free(gguf->kv);
     }
-    free(gguf->kv);
 
-    for (uint64_t i = 0; i < gguf->n_tensors; i++) {
-        free(gguf->tensors[i].name);
-    }
-    free(gguf->tensors);
-
-    // Free vocabulary if loaded
-    if (gguf->vocab_tokens) {
-        for (uint64_t i = 0; i < gguf->vocab_size; i++) {
-            free(gguf->vocab_tokens[i]);
+    if (gguf->tensors) {
+        for (uint64_t i = 0; i < gguf->n_tensors; i++) {
+            free(gguf->tensors[i].name);
         }
-        free(gguf->vocab_tokens);
+        free(gguf->tensors);
     }
-    free(gguf->vocab_scores);
+
+    // Free vocabulary if it was not handed over to the tokenizer
+    free(gguf->vocab_data);
+    free(gguf->vocab_offsets);
 
     free(gguf);
 }
@@ -3251,14 +3666,14 @@ void free_gguf_file(GGUFFile* gguf) {
 // Load weights from GGUF into TransformerWeights
 
 void track_allocation(float* ptr) {
-    num_weight_allocations++;
-    float** new_allocations = realloc(weight_allocations, num_weight_allocations * sizeof(float*));
+    float** new_allocations = realloc(weight_allocations, (num_weight_allocations + 1) * sizeof(float*));
     if (!new_allocations) {
-        fprintf(stderr, "Failed to allocate memory for weight tracking (allocation #%d)\n", num_weight_allocations);
+        fprintf(stderr, "Failed to allocate memory for weight tracking (allocation #%d)\n", num_weight_allocations + 1);
+        free(ptr);
         exit(1);
     }
     weight_allocations = new_allocations;
-    weight_allocations[num_weight_allocations - 1] = ptr;
+    weight_allocations[num_weight_allocations++] = ptr;
 }
 
 void free_tracked_allocation(float* ptr) {
@@ -3345,6 +3760,7 @@ int load_tensor_quantized(GGUFFile* gguf, const char* name, QuantizedTensor* qt,
     qt->q8_func = get_vec_dot_q8_func(tensor->type);
     qt->dot_func = get_vec_dot_func(tensor->type);
     qt->deq_func = get_deq_row_func(tensor->type);
+    qt->rows4_func = get_rows4_func(tensor->type, cols);
 
     return 1;
 }
@@ -3503,6 +3919,7 @@ int init_weights_from_gguf(GGUFFile* gguf, Config* p, TransformerWeights* w) {
         w->wcls.q8_func = get_vec_dot_q8_func(w->token_embedding_type);
         w->wcls.dot_func = get_vec_dot_func(w->token_embedding_type);
         w->wcls.deq_func = get_deq_row_func(w->token_embedding_type);
+        w->wcls.rows4_func = get_rows4_func(w->token_embedding_type, p->dim);
     }
 
     return 1;
@@ -3625,6 +4042,8 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
     float eps = p->rms_norm_eps > 0 ? p->rms_norm_eps : 1e-5f;
     float inv_dim = s->inv_dim;
     float inv_head_size = s->inv_head_size;
+
+    if (pos >= s->rope_filled) rope_fill(s, pos + 1);
 
     // Embedding (scaling fused into first rmsnorm)
     // dequantize the token embedding into x (on-demand, saves memory)
@@ -3891,6 +4310,8 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
     block_q8_0* bq8 = s->batch_q8;
     int q8_stride = s->batch_q8_stride;
 
+    rope_fill(s, start_pos + batch_size);
+
     // Embed all tokens in batch
     for (int b = 0; b < batch_size; b++) {
         int tok = tokens[start_pos + b];
@@ -4133,10 +4554,10 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 #define LLAMA3_EOT 128009              // <|eot_id|>
 
 typedef struct {
-    char** vocab;
-    float* vocab_scores;
+    char* vocab_data;          // token strings back to back, each NUL-terminated
+    uint32_t* vocab_offsets;   // (vocab_size + 1) start of every token in vocab_data
     int vocab_size;
-    unsigned int max_token_length;
+    unsigned int max_token_length;  // bytes of the longest token
     int bos_token;
     int eos_token;
     // Special tokens
@@ -4146,6 +4567,15 @@ typedef struct {
 } Tokenizer;
 
 Tokenizer tokenizer;
+
+// Token string / byte length by id
+static inline const char* vocab_token(int id) {
+    return tokenizer.vocab_data + tokenizer.vocab_offsets[id];
+}
+
+static inline int vocab_token_len(int id) {
+    return (int)(tokenizer.vocab_offsets[id + 1] - tokenizer.vocab_offsets[id]) - 1;
+}
 
 // Decode token string to printable text
 // Handles both tiktoken (BPE) and SentencePiece formats:
@@ -4404,157 +4834,102 @@ char* text_to_sentencepiece(const char* text) {
     return result;
 }
 
-// Flat CSR byte trie for longest-match vocab lookup. The old
-// `TrieNode { TrieNode* children[256]; int id; int len; }` was 2056 bytes
-// per node × ~1.6M nodes on Gemma's 262k-token vocab ≈ 3 GB virtual /
-// 1.28 GB dirty, because each node carried a 256-pointer fan-out array.
-//
-// CSR layout:
-//   trie_node_id[N]      : int32, token id for terminal nodes, -1 otherwise
-//   trie_child_start[N+1]: int32, per-node CSR offset into edge arrays
-//                          (children of n are at [child_start[n], child_start[n+1]))
-//   trie_edge_char[E]    : uint8, byte value of each edge (sorted per parent)
-//   trie_edge_target[E]  : int32, target node index of each edge
-// Totals ~19 MB instead of 1.28 GB for Gemma — same data structure the JS
-// engine uses (see llama3pure-js-engine.js `trieChildStart`/`trieEdgeChar`).
-static int32_t* trie_node_id = NULL;
-static int32_t* trie_child_start = NULL;
-static uint8_t* trie_edge_char = NULL;
-static int32_t* trie_edge_target = NULL;
-static int trie_built = 0;
+// Tokenizer lookup: chained hash table over the bytes of every non-empty token
+// (head[hash & mask] = highest id of the chain, next[id] = the next lower one,
+// -1 ends it) plus one bit per hashed token prefix, which tells when no token
+// can extend the bytes matched so far. Built in the scratch block on the first
+// bpe_encode() and dropped by free_vocab_hash() once the prompt is tokenized.
+static int32_t* vocab_hash_head = NULL;
+static int32_t* vocab_hash_next = NULL;
+static uint8_t* vocab_prefix_bits = NULL;
+static uint32_t vocab_hash_mask = 0;
+static uint32_t vocab_prefix_shift = 0;
 
-// O(1) single-byte token lookup (fallback when trie walk misses)
-static int single_char_token[256];
+// Bit of a prefix hash in vocab_prefix_bits
+#define VOCAB_PREFIX_BIT(h) (((h) * 2654435761u) >> vocab_prefix_shift)
 
-// qsort comparator state: the vocab pointer is set transiently around the
-// sort call (no reentrancy, single-threaded load).
-static char** __sort_vocab = NULL;
-static int __sort_cmp_vocab(const void* a, const void* b) {
-    int ia = *(const int*)a;
-    int ib = *(const int*)b;
-    return strcmp(__sort_vocab[ia], __sort_vocab[ib]);
+// Bytes of the lookup tables: a power-of-two bucket count with about 4 tokens
+// per chain and a power-of-two bit count with at least 2 bits per token byte
+static size_t vocab_hash_size(uint32_t* buckets_out, uint32_t* bits_log2_out) {
+    uint32_t buckets = 256;
+    while (buckets * 4 < (uint32_t)tokenizer.vocab_size) buckets <<= 1;
+    size_t total_bytes = tokenizer.vocab_offsets[tokenizer.vocab_size];
+    uint32_t bits_log2 = 16;
+    while (bits_log2 < 31 && ((size_t)1 << bits_log2) < total_bytes * 2) bits_log2++;
+    if (buckets_out) *buckets_out = buckets;
+    if (bits_log2_out) *bits_log2_out = bits_log2;
+    return ((size_t)buckets + tokenizer.vocab_size) * sizeof(int32_t) + ((size_t)1 << (bits_log2 - 3));
 }
 
-void build_sorted_vocab(char** vocab, int vocab_size) {
-    if (trie_built) return;
-    trie_built = 1;
+static void build_vocab_hash(void) {
+    if (vocab_hash_head) return;
+    int vocab_size = tokenizer.vocab_size;
+    uint32_t buckets, bits_log2;
+    size_t size = vocab_hash_size(&buckets, &bits_log2);
+    if (!run_scratch || run_scratch_size < size) {
+        fprintf(stderr, "Tokenizer lookup table does not fit the scratch block\n");
+        exit(1);
+    }
 
-    // Collect indices of non-empty tokens; record max length for path[] stack
-    int count = 0;
-    int max_len = 0;
+    int32_t* head = (int32_t*)run_scratch;
+    int32_t* next = head + buckets;
+    uint8_t* bits = (uint8_t*)(next + vocab_size);
+    uint32_t mask = buckets - 1;
+    vocab_prefix_shift = 32 - bits_log2;
+    for (uint32_t b = 0; b < buckets; b++) head[b] = -1;
+    memset(bits, 0, (size_t)1 << (bits_log2 - 3));
+
     for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && vocab[i][0]) {
-            count++;
-            int L = (int)strlen(vocab[i]);
-            if (L > max_len) max_len = L;
+        const unsigned char* s = (const unsigned char*)vocab_token(i);
+        int len = vocab_token_len(i);
+        if (len > 0) {
+            uint32_t h = 0;
+            for (int k = 0; k < len; k++) {
+                h = h * 31 + s[k];
+                uint32_t bit = VOCAB_PREFIX_BIT(h);
+                bits[bit >> 3] |= (uint8_t)(1 << (bit & 7));
+            }
+            next[i] = head[h & mask];
+            head[h & mask] = i;
         }
     }
-    if (count == 0) return;
 
-    int* indices = malloc((size_t)count * sizeof(int));
-    int w = 0;
-    for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && vocab[i][0]) indices[w++] = i;
-    }
+    vocab_hash_head = head;
+    vocab_hash_next = next;
+    vocab_prefix_bits = bits;
+    vocab_hash_mask = mask;
+}
 
-    // Sort indices by byte-wise string comparison so identical prefixes end
-    // up adjacent — enables O(totalBytes) LCP-based trie build.
-    __sort_vocab = vocab;
-    qsort(indices, (size_t)count, sizeof(int), __sort_cmp_vocab);
-    __sort_vocab = NULL;
+// The scratch block goes to the next phase
+static void free_vocab_hash(void) {
+    vocab_hash_head = NULL;
+    vocab_hash_next = NULL;
+    vocab_prefix_bits = NULL;
+}
 
-    // Pass 1: count the total unique trie nodes via prev-token LCP.
-    int total_nodes = 1;  // root
-    const char* prev = "";
-    int prev_len = 0;
-    for (int m = 0; m < count; m++) {
-        const char* s = vocab[indices[m]];
-        int s_len = (int)strlen(s);
-        int min_len = prev_len < s_len ? prev_len : s_len;
-        int lcp = 0;
-        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
-        total_nodes += s_len - lcp;
-        prev = s;
-        prev_len = s_len;
-    }
-    int total_edges = total_nodes - 1;
-
-    // Allocate exact-size CSR arrays. child_start is used as a per-node
-    // child *count* during pass 2 (via child_start[parent+1]++), then
-    // prefix-summed into real start offsets.
-    trie_node_id = malloc((size_t)total_nodes * sizeof(int32_t));
-    for (int i = 0; i < total_nodes; i++) trie_node_id[i] = -1;
-    trie_child_start = calloc((size_t)total_nodes + 1, sizeof(int32_t));
-    trie_edge_char = malloc((size_t)total_edges);
-    trie_edge_target = malloc((size_t)total_edges * sizeof(int32_t));
-
-    int* path = malloc((size_t)(max_len + 1) * sizeof(int));
-    path[0] = 0;
-
-    // Pass 2: assign node ids and count children per node.
-    int node_idx = 1;
-    prev = "";
-    prev_len = 0;
-    for (int m = 0; m < count; m++) {
-        const char* s = vocab[indices[m]];
-        int s_len = (int)strlen(s);
-        int min_len = prev_len < s_len ? prev_len : s_len;
-        int lcp = 0;
-        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
-        for (int j = lcp; j < s_len; j++) {
-            int parent = path[j];
-            trie_child_start[parent + 1]++;
-            int new_node = node_idx++;
-            path[j + 1] = new_node;
-        }
-        prev = s;
-        prev_len = s_len;
-    }
-
-    // Prefix-sum counts into cumulative start offsets.
-    for (int n = 1; n <= total_nodes; n++) {
-        trie_child_start[n] += trie_child_start[n - 1];
-    }
-
-    // Pass 3: fill edges. Tokens are sorted lex by byte, so children at each
-    // parent are emitted in ascending byte order — matches CSR layout.
-    int* write_cursor = malloc((size_t)total_nodes * sizeof(int));
-    for (int i = 0; i < total_nodes; i++) write_cursor[i] = trie_child_start[i];
-    path[0] = 0;
-    node_idx = 1;
-    prev = "";
-    prev_len = 0;
-    for (int m = 0; m < count; m++) {
-        int tok_id = indices[m];
-        const char* s = vocab[tok_id];
-        int s_len = (int)strlen(s);
-        int min_len = prev_len < s_len ? prev_len : s_len;
-        int lcp = 0;
-        while (lcp < min_len && (unsigned char)prev[lcp] == (unsigned char)s[lcp]) lcp++;
-        for (int j = lcp; j < s_len; j++) {
-            int parent = path[j];
-            int new_node = node_idx++;
-            int wi = write_cursor[parent]++;
-            trie_edge_char[wi] = (unsigned char)s[j];
-            trie_edge_target[wi] = new_node;
-            path[j + 1] = new_node;
-        }
-        trie_node_id[path[s_len]] = tok_id;
-        prev = s;
-        prev_len = s_len;
-    }
-
-    free(write_cursor);
-    free(path);
-    free(indices);
-
-    // Build O(1) single-byte token lookup for bpe_encode fallback.
-    memset(single_char_token, -1, sizeof(single_char_token));
-    for (int i = 0; i < vocab_size; i++) {
-        if (vocab[i] && vocab[i][0] && vocab[i][1] == '\0') {
-            single_char_token[(unsigned char)vocab[i][0]] = i;
+// Longest token whose bytes are a prefix of text[0 .. limit), or -1: the hash
+// of every prefix is looked up as it grows, the last hit wins, and the walk
+// stops at the first prefix that no token starts with.
+static int vocab_longest_match(const unsigned char* text, size_t limit, int* match_len) {
+    const int32_t* head = vocab_hash_head;
+    const int32_t* next = vocab_hash_next;
+    const uint8_t* bits = vocab_prefix_bits;
+    uint32_t mask = vocab_hash_mask;
+    int best = -1;
+    uint32_t h = 0;
+    for (size_t n = 1; n <= limit; n++) {
+        h = h * 31 + text[n - 1];
+        uint32_t bit = VOCAB_PREFIX_BIT(h);
+        if (!(bits[bit >> 3] & (1 << (bit & 7)))) break;
+        for (int32_t id = head[h & mask]; id != -1; id = next[id]) {
+            if ((size_t)vocab_token_len(id) == n && memcmp(vocab_token(id), text, n) == 0) {
+                best = id;
+                *match_len = (int)n;
+                break;
+            }
         }
     }
+    return best;
 }
 
 // Greedy longest-match tokenizer
@@ -4562,11 +4937,7 @@ void build_sorted_vocab(char** vocab, int vocab_size) {
 // Global flag for tokenizer type (0 = tiktoken/BPE, 1 = SentencePiece)
 int use_sentencepiece = 0;
 
-void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
-                unsigned int max_token_length, int *tokens, int *n_tokens) {
-    (void)vocab_scores;  // Not used in greedy approach
-    (void)max_token_length;
-
+void bpe_encode(const char *text, int *tokens, int *n_tokens) {
     *n_tokens = 0;
     if (!text || !*text) return;
 
@@ -4579,44 +4950,25 @@ void bpe_encode(char *text, char **vocab, float *vocab_scores, int vocab_size,
     }
     if (!encoded_text) return;
 
-    // Build sorted vocab for efficient lookup
-    build_sorted_vocab(vocab, vocab_size);
+    // Build the vocabulary lookup table on first use
+    build_vocab_hash();
 
+    const unsigned char* bytes = (const unsigned char*)encoded_text;
     size_t text_len = strlen(encoded_text);
+    size_t max_len = tokenizer.max_token_length;
     size_t pos = 0;
 
     while (pos < text_len) {
-        // Walk CSR byte trie for longest match at current position.
-        int32_t node = 0;  // root
-        int best_id = -1;
+        size_t limit = text_len - pos;
+        if (limit > max_len) limit = max_len;
         int best_len = 0;
-        for (size_t j = pos; j < text_len; j++) {
-            unsigned char ch = (unsigned char)encoded_text[j];
-            int32_t cs = trie_child_start[node];
-            int32_t ce = trie_child_start[node + 1];
-            int32_t next = -1;
-            for (int32_t k = cs; k < ce; k++) {
-                if (trie_edge_char[k] == ch) { next = trie_edge_target[k]; break; }
-            }
-            if (next < 0) break;
-            node = next;
-            int32_t nid = trie_node_id[node];
-            if (nid >= 0) {
-                best_id = (int)nid;
-                best_len = (int)(j - pos + 1);
-            }
-        }
+        int best_id = vocab_longest_match(bytes + pos, limit, &best_len);
 
         if (best_id != -1) {
             tokens[(*n_tokens)++] = best_id;
             pos += best_len;
         } else {
-            // No match found - use O(1) single-byte token lookup
-            int sid = single_char_token[(unsigned char)encoded_text[pos]];
-            if (sid >= 0) {
-                tokens[(*n_tokens)++] = sid;
-            }
-            // Skip this character regardless
+            // No token starts here - skip this byte
             pos++;
         }
     }
@@ -4631,40 +4983,30 @@ int init_tokenizer_from_gguf(GGUFFile* gguf, Config* p) {
     int64_t eos = get_gguf_int(gguf, "tokenizer.ggml.eos_token_id", LLAMA3_EOS_TOKEN);
     tokenizer.bos_token = (int)bos;
     tokenizer.eos_token = (int)eos;
-    tokenizer.max_token_length = 256;
 
     // Set special tokens
     tokenizer.start_header_token = LLAMA3_START_HEADER;
     tokenizer.end_header_token = LLAMA3_END_HEADER;
     tokenizer.eot_token = LLAMA3_EOT;
 
-    // Use vocabulary from GGUF file
-    if (gguf->vocab_tokens && gguf->vocab_size > 0) {
+    // Use vocabulary from GGUF file (taken over, not copied)
+    if (gguf->vocab_data && gguf->vocab_size > 0) {
         if (debug_mode) {
             printf("Using vocabulary from GGUF file (%llu tokens)\n", (unsigned long long)gguf->vocab_size);
         }
         tokenizer.vocab_size = (int)gguf->vocab_size;
-        tokenizer.vocab = (char**)malloc(tokenizer.vocab_size * sizeof(char*));
-        tokenizer.vocab_scores = (float*)malloc(tokenizer.vocab_size * sizeof(float));
+        tokenizer.vocab_data = gguf->vocab_data;
+        tokenizer.vocab_offsets = gguf->vocab_offsets;
+        gguf->vocab_data = NULL;
+        gguf->vocab_offsets = NULL;
 
-        if (!tokenizer.vocab || !tokenizer.vocab_scores) {
-            fprintf(stderr, "Failed to allocate tokenizer\n");
-            return 0;
-        }
-
-        // Copy vocabulary from GGUF
+        // Track max token length
+        tokenizer.max_token_length = 0;
         for (int i = 0; i < tokenizer.vocab_size; i++) {
-            if (gguf->vocab_tokens[i]) {
-                tokenizer.vocab[i] = strdup(gguf->vocab_tokens[i]);
-                // Track max token length
-                size_t len = strlen(gguf->vocab_tokens[i]);
-                if (len > tokenizer.max_token_length) {
-                    tokenizer.max_token_length = (unsigned int)len;
-                }
-            } else {
-                tokenizer.vocab[i] = NULL;
+            unsigned int len = (unsigned int)vocab_token_len(i);
+            if (len > tokenizer.max_token_length) {
+                tokenizer.max_token_length = len;
             }
-            tokenizer.vocab_scores[i] = gguf->vocab_scores ? gguf->vocab_scores[i] : 0.0f;
         }
 
         // Update config vocab_size if GGUF has different size
@@ -4681,13 +5023,8 @@ int init_tokenizer_from_gguf(GGUFFile* gguf, Config* p) {
 }
 
 void free_tokenizer(void) {
-    if (tokenizer.vocab) {
-        for (int i = 0; i < tokenizer.vocab_size; i++) {
-            free(tokenizer.vocab[i]);
-        }
-        free(tokenizer.vocab);
-    }
-    free(tokenizer.vocab_scores);
+    free(tokenizer.vocab_data);
+    free(tokenizer.vocab_offsets);
 }
 
 // ----------------------------------------------------------------------------
@@ -4739,29 +5076,12 @@ int argmax(float* v, int n) {
 #define GEMMA3_START_TURN 106        // <start_of_turn>
 #define GEMMA3_END_TURN 107          // <end_of_turn>
 
-// Helper to find a special token in vocabulary by its string representation.
+// Helper to find a special token in vocabulary by its string representation:
+// a linear scan of the token strings (a handful of lookups per run).
 int find_special_token(const char* token_str) {
-    if (trie_built) {
-        // CSR trie walk — O(token_len × avg_children_per_node). For the few
-        // short ASCII special-token lookups at load + per generate, well
-        // under 1 ms on a 262k-entry vocab.
-        int32_t node = 0;
-        for (int i = 0; token_str[i]; i++) {
-            unsigned char ch = (unsigned char)token_str[i];
-            int32_t cs = trie_child_start[node];
-            int32_t ce = trie_child_start[node + 1];
-            int32_t next = -1;
-            for (int32_t k = cs; k < ce; k++) {
-                if (trie_edge_char[k] == ch) { next = trie_edge_target[k]; break; }
-            }
-            if (next < 0) return -1;
-            node = next;
-        }
-        return (int)trie_node_id[node];
-    }
-    // Fallback: linear scan (trie not built yet)
+    int len = (int)strlen(token_str);
     for (int i = 0; i < tokenizer.vocab_size; i++) {
-        if (tokenizer.vocab[i] && strcmp(tokenizer.vocab[i], token_str) == 0) {
+        if (vocab_token_len(i) == len && memcmp(vocab_token(i), token_str, (size_t)len) == 0) {
             return i;
         }
     }
@@ -4809,6 +5129,8 @@ static const char* parse_json_string(const char* p, char** out) {
     return p + 1;
 }
 
+void free_chat_history(ChatMessage* messages, int count);
+
 // Parse a JSON chat history string into an array of ChatMessage.
 // Expected format: [{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]
 int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
@@ -4821,14 +5143,14 @@ int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
 
     const char* p = json;
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-    if (*p != '[') { free(msgs); return 0; }
+    if (*p != '[') { free_chat_history(msgs, n); return 0; }
     p++;
 
     while (*p) {
         while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
         if (*p == ']') break;
         if (*p == ',') { p++; continue; }
-        if (*p != '{') { free(msgs); return 0; }
+        if (*p != '{') { free_chat_history(msgs, n); return 0; }
         p++;
 
         char* role = NULL;
@@ -4838,24 +5160,24 @@ int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
             if (*p == '}') { p++; break; }
             if (*p == ',') { p++; continue; }
-            if (*p != '"') { if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            if (*p != '"') { if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
             p++;
 
             char* key = NULL;
             p = parse_json_string(p, &key);
-            if (!p) { if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            if (!p) { if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
 
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-            if (*p != ':') { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            if (*p != ':') { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
             p++;
 
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-            if (*p != '"') { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            if (*p != '"') { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
             p++;
 
             char* value = NULL;
             p = parse_json_string(p, &value);
-            if (!p) { free(key); if (role) free(role); if (content) free(content); free(msgs); return 0; }
+            if (!p) { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
 
             if (strcmp(key, "role") == 0) {
                 if (role) free(role);
@@ -4915,15 +5237,13 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
 
     if (sys_prompt && strlen(sys_prompt) > 0) {
         tokens[(*n_tokens)++] = start_header;
-        bpe_encode("system", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode("system", temp_tokens, &temp_n);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
         tokens[(*n_tokens)++] = end_header;
 
         char* sys_text = malloc(strlen(sys_prompt) + 4);
         sprintf(sys_text, "\n\n%s", sys_prompt);
-        bpe_encode(sys_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode(sys_text, temp_tokens, &temp_n);
         free(sys_text);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
         tokens[(*n_tokens)++] = eot_token;
@@ -4931,28 +5251,24 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
 
     for (int m = 0; m < msg_count; m++) {
         tokens[(*n_tokens)++] = start_header;
-        bpe_encode(messages[m].role, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode(messages[m].role, temp_tokens, &temp_n);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
         tokens[(*n_tokens)++] = end_header;
 
         char* msg_text = malloc(strlen(messages[m].content) + 4);
         sprintf(msg_text, "\n\n%s", messages[m].content);
-        bpe_encode(msg_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode(msg_text, temp_tokens, &temp_n);
         free(msg_text);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
         tokens[(*n_tokens)++] = eot_token;
     }
 
     tokens[(*n_tokens)++] = start_header;
-    bpe_encode("assistant", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("assistant", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
     tokens[(*n_tokens)++] = end_header;
 
-    bpe_encode("\n\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("\n\n", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
 }
 
@@ -4989,21 +5305,18 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
             sprintf(role_text, "%s\n%s", gemma_role, content);
         }
 
-        bpe_encode(role_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode(role_text, temp_tokens, &temp_n);
         free(role_text);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
 
         tokens[(*n_tokens)++] = end_turn;
 
-        bpe_encode("\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode("\n", temp_tokens, &temp_n);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
     }
 
     tokens[(*n_tokens)++] = start_turn;
-    bpe_encode("model\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("model\n", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
 }
 
@@ -5044,8 +5357,7 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
     // "user\n" + prompt - encode via BPE
     char* user_text = malloc(strlen(full_prompt) + 8);
     sprintf(user_text, "user\n%s", full_prompt);
-    bpe_encode(user_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode(user_text, temp_tokens, &temp_n);
     free(user_text);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
@@ -5055,8 +5367,7 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
     tokens[(*n_tokens)++] = end_turn;
 
     // "\n" - encode via BPE
-    bpe_encode("\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("\n", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
     }
@@ -5065,8 +5376,7 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
     tokens[(*n_tokens)++] = start_turn;
 
     // "model\n" - encode via BPE
-    bpe_encode("model\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("model\n", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
     }
@@ -5103,8 +5413,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
         tokens[(*n_tokens)++] = start_header;
 
         // "system" - encode via BPE
-        bpe_encode("system", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode("system", temp_tokens, &temp_n);
         for (int i = 0; i < temp_n; i++) {
             tokens[(*n_tokens)++] = temp_tokens[i];
         }
@@ -5115,8 +5424,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
         // "\n\n" + system_prompt (encode via BPE)
         char* sys_text = malloc(strlen(system_prompt) + 4);
         sprintf(sys_text, "\n\n%s", system_prompt);
-        bpe_encode(sys_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                   tokenizer.max_token_length, temp_tokens, &temp_n);
+        bpe_encode(sys_text, temp_tokens, &temp_n);
         free(sys_text);
         for (int i = 0; i < temp_n; i++) {
             tokens[(*n_tokens)++] = temp_tokens[i];
@@ -5130,8 +5438,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
     tokens[(*n_tokens)++] = start_header;
 
     // "user" - encode via BPE
-    bpe_encode("user", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("user", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
     }
@@ -5142,8 +5449,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
     // "\n\n" + prompt (encode via BPE)
     char* user_text = malloc(strlen(prompt) + 4);
     sprintf(user_text, "\n\n%s", prompt);
-    bpe_encode(user_text, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode(user_text, temp_tokens, &temp_n);
     free(user_text);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
@@ -5156,8 +5462,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
     tokens[(*n_tokens)++] = start_header;
 
     // "assistant" - encode via BPE
-    bpe_encode("assistant", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("assistant", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
     }
@@ -5166,8 +5471,7 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
     tokens[(*n_tokens)++] = end_header;
 
     // "\n\n" (encode via BPE)
-    bpe_encode("\n\n", tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-               tokenizer.max_token_length, temp_tokens, &temp_n);
+    bpe_encode("\n\n", temp_tokens, &temp_n);
     for (int i = 0; i < temp_n; i++) {
         tokens[(*n_tokens)++] = temp_tokens[i];
     }
@@ -5360,9 +5664,9 @@ void generate_token(void) {
 
     // Only print generated tokens (not prompt tokens) during generation
     // Skip special tokens like <|eot_id|>
-    if (pos >= num_prompt_tokens - 1 && tokenizer.vocab[next] && next != tokenizer.eot_token && next != tokenizer.eos_token) {
+    if (pos >= num_prompt_tokens - 1 && next != tokenizer.eot_token && next != tokenizer.eos_token) {
         // Decode tiktoken representation to normal text
-        char* decoded = decode_tiktoken(tokenizer.vocab[next]);
+        char* decoded = decode_tiktoken(vocab_token(next));
         if (decoded) {
             // Buffer newlines - only output if followed by non-end token
             if (strcmp(decoded, "\n") == 0) {
@@ -5413,12 +5717,67 @@ void generate_token(void) {
     step++;
 }
 
+// Release everything the run allocated (safe to call on NULL - all globals are
+// zero-initialized). main() calls it before returning; it is also registered
+// with atexit(), so a fatal error that calls exit() in the middle of the run
+// releases everything as well.
+static void free_all(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+
+    free_run_state(&state);
+    free(run_scratch);
+    free(q8_buf);
+    free(deq_buf);
+    free_tokenizer();
+
+    free(prompt_tokens);
+    free(generated_tokens);
+    free(top_k_idx_buf);
+    free(top_k_val_buf);
+
+    // Free float weight allocations (norms, etc. - embeddings point to mmap'd file)
+    for (int i = 0; i < num_weight_allocations; i++) {
+        free(weight_allocations[i]);
+    }
+    free(weight_allocations);
+
+    // Free QuantizedTensor arrays (the arrays themselves, not the data - data is mmap'd)
+    free(weights.wq);
+    free(weights.wk);
+    free(weights.wv);
+    free(weights.wo);
+    free(weights.w1);
+    free(weights.w2);
+    free(weights.w3);
+
+    // Free Gemma3-specific arrays if allocated
+    free(weights.attn_q_norm);
+    free(weights.attn_k_norm);
+    free(weights.attn_post_norm);
+    free(weights.ffn_post_norm);
+
+    // Free norm weight arrays
+    free(weights.rms_att_weight);
+    free(weights.rms_ffn_weight);
+
+    if (mapped_data && mapped_data != MAP_FAILED) {
+        munmap(mapped_data, mapped_size);
+    }
+
+    if (gguf_file) {
+        free_gguf_file(gguf_file);
+    }
+}
 
 int main(int argc, char *argv[]) {
     int exit_code = 0;
     char *checkpoint = NULL;
     char *prompt = NULL;
     char *chat_history_file = NULL;
+
+    atexit(free_all);
 
     // Parse named arguments
     for (int i = 1; i < argc; i++) {
@@ -5483,8 +5842,8 @@ int main(int argc, char *argv[]) {
         exit_code = 1; goto cleanup;
     }
 
-    // Load tokenizer vocabulary from GGUF (contains tokens and scores arrays)
-    if (!load_gguf_tokenizer(gguf_file, checkpoint)) {
+    // The tokenizer vocabulary was read with the rest of the header
+    if (!gguf_file->vocab_data) {
         fprintf(stderr, "Failed to load vocabulary from GGUF\n");
         exit_code = 1; goto cleanup;
     }
@@ -5626,6 +5985,20 @@ int main(int argc, char *argv[]) {
 
     malloc_run_state(&state, &config);
 
+    // Scratch block for the tokenizer tables, then the prefill buffers, then the logits
+    run_scratch_size = vocab_hash_size(NULL, NULL);
+    if (prefill_buffers_size(&state, &config) > run_scratch_size) {
+        run_scratch_size = prefill_buffers_size(&state, &config);
+    }
+    if ((size_t)config.vocab_size * sizeof(float) > run_scratch_size) {
+        run_scratch_size = (size_t)config.vocab_size * sizeof(float);
+    }
+    run_scratch = calloc(run_scratch_size, 1);
+    if (!run_scratch) {
+        fprintf(stderr, "malloc failed!\n");
+        exit(1);
+    }
+
     // Allocate Q8_0 buffer for quantized input matmul optimization
     // Size: max input dimension (max of dim, q_dim, hidden_dim) in Q8_0 blocks
     {
@@ -5683,6 +6056,7 @@ int main(int argc, char *argv[]) {
         int msg_count = 0;
         if (!parse_chat_history(json, &messages, &msg_count) || msg_count == 0) {
             fprintf(stderr, "Failed to parse chat history from file: %s\n", chat_history_file);
+            free_chat_history(messages, msg_count);
             free(json);
             exit_code = 1; goto cleanup;
         }
@@ -5707,18 +6081,21 @@ int main(int argc, char *argv[]) {
                 encode_llama3_chat(prompt, system_prompt, prompt_tokens, &num_prompt_tokens);
             }
         } else {
-            bpe_encode(prompt, tokenizer.vocab, tokenizer.vocab_scores, tokenizer.vocab_size,
-                       tokenizer.max_token_length, prompt_tokens, &num_prompt_tokens);
+            bpe_encode(prompt, prompt_tokens, &num_prompt_tokens);
         }
 
         // Use the first prompt token as the initial token
         token = prompt_tokens[0];
     }
 
+    // The prompt is tokenized: the vocabulary lookup tables are not needed anymore
+    free_vocab_hash();
+
     long start = 0;
 
     // Batched prefill: process all prompt tokens except the last in batches
     if (num_prompt_tokens > 1) {
+        use_prefill_buffers(&state, &config);
         int prefill_end = num_prompt_tokens - 1;
         while (pos < prefill_end) {
             int bs = prefill_end - pos;
@@ -5728,6 +6105,7 @@ int main(int argc, char *argv[]) {
         }
         token = prompt_tokens[pos];
     }
+    use_logits_buffer(&state, &config);
 
     while (pos < max_tokens) {
         generate_token();
@@ -5760,53 +6138,7 @@ int main(int argc, char *argv[]) {
     }
 
 cleanup:
-    // Cleanup (safe to call on NULL - all globals are zero-initialized)
-    free_run_state(&state);
-    free(q8_buf);
-    free(deq_buf);
-    free_tokenizer();
-    free(trie_node_id);
-    free(trie_child_start);
-    free(trie_edge_char);
-    free(trie_edge_target);
-
-    free(prompt_tokens);
-    free(generated_tokens);
-    free(top_k_idx_buf);
-    free(top_k_val_buf);
-
-    // Free float weight allocations (norms, etc. - embeddings point to mmap'd file)
-    for (int i = 0; i < num_weight_allocations; i++) {
-        free(weight_allocations[i]);
-    }
-    free(weight_allocations);
-
-    // Free QuantizedTensor arrays (the arrays themselves, not the data - data is mmap'd)
-    free(weights.wq);
-    free(weights.wk);
-    free(weights.wv);
-    free(weights.wo);
-    free(weights.w1);
-    free(weights.w2);
-    free(weights.w3);
-
-    // Free Gemma3-specific arrays if allocated
-    free(weights.attn_q_norm);
-    free(weights.attn_k_norm);
-    free(weights.attn_post_norm);
-    free(weights.ffn_post_norm);
-
-    // Free norm weight arrays
-    free(weights.rms_att_weight);
-    free(weights.rms_ffn_weight);
-
-    if (mapped_data && mapped_data != MAP_FAILED) {
-        munmap(mapped_data, mapped_size);
-    }
-
-    if (gguf_file) {
-        free_gguf_file(gguf_file);
-    }
+    free_all();
 
     return exit_code;
 }
