@@ -725,11 +725,7 @@
 
           chatHistory.push({ role: "assistant", content: newReply })
 
-          var resultText = newReply
-            .replace(/\</g, "&#60;")
-            .trim()
-            .replace(/^\),/, "")
-            .trim()
+          var resultText = newReply.replace(/\</g, "&#60;")
           promptResult.innerHTML = markdownToHTML(resultText)
 
           var selection = window.getSelection()
