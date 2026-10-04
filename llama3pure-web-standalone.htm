@@ -170,7 +170,7 @@
           disclaimer: "Llama is AI and can make mistakes.",
           copied: "Copied to clipboard.",
           error_empty:
-            "The AI model generated an empty response. The current contextSize () might be too low. Try increasing it by adding it to the URL, for example: ?contextSize={number}",
+            "The AI model returned an empty message, check the context size or the Internet connection.",
           error_filesize:
             "Error. Due to universal browser memory constraints regarding ArrayBuffer size limits, this Web engine can only read GGUF files up to 2 GB.",
           error_download: "Error. Something went wrong during the download process.",
@@ -189,7 +189,7 @@
           disclaimer: "Llama es una IA y puede cometer errores.",
           copied: "Copiado al portapapeles.",
           error_empty:
-            "El modelo de AI gener\xF3 una respuesta vac\xEDa. El valor actual de contextSize () podr\xEDa ser bajo, prueba aumentar ese valor agreg\xE1ndolo a la URL actual, por ejemplo: ?contextSize={n\xFAmero}",
+            "El modelo de IA devolvi\xF3 un mensaje vac\xEDo, verifique el tama\xF1o del contexto o la conexi\xF3n a Internet.",
           error_filesize:
             "Error. Debido a las restricciones de memoria de los navegadores con el tama\xF1o de los ArrayBuffer, este motor Web no puede leer archivos GGUF que superen los 2 GB.",
           error_download:
@@ -405,11 +405,7 @@
               rendering = false
               if (reply === "") {
                 lastReply.innerHTML =
-                  markdownToHTML(
-                    t("error_empty")
-                      .replace("()", "(" + CONTEXT_SIZE + ")")
-                      .replace(/\</g, "&#60;")
-                  ) + '<div class="pointer"></div>'
+                  markdownToHTML(t("error_empty")) + '<div class="pointer"></div>'
               }
               handleReply(
                 document.querySelector(".content"),
