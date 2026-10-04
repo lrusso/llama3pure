@@ -107,13 +107,14 @@ const testModelUsingNode = (model) => {
   llama3pure({
     type: "generate",
     chatHistory: [
-      { role: "user", content: "Tell me in 1 line what is Microsoft." },
+      { type: "user", text: "Tell me in 1 line what is Microsoft." },
       {
-        role: "assistant",
-        content:
+        type: "model",
+        response: [
           "Microsoft is a global technology leader known for its innovative products and services.",
+        ],
       },
-      { role: "user", content: "Tell me in 1 line the names of the founders." },
+      { type: "user", text: "Tell me in 1 line the names of the founders." },
     ],
   })
 
@@ -163,13 +164,14 @@ const testPerformance = () => {
   llama3pure({
     type: "generate",
     chatHistory: [
-      { role: "user", content: "Tell me in 1 line what is Microsoft." },
+      { type: "user", text: "Tell me in 1 line what is Microsoft." },
       {
-        role: "assistant",
-        content:
+        type: "model",
+        response: [
           "Microsoft is a global technology leader known for its innovative products and services.",
+        ],
       },
-      { role: "user", content: "Tell me in 1 line the names of the founders." },
+      { type: "user", text: "Tell me in 1 line the names of the founders." },
     ],
   })
 

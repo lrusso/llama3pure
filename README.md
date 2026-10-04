@@ -113,19 +113,20 @@ llama3pure({
 
 - Step 2: Generate a response
 
-Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `role: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations.
+Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `type: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations.
 
 ```javascript
 llama3pure({
   type: "generate",
   chatHistory: [
-    { role: "user", content: "Tell me in 1 line what is Microsoft." },
+    { type: "user", text: "Tell me in 1 line what is Microsoft." },
     {
-      role: "assistant",
-      content:
+      type: "model",
+      response: [
         "Microsoft is a global technology leader known for its innovative products and services.",
+      ],
     },
-    { role: "user", content: "Tell me in 1 line the names of the founders." },
+    { type: "user", text: "Tell me in 1 line the names of the founders." },
   ],
 })
 ```
@@ -183,13 +184,14 @@ reader.readAsArrayBuffer(file)
 worker.postMessage({
   type: "generate",
   chatHistory: [
-    { role: "user", content: "Tell me in 1 line what is Microsoft." },
+    { type: "user", text: "Tell me in 1 line what is Microsoft." },
     {
-      role: "assistant",
-      content:
+      type: "model",
+      response: [
         "Microsoft is a global technology leader known for its innovative products and services.",
+      ],
     },
-    { role: "user", content: "Tell me in 1 line the names of the founders." },
+    { type: "user", text: "Tell me in 1 line the names of the founders." },
   ],
 })
 ```

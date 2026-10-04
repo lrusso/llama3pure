@@ -582,7 +582,7 @@
           formattedPrompt = formattedPrompt.replace(rule.regex, rule.replacement)
         })
 
-        chatHistory.push({ role: "user", content: customPrefix + formattedPrompt })
+        chatHistory.push({ type: "user", text: customPrefix + formattedPrompt })
 
         lastPrompt = prompt
 
@@ -665,7 +665,7 @@
           return
         }
 
-        chatHistory.push({ role: "assistant", content: reply })
+        chatHistory.push({ type: "model", response: [reply] })
         replies.push(reply)
         selectedReply = replies.length
         document.title = t("title")
@@ -700,7 +700,7 @@
 
           chatHistory.pop()
           chatHistory.pop()
-          chatHistory.push({ role: "user", content: prompt })
+          chatHistory.push({ type: "user", text: prompt })
 
           if (!replies[selectedReply + 1]) {
             selectedReply = 0
@@ -717,7 +717,7 @@
 
           var newReply = replies[selectedReply]
 
-          chatHistory.push({ role: "assistant", content: newReply })
+          chatHistory.push({ type: "model", response: [newReply] })
 
           var resultText = newReply.replace(/\</g, "&#60;")
           promptResult.innerHTML = markdownToHTML(resultText)

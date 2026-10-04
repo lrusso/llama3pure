@@ -5129,10 +5129,38 @@ static const char* parse_json_string(const char* p, char** out) {
     return p + 1;
 }
 
+// Parse a JSON array of strings starting after the opening bracket and join
+// them into a single string.
+// Returns pointer to character after the closing bracket, or NULL on error.
+static const char* parse_json_string_array(const char* p, char** out) {
+    char* joined = (char*)malloc(1);
+    size_t len = 0;
+    joined[0] = '\0';
+
+    for (;;) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p != '"') { free(joined); return NULL; }
+
+        char* item = NULL;
+        p = parse_json_string(p + 1, &item);
+        if (!p) { free(joined); return NULL; }
+
+        size_t item_len = strlen(item);
+        joined = (char*)realloc(joined, len + item_len + 1);
+        memcpy(joined + len, item, item_len + 1);
+        len += item_len;
+        free(item);
+    }
+
+    *out = joined;
+    return p + 1;
+}
+
 void free_chat_history(ChatMessage* messages, int count);
 
 // Parse a JSON chat history string into an array of ChatMessage.
-// Expected format: [{"role":"user","content":"Hello"},{"role":"assistant","content":"Hi"}]
+// Expected format: [{"type":"user","text":"Hello"},{"type":"model","response":["Hi"]}]
 int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
     *messages = NULL;
     *count = 0;
@@ -5172,17 +5200,17 @@ int parse_chat_history(const char* json, ChatMessage** messages, int* count) {
             p++;
 
             while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
-            if (*p != '"') { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
-            p++;
+            if (*p != '"' && *p != '[') { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
 
+            // The value is a string, or an array of strings in the "response" of a model message
             char* value = NULL;
-            p = parse_json_string(p, &value);
+            p = (*p == '[') ? parse_json_string_array(p + 1, &value) : parse_json_string(p + 1, &value);
             if (!p) { free(key); if (role) free(role); if (content) free(content); free_chat_history(msgs, n); return 0; }
 
-            if (strcmp(key, "role") == 0) {
+            if (strcmp(key, "type") == 0) {
                 if (role) free(role);
                 role = value;
-            } else if (strcmp(key, "content") == 0) {
+            } else if (strcmp(key, "text") == 0 || strcmp(key, "response") == 0) {
                 if (content) free(content);
                 content = value;
             } else {
@@ -5250,8 +5278,11 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
     }
 
     for (int m = 0; m < msg_count; m++) {
+        // Llama uses "assistant" instead of "model"
+        const char* llama_role = (strcmp(messages[m].role, "model") == 0) ? "assistant" : messages[m].role;
+
         tokens[(*n_tokens)++] = start_header;
-        bpe_encode(messages[m].role, temp_tokens, &temp_n);
+        bpe_encode(llama_role, temp_tokens, &temp_n);
         for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
         tokens[(*n_tokens)++] = end_header;
 
@@ -5291,18 +5322,17 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
     for (int m = 0; m < msg_count; m++) {
         const char* role = messages[m].role;
         const char* content = messages[m].content;
-        const char* gemma_role = (strcmp(role, "assistant") == 0) ? "model" : role;
 
         tokens[(*n_tokens)++] = start_turn;
 
         char* role_text;
         if (!system_used && strcmp(role, "user") == 0 && sys_prompt && strlen(sys_prompt) > 0) {
-            role_text = malloc(strlen(gemma_role) + strlen(sys_prompt) + strlen(content) + 8);
-            sprintf(role_text, "%s\n%s\n\n%s", gemma_role, sys_prompt, content);
+            role_text = malloc(strlen(role) + strlen(sys_prompt) + strlen(content) + 8);
+            sprintf(role_text, "%s\n%s\n\n%s", role, sys_prompt, content);
             system_used = 1;
         } else {
-            role_text = malloc(strlen(gemma_role) + strlen(content) + 4);
-            sprintf(role_text, "%s\n%s", gemma_role, content);
+            role_text = malloc(strlen(role) + strlen(content) + 4);
+            sprintf(role_text, "%s\n%s", role, content);
         }
 
         bpe_encode(role_text, temp_tokens, &temp_n);

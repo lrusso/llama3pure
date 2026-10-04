@@ -916,13 +916,19 @@ function deqRowQ5_K(I32, p, dst, dstOff, cols) {
         var hv = I32[(hp + k) | 0]
         var o = (k << 2) | 0
         dst[(y + o) | 0] = d1 * ((v & 0xf) + (((hv >>> b1) & 1) << 4)) - m1
-        dst[(y + o + 1) | 0] = d1 * (((v >>> 8) & 0xf) + (((hv >>> (b1 + 8)) & 1) << 4)) - m1
-        dst[(y + o + 2) | 0] = d1 * (((v >>> 16) & 0xf) + (((hv >>> (b1 + 16)) & 1) << 4)) - m1
-        dst[(y + o + 3) | 0] = d1 * (((v >>> 24) & 0xf) + (((hv >>> (b1 + 24)) & 1) << 4)) - m1
+        dst[(y + o + 1) | 0] =
+          d1 * (((v >>> 8) & 0xf) + (((hv >>> (b1 + 8)) & 1) << 4)) - m1
+        dst[(y + o + 2) | 0] =
+          d1 * (((v >>> 16) & 0xf) + (((hv >>> (b1 + 16)) & 1) << 4)) - m1
+        dst[(y + o + 3) | 0] =
+          d1 * (((v >>> 24) & 0xf) + (((hv >>> (b1 + 24)) & 1) << 4)) - m1
         dst[(y1 + o) | 0] = d2 * (((v >>> 4) & 0xf) + (((hv >>> b2) & 1) << 4)) - m2
-        dst[(y1 + o + 1) | 0] = d2 * (((v >>> 12) & 0xf) + (((hv >>> (b2 + 8)) & 1) << 4)) - m2
-        dst[(y1 + o + 2) | 0] = d2 * (((v >>> 20) & 0xf) + (((hv >>> (b2 + 16)) & 1) << 4)) - m2
-        dst[(y1 + o + 3) | 0] = d2 * ((v >>> 28) + (((hv >>> (b2 + 24)) & 1) << 4)) - m2
+        dst[(y1 + o + 1) | 0] =
+          d2 * (((v >>> 12) & 0xf) + (((hv >>> (b2 + 8)) & 1) << 4)) - m2
+        dst[(y1 + o + 2) | 0] =
+          d2 * (((v >>> 20) & 0xf) + (((hv >>> (b2 + 16)) & 1) << 4)) - m2
+        dst[(y1 + o + 3) | 0] =
+          d2 * ((v >>> 28) + (((hv >>> (b2 + 24)) & 1) << 4)) - m2
       }
       qp = qp + 8
       y = y + 64
@@ -1284,7 +1290,19 @@ function block32XSums(bQ8i8, batchSize, nb, sc, xsBase) {
 // Integer 4-row x 3-token tile over one group of 4 unpacked rows (w8: int8
 // weights; sc: per-block scales, mins and x block sums) for tokens
 // bt..bt+nTok-1; a short group reuses its last token for the missing lanes.
-function block32Tile(outs, bt, nTok, i, nb, cols, hasMin, sc, scBase, mnBase, xsBase) {
+function block32Tile(
+  outs,
+  bt,
+  nTok,
+  i,
+  nb,
+  cols,
+  hasMin,
+  sc,
+  scBase,
+  mnBase,
+  xsBase
+) {
   var bQ8 = state.batchQ8
   var bQ8i8 = state.batchQ8i8
   var w8 = matmulDeqI8
@@ -1411,7 +1429,6 @@ function block32Tile(outs, bt, nTok, i, nb, cols, hasMin, sc, scBase, mnBase, xs
   }
 }
 
-
 // Scratch layout inside matmulDeqBuf (32 * maxCols bytes) for the integer tile:
 //   bytes   [0, 4 * cols)                int8 weights of the 4 rows (matmulDeqI8)
 //   doubles [cols/2, +4*nb)              per-row, per-block scales
@@ -1446,8 +1463,28 @@ function matmulBlock32Q8Batch(outs, xs, qw, batchSize) {
     var ro = base + i * rowSize
     unpack(u8, ro, w8, 0, sc, scBase, sc, mnBase, nb)
     unpack(u8, ro + rowSize, w8, cols, sc, scBase + nb, sc, mnBase + nb, nb)
-    unpack(u8, ro + rowSize + rowSize, w8, cols + cols, sc, scBase + 2 * nb, sc, mnBase + 2 * nb, nb)
-    unpack(u8, ro + rowSize + rowSize + rowSize, w8, cols + cols + cols, sc, scBase + 3 * nb, sc, mnBase + 3 * nb, nb)
+    unpack(
+      u8,
+      ro + rowSize + rowSize,
+      w8,
+      cols + cols,
+      sc,
+      scBase + 2 * nb,
+      sc,
+      mnBase + 2 * nb,
+      nb
+    )
+    unpack(
+      u8,
+      ro + rowSize + rowSize + rowSize,
+      w8,
+      cols + cols + cols,
+      sc,
+      scBase + 3 * nb,
+      sc,
+      mnBase + 3 * nb,
+      nb
+    )
     for (var bt = 0; bt < batchSize; bt = bt + 3) {
       var nTok = batchSize - bt
       if (nTok > 3) {
@@ -1505,20 +1542,56 @@ function matmulQ4_0Q8Rows4(out, qw, i) {
       xs = (xs + x0 + x1 + x2 + x3 + y0 + y1 + y2 + y3) | 0
       var w0 = U16[(p0 + wk) | 0]
       var v0 = U16[(p0 + wk + 1) | 0]
-      i0 = (i0 + (w0 & 0xf) * x0 + ((w0 >>> 4) & 0xf) * y0 + ((w0 >>> 8) & 0xf) * x1 + (w0 >>> 12) * y1 +
-        (v0 & 0xf) * x2 + ((v0 >>> 4) & 0xf) * y2 + ((v0 >>> 8) & 0xf) * x3 + (v0 >>> 12) * y3) | 0
+      i0 =
+        (i0 +
+          (w0 & 0xf) * x0 +
+          ((w0 >>> 4) & 0xf) * y0 +
+          ((w0 >>> 8) & 0xf) * x1 +
+          (w0 >>> 12) * y1 +
+          (v0 & 0xf) * x2 +
+          ((v0 >>> 4) & 0xf) * y2 +
+          ((v0 >>> 8) & 0xf) * x3 +
+          (v0 >>> 12) * y3) |
+        0
       var w1 = U16[(p1 + wk) | 0]
       var v1 = U16[(p1 + wk + 1) | 0]
-      i1 = (i1 + (w1 & 0xf) * x0 + ((w1 >>> 4) & 0xf) * y0 + ((w1 >>> 8) & 0xf) * x1 + (w1 >>> 12) * y1 +
-        (v1 & 0xf) * x2 + ((v1 >>> 4) & 0xf) * y2 + ((v1 >>> 8) & 0xf) * x3 + (v1 >>> 12) * y3) | 0
+      i1 =
+        (i1 +
+          (w1 & 0xf) * x0 +
+          ((w1 >>> 4) & 0xf) * y0 +
+          ((w1 >>> 8) & 0xf) * x1 +
+          (w1 >>> 12) * y1 +
+          (v1 & 0xf) * x2 +
+          ((v1 >>> 4) & 0xf) * y2 +
+          ((v1 >>> 8) & 0xf) * x3 +
+          (v1 >>> 12) * y3) |
+        0
       var w2 = U16[(p2 + wk) | 0]
       var v2 = U16[(p2 + wk + 1) | 0]
-      i2 = (i2 + (w2 & 0xf) * x0 + ((w2 >>> 4) & 0xf) * y0 + ((w2 >>> 8) & 0xf) * x1 + (w2 >>> 12) * y1 +
-        (v2 & 0xf) * x2 + ((v2 >>> 4) & 0xf) * y2 + ((v2 >>> 8) & 0xf) * x3 + (v2 >>> 12) * y3) | 0
+      i2 =
+        (i2 +
+          (w2 & 0xf) * x0 +
+          ((w2 >>> 4) & 0xf) * y0 +
+          ((w2 >>> 8) & 0xf) * x1 +
+          (w2 >>> 12) * y1 +
+          (v2 & 0xf) * x2 +
+          ((v2 >>> 4) & 0xf) * y2 +
+          ((v2 >>> 8) & 0xf) * x3 +
+          (v2 >>> 12) * y3) |
+        0
       var w3 = U16[(p3 + wk) | 0]
       var v3 = U16[(p3 + wk + 1) | 0]
-      i3 = (i3 + (w3 & 0xf) * x0 + ((w3 >>> 4) & 0xf) * y0 + ((w3 >>> 8) & 0xf) * x1 + (w3 >>> 12) * y1 +
-        (v3 & 0xf) * x2 + ((v3 >>> 4) & 0xf) * y2 + ((v3 >>> 8) & 0xf) * x3 + (v3 >>> 12) * y3) | 0
+      i3 =
+        (i3 +
+          (w3 & 0xf) * x0 +
+          ((w3 >>> 4) & 0xf) * y0 +
+          ((w3 >>> 8) & 0xf) * x1 +
+          (w3 >>> 12) * y1 +
+          (v3 & 0xf) * x2 +
+          ((v3 >>> 4) & 0xf) * y2 +
+          ((v3 >>> 8) & 0xf) * x3 +
+          (v3 >>> 12) * y3) |
+        0
       xg = xg + 4
       wk = wk + 2
     }
@@ -1587,20 +1660,56 @@ function matmulQ4_1Q8Rows4(out, qw, i) {
       xs = (xs + x0 + x1 + x2 + x3 + y0 + y1 + y2 + y3) | 0
       var w0 = U16[(p0 + wk) | 0]
       var v0 = U16[(p0 + wk + 1) | 0]
-      i0 = (i0 + (w0 & 0xf) * x0 + ((w0 >>> 4) & 0xf) * y0 + ((w0 >>> 8) & 0xf) * x1 + (w0 >>> 12) * y1 +
-        (v0 & 0xf) * x2 + ((v0 >>> 4) & 0xf) * y2 + ((v0 >>> 8) & 0xf) * x3 + (v0 >>> 12) * y3) | 0
+      i0 =
+        (i0 +
+          (w0 & 0xf) * x0 +
+          ((w0 >>> 4) & 0xf) * y0 +
+          ((w0 >>> 8) & 0xf) * x1 +
+          (w0 >>> 12) * y1 +
+          (v0 & 0xf) * x2 +
+          ((v0 >>> 4) & 0xf) * y2 +
+          ((v0 >>> 8) & 0xf) * x3 +
+          (v0 >>> 12) * y3) |
+        0
       var w1 = U16[(p1 + wk) | 0]
       var v1 = U16[(p1 + wk + 1) | 0]
-      i1 = (i1 + (w1 & 0xf) * x0 + ((w1 >>> 4) & 0xf) * y0 + ((w1 >>> 8) & 0xf) * x1 + (w1 >>> 12) * y1 +
-        (v1 & 0xf) * x2 + ((v1 >>> 4) & 0xf) * y2 + ((v1 >>> 8) & 0xf) * x3 + (v1 >>> 12) * y3) | 0
+      i1 =
+        (i1 +
+          (w1 & 0xf) * x0 +
+          ((w1 >>> 4) & 0xf) * y0 +
+          ((w1 >>> 8) & 0xf) * x1 +
+          (w1 >>> 12) * y1 +
+          (v1 & 0xf) * x2 +
+          ((v1 >>> 4) & 0xf) * y2 +
+          ((v1 >>> 8) & 0xf) * x3 +
+          (v1 >>> 12) * y3) |
+        0
       var w2 = U16[(p2 + wk) | 0]
       var v2 = U16[(p2 + wk + 1) | 0]
-      i2 = (i2 + (w2 & 0xf) * x0 + ((w2 >>> 4) & 0xf) * y0 + ((w2 >>> 8) & 0xf) * x1 + (w2 >>> 12) * y1 +
-        (v2 & 0xf) * x2 + ((v2 >>> 4) & 0xf) * y2 + ((v2 >>> 8) & 0xf) * x3 + (v2 >>> 12) * y3) | 0
+      i2 =
+        (i2 +
+          (w2 & 0xf) * x0 +
+          ((w2 >>> 4) & 0xf) * y0 +
+          ((w2 >>> 8) & 0xf) * x1 +
+          (w2 >>> 12) * y1 +
+          (v2 & 0xf) * x2 +
+          ((v2 >>> 4) & 0xf) * y2 +
+          ((v2 >>> 8) & 0xf) * x3 +
+          (v2 >>> 12) * y3) |
+        0
       var w3 = U16[(p3 + wk) | 0]
       var v3 = U16[(p3 + wk + 1) | 0]
-      i3 = (i3 + (w3 & 0xf) * x0 + ((w3 >>> 4) & 0xf) * y0 + ((w3 >>> 8) & 0xf) * x1 + (w3 >>> 12) * y1 +
-        (v3 & 0xf) * x2 + ((v3 >>> 4) & 0xf) * y2 + ((v3 >>> 8) & 0xf) * x3 + (v3 >>> 12) * y3) | 0
+      i3 =
+        (i3 +
+          (w3 & 0xf) * x0 +
+          ((w3 >>> 4) & 0xf) * y0 +
+          ((w3 >>> 8) & 0xf) * x1 +
+          (w3 >>> 12) * y1 +
+          (v3 & 0xf) * x2 +
+          ((v3 >>> 4) & 0xf) * y2 +
+          ((v3 >>> 8) & 0xf) * x3 +
+          (v3 >>> 12) * y3) |
+        0
       xg = xg + 4
       wk = wk + 2
     }
@@ -1670,23 +1779,59 @@ function matmulQ5_0Q8Rows4(out, qw, i) {
       var w0 = U16[(p0 + wk) | 0]
       var v0 = U16[(p0 + wk + 1) | 0]
       var hs0 = h0 >>> (g << 2)
-      i0 = (i0 + ((w0 & 0xf) | ((hs0 << 4) & 0x10)) * x0 + (((w0 >>> 4) & 0xf) | ((hs0 >>> 12) & 0x10)) * y0 + (((w0 >>> 8) & 0xf) | ((hs0 << 3) & 0x10)) * x1 + ((w0 >>> 12) | ((hs0 >>> 13) & 0x10)) * y1 +
-        ((v0 & 0xf) | ((hs0 << 2) & 0x10)) * x2 + (((v0 >>> 4) & 0xf) | ((hs0 >>> 14) & 0x10)) * y2 + (((v0 >>> 8) & 0xf) | ((hs0 << 1) & 0x10)) * x3 + ((v0 >>> 12) | ((hs0 >>> 15) & 0x10)) * y3) | 0
+      i0 =
+        (i0 +
+          ((w0 & 0xf) | ((hs0 << 4) & 0x10)) * x0 +
+          (((w0 >>> 4) & 0xf) | ((hs0 >>> 12) & 0x10)) * y0 +
+          (((w0 >>> 8) & 0xf) | ((hs0 << 3) & 0x10)) * x1 +
+          ((w0 >>> 12) | ((hs0 >>> 13) & 0x10)) * y1 +
+          ((v0 & 0xf) | ((hs0 << 2) & 0x10)) * x2 +
+          (((v0 >>> 4) & 0xf) | ((hs0 >>> 14) & 0x10)) * y2 +
+          (((v0 >>> 8) & 0xf) | ((hs0 << 1) & 0x10)) * x3 +
+          ((v0 >>> 12) | ((hs0 >>> 15) & 0x10)) * y3) |
+        0
       var w1 = U16[(p1 + wk) | 0]
       var v1 = U16[(p1 + wk + 1) | 0]
       var hs1 = h1 >>> (g << 2)
-      i1 = (i1 + ((w1 & 0xf) | ((hs1 << 4) & 0x10)) * x0 + (((w1 >>> 4) & 0xf) | ((hs1 >>> 12) & 0x10)) * y0 + (((w1 >>> 8) & 0xf) | ((hs1 << 3) & 0x10)) * x1 + ((w1 >>> 12) | ((hs1 >>> 13) & 0x10)) * y1 +
-        ((v1 & 0xf) | ((hs1 << 2) & 0x10)) * x2 + (((v1 >>> 4) & 0xf) | ((hs1 >>> 14) & 0x10)) * y2 + (((v1 >>> 8) & 0xf) | ((hs1 << 1) & 0x10)) * x3 + ((v1 >>> 12) | ((hs1 >>> 15) & 0x10)) * y3) | 0
+      i1 =
+        (i1 +
+          ((w1 & 0xf) | ((hs1 << 4) & 0x10)) * x0 +
+          (((w1 >>> 4) & 0xf) | ((hs1 >>> 12) & 0x10)) * y0 +
+          (((w1 >>> 8) & 0xf) | ((hs1 << 3) & 0x10)) * x1 +
+          ((w1 >>> 12) | ((hs1 >>> 13) & 0x10)) * y1 +
+          ((v1 & 0xf) | ((hs1 << 2) & 0x10)) * x2 +
+          (((v1 >>> 4) & 0xf) | ((hs1 >>> 14) & 0x10)) * y2 +
+          (((v1 >>> 8) & 0xf) | ((hs1 << 1) & 0x10)) * x3 +
+          ((v1 >>> 12) | ((hs1 >>> 15) & 0x10)) * y3) |
+        0
       var w2 = U16[(p2 + wk) | 0]
       var v2 = U16[(p2 + wk + 1) | 0]
       var hs2 = h2 >>> (g << 2)
-      i2 = (i2 + ((w2 & 0xf) | ((hs2 << 4) & 0x10)) * x0 + (((w2 >>> 4) & 0xf) | ((hs2 >>> 12) & 0x10)) * y0 + (((w2 >>> 8) & 0xf) | ((hs2 << 3) & 0x10)) * x1 + ((w2 >>> 12) | ((hs2 >>> 13) & 0x10)) * y1 +
-        ((v2 & 0xf) | ((hs2 << 2) & 0x10)) * x2 + (((v2 >>> 4) & 0xf) | ((hs2 >>> 14) & 0x10)) * y2 + (((v2 >>> 8) & 0xf) | ((hs2 << 1) & 0x10)) * x3 + ((v2 >>> 12) | ((hs2 >>> 15) & 0x10)) * y3) | 0
+      i2 =
+        (i2 +
+          ((w2 & 0xf) | ((hs2 << 4) & 0x10)) * x0 +
+          (((w2 >>> 4) & 0xf) | ((hs2 >>> 12) & 0x10)) * y0 +
+          (((w2 >>> 8) & 0xf) | ((hs2 << 3) & 0x10)) * x1 +
+          ((w2 >>> 12) | ((hs2 >>> 13) & 0x10)) * y1 +
+          ((v2 & 0xf) | ((hs2 << 2) & 0x10)) * x2 +
+          (((v2 >>> 4) & 0xf) | ((hs2 >>> 14) & 0x10)) * y2 +
+          (((v2 >>> 8) & 0xf) | ((hs2 << 1) & 0x10)) * x3 +
+          ((v2 >>> 12) | ((hs2 >>> 15) & 0x10)) * y3) |
+        0
       var w3 = U16[(p3 + wk) | 0]
       var v3 = U16[(p3 + wk + 1) | 0]
       var hs3 = h3 >>> (g << 2)
-      i3 = (i3 + ((w3 & 0xf) | ((hs3 << 4) & 0x10)) * x0 + (((w3 >>> 4) & 0xf) | ((hs3 >>> 12) & 0x10)) * y0 + (((w3 >>> 8) & 0xf) | ((hs3 << 3) & 0x10)) * x1 + ((w3 >>> 12) | ((hs3 >>> 13) & 0x10)) * y1 +
-        ((v3 & 0xf) | ((hs3 << 2) & 0x10)) * x2 + (((v3 >>> 4) & 0xf) | ((hs3 >>> 14) & 0x10)) * y2 + (((v3 >>> 8) & 0xf) | ((hs3 << 1) & 0x10)) * x3 + ((v3 >>> 12) | ((hs3 >>> 15) & 0x10)) * y3) | 0
+      i3 =
+        (i3 +
+          ((w3 & 0xf) | ((hs3 << 4) & 0x10)) * x0 +
+          (((w3 >>> 4) & 0xf) | ((hs3 >>> 12) & 0x10)) * y0 +
+          (((w3 >>> 8) & 0xf) | ((hs3 << 3) & 0x10)) * x1 +
+          ((w3 >>> 12) | ((hs3 >>> 13) & 0x10)) * y1 +
+          ((v3 & 0xf) | ((hs3 << 2) & 0x10)) * x2 +
+          (((v3 >>> 4) & 0xf) | ((hs3 >>> 14) & 0x10)) * y2 +
+          (((v3 >>> 8) & 0xf) | ((hs3 << 1) & 0x10)) * x3 +
+          ((v3 >>> 12) | ((hs3 >>> 15) & 0x10)) * y3) |
+        0
       xg = xg + 4
       wk = wk + 2
     }
@@ -1760,23 +1905,59 @@ function matmulQ5_1Q8Rows4(out, qw, i) {
       var w0 = U16[(p0 + wk) | 0]
       var v0 = U16[(p0 + wk + 1) | 0]
       var hs0 = h0 >>> (g << 2)
-      i0 = (i0 + ((w0 & 0xf) | ((hs0 << 4) & 0x10)) * x0 + (((w0 >>> 4) & 0xf) | ((hs0 >>> 12) & 0x10)) * y0 + (((w0 >>> 8) & 0xf) | ((hs0 << 3) & 0x10)) * x1 + ((w0 >>> 12) | ((hs0 >>> 13) & 0x10)) * y1 +
-        ((v0 & 0xf) | ((hs0 << 2) & 0x10)) * x2 + (((v0 >>> 4) & 0xf) | ((hs0 >>> 14) & 0x10)) * y2 + (((v0 >>> 8) & 0xf) | ((hs0 << 1) & 0x10)) * x3 + ((v0 >>> 12) | ((hs0 >>> 15) & 0x10)) * y3) | 0
+      i0 =
+        (i0 +
+          ((w0 & 0xf) | ((hs0 << 4) & 0x10)) * x0 +
+          (((w0 >>> 4) & 0xf) | ((hs0 >>> 12) & 0x10)) * y0 +
+          (((w0 >>> 8) & 0xf) | ((hs0 << 3) & 0x10)) * x1 +
+          ((w0 >>> 12) | ((hs0 >>> 13) & 0x10)) * y1 +
+          ((v0 & 0xf) | ((hs0 << 2) & 0x10)) * x2 +
+          (((v0 >>> 4) & 0xf) | ((hs0 >>> 14) & 0x10)) * y2 +
+          (((v0 >>> 8) & 0xf) | ((hs0 << 1) & 0x10)) * x3 +
+          ((v0 >>> 12) | ((hs0 >>> 15) & 0x10)) * y3) |
+        0
       var w1 = U16[(p1 + wk) | 0]
       var v1 = U16[(p1 + wk + 1) | 0]
       var hs1 = h1 >>> (g << 2)
-      i1 = (i1 + ((w1 & 0xf) | ((hs1 << 4) & 0x10)) * x0 + (((w1 >>> 4) & 0xf) | ((hs1 >>> 12) & 0x10)) * y0 + (((w1 >>> 8) & 0xf) | ((hs1 << 3) & 0x10)) * x1 + ((w1 >>> 12) | ((hs1 >>> 13) & 0x10)) * y1 +
-        ((v1 & 0xf) | ((hs1 << 2) & 0x10)) * x2 + (((v1 >>> 4) & 0xf) | ((hs1 >>> 14) & 0x10)) * y2 + (((v1 >>> 8) & 0xf) | ((hs1 << 1) & 0x10)) * x3 + ((v1 >>> 12) | ((hs1 >>> 15) & 0x10)) * y3) | 0
+      i1 =
+        (i1 +
+          ((w1 & 0xf) | ((hs1 << 4) & 0x10)) * x0 +
+          (((w1 >>> 4) & 0xf) | ((hs1 >>> 12) & 0x10)) * y0 +
+          (((w1 >>> 8) & 0xf) | ((hs1 << 3) & 0x10)) * x1 +
+          ((w1 >>> 12) | ((hs1 >>> 13) & 0x10)) * y1 +
+          ((v1 & 0xf) | ((hs1 << 2) & 0x10)) * x2 +
+          (((v1 >>> 4) & 0xf) | ((hs1 >>> 14) & 0x10)) * y2 +
+          (((v1 >>> 8) & 0xf) | ((hs1 << 1) & 0x10)) * x3 +
+          ((v1 >>> 12) | ((hs1 >>> 15) & 0x10)) * y3) |
+        0
       var w2 = U16[(p2 + wk) | 0]
       var v2 = U16[(p2 + wk + 1) | 0]
       var hs2 = h2 >>> (g << 2)
-      i2 = (i2 + ((w2 & 0xf) | ((hs2 << 4) & 0x10)) * x0 + (((w2 >>> 4) & 0xf) | ((hs2 >>> 12) & 0x10)) * y0 + (((w2 >>> 8) & 0xf) | ((hs2 << 3) & 0x10)) * x1 + ((w2 >>> 12) | ((hs2 >>> 13) & 0x10)) * y1 +
-        ((v2 & 0xf) | ((hs2 << 2) & 0x10)) * x2 + (((v2 >>> 4) & 0xf) | ((hs2 >>> 14) & 0x10)) * y2 + (((v2 >>> 8) & 0xf) | ((hs2 << 1) & 0x10)) * x3 + ((v2 >>> 12) | ((hs2 >>> 15) & 0x10)) * y3) | 0
+      i2 =
+        (i2 +
+          ((w2 & 0xf) | ((hs2 << 4) & 0x10)) * x0 +
+          (((w2 >>> 4) & 0xf) | ((hs2 >>> 12) & 0x10)) * y0 +
+          (((w2 >>> 8) & 0xf) | ((hs2 << 3) & 0x10)) * x1 +
+          ((w2 >>> 12) | ((hs2 >>> 13) & 0x10)) * y1 +
+          ((v2 & 0xf) | ((hs2 << 2) & 0x10)) * x2 +
+          (((v2 >>> 4) & 0xf) | ((hs2 >>> 14) & 0x10)) * y2 +
+          (((v2 >>> 8) & 0xf) | ((hs2 << 1) & 0x10)) * x3 +
+          ((v2 >>> 12) | ((hs2 >>> 15) & 0x10)) * y3) |
+        0
       var w3 = U16[(p3 + wk) | 0]
       var v3 = U16[(p3 + wk + 1) | 0]
       var hs3 = h3 >>> (g << 2)
-      i3 = (i3 + ((w3 & 0xf) | ((hs3 << 4) & 0x10)) * x0 + (((w3 >>> 4) & 0xf) | ((hs3 >>> 12) & 0x10)) * y0 + (((w3 >>> 8) & 0xf) | ((hs3 << 3) & 0x10)) * x1 + ((w3 >>> 12) | ((hs3 >>> 13) & 0x10)) * y1 +
-        ((v3 & 0xf) | ((hs3 << 2) & 0x10)) * x2 + (((v3 >>> 4) & 0xf) | ((hs3 >>> 14) & 0x10)) * y2 + (((v3 >>> 8) & 0xf) | ((hs3 << 1) & 0x10)) * x3 + ((v3 >>> 12) | ((hs3 >>> 15) & 0x10)) * y3) | 0
+      i3 =
+        (i3 +
+          ((w3 & 0xf) | ((hs3 << 4) & 0x10)) * x0 +
+          (((w3 >>> 4) & 0xf) | ((hs3 >>> 12) & 0x10)) * y0 +
+          (((w3 >>> 8) & 0xf) | ((hs3 << 3) & 0x10)) * x1 +
+          ((w3 >>> 12) | ((hs3 >>> 13) & 0x10)) * y1 +
+          ((v3 & 0xf) | ((hs3 << 2) & 0x10)) * x2 +
+          (((v3 >>> 4) & 0xf) | ((hs3 >>> 14) & 0x10)) * y2 +
+          (((v3 >>> 8) & 0xf) | ((hs3 << 1) & 0x10)) * x3 +
+          ((v3 >>> 12) | ((hs3 >>> 15) & 0x10)) * y3) |
+        0
       xg = xg + 4
       wk = wk + 2
     }
@@ -1840,20 +2021,56 @@ function matmulIQ4_NLQ8Rows4(out, qw, i) {
       var y3 = xq[(xg + 19) | 0]
       var w0 = U16[(p0 + wk) | 0]
       var v0 = U16[(p0 + wk + 1) | 0]
-      i0 = (i0 + kv[(w0 & 0xf)] * x0 + kv[((w0 >>> 4) & 0xf)] * y0 + kv[((w0 >>> 8) & 0xf)] * x1 + kv[(w0 >>> 12)] * y1 +
-        kv[(v0 & 0xf)] * x2 + kv[((v0 >>> 4) & 0xf)] * y2 + kv[((v0 >>> 8) & 0xf)] * x3 + kv[(v0 >>> 12)] * y3) | 0
+      i0 =
+        (i0 +
+          kv[w0 & 0xf] * x0 +
+          kv[(w0 >>> 4) & 0xf] * y0 +
+          kv[(w0 >>> 8) & 0xf] * x1 +
+          kv[w0 >>> 12] * y1 +
+          kv[v0 & 0xf] * x2 +
+          kv[(v0 >>> 4) & 0xf] * y2 +
+          kv[(v0 >>> 8) & 0xf] * x3 +
+          kv[v0 >>> 12] * y3) |
+        0
       var w1 = U16[(p1 + wk) | 0]
       var v1 = U16[(p1 + wk + 1) | 0]
-      i1 = (i1 + kv[(w1 & 0xf)] * x0 + kv[((w1 >>> 4) & 0xf)] * y0 + kv[((w1 >>> 8) & 0xf)] * x1 + kv[(w1 >>> 12)] * y1 +
-        kv[(v1 & 0xf)] * x2 + kv[((v1 >>> 4) & 0xf)] * y2 + kv[((v1 >>> 8) & 0xf)] * x3 + kv[(v1 >>> 12)] * y3) | 0
+      i1 =
+        (i1 +
+          kv[w1 & 0xf] * x0 +
+          kv[(w1 >>> 4) & 0xf] * y0 +
+          kv[(w1 >>> 8) & 0xf] * x1 +
+          kv[w1 >>> 12] * y1 +
+          kv[v1 & 0xf] * x2 +
+          kv[(v1 >>> 4) & 0xf] * y2 +
+          kv[(v1 >>> 8) & 0xf] * x3 +
+          kv[v1 >>> 12] * y3) |
+        0
       var w2 = U16[(p2 + wk) | 0]
       var v2 = U16[(p2 + wk + 1) | 0]
-      i2 = (i2 + kv[(w2 & 0xf)] * x0 + kv[((w2 >>> 4) & 0xf)] * y0 + kv[((w2 >>> 8) & 0xf)] * x1 + kv[(w2 >>> 12)] * y1 +
-        kv[(v2 & 0xf)] * x2 + kv[((v2 >>> 4) & 0xf)] * y2 + kv[((v2 >>> 8) & 0xf)] * x3 + kv[(v2 >>> 12)] * y3) | 0
+      i2 =
+        (i2 +
+          kv[w2 & 0xf] * x0 +
+          kv[(w2 >>> 4) & 0xf] * y0 +
+          kv[(w2 >>> 8) & 0xf] * x1 +
+          kv[w2 >>> 12] * y1 +
+          kv[v2 & 0xf] * x2 +
+          kv[(v2 >>> 4) & 0xf] * y2 +
+          kv[(v2 >>> 8) & 0xf] * x3 +
+          kv[v2 >>> 12] * y3) |
+        0
       var w3 = U16[(p3 + wk) | 0]
       var v3 = U16[(p3 + wk + 1) | 0]
-      i3 = (i3 + kv[(w3 & 0xf)] * x0 + kv[((w3 >>> 4) & 0xf)] * y0 + kv[((w3 >>> 8) & 0xf)] * x1 + kv[(w3 >>> 12)] * y1 +
-        kv[(v3 & 0xf)] * x2 + kv[((v3 >>> 4) & 0xf)] * y2 + kv[((v3 >>> 8) & 0xf)] * x3 + kv[(v3 >>> 12)] * y3) | 0
+      i3 =
+        (i3 +
+          kv[w3 & 0xf] * x0 +
+          kv[(w3 >>> 4) & 0xf] * y0 +
+          kv[(w3 >>> 8) & 0xf] * x1 +
+          kv[w3 >>> 12] * y1 +
+          kv[v3 & 0xf] * x2 +
+          kv[(v3 >>> 4) & 0xf] * y2 +
+          kv[(v3 >>> 8) & 0xf] * x3 +
+          kv[v3 >>> 12] * y3) |
+        0
       xg = xg + 4
       wk = wk + 2
     }
@@ -2976,14 +3193,16 @@ function matmulK16Rows(out, x, qw, i) {
         var q
         q =
           ((DV.getInt32(((r0 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
-          (((DV.getInt32(((r0 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) << hiUp)
+          (((DV.getInt32(((r0 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) <<
+            hiUp)
         s0 = s0 + x0 * (eA * ((q & 0xff) - bias))
         s0 = s0 + x1 * (eA * (((q >>> 8) & 0xff) - bias))
         s0 = s0 + x2 * (eA * (((q >>> 16) & 0xff) - bias))
         s0 = s0 + x3 * (eA * ((q >>> 24) - bias))
         q =
           ((DV.getInt32(((r1 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
-          (((DV.getInt32(((r1 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) << hiUp)
+          (((DV.getInt32(((r1 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) <<
+            hiUp)
         s1 = s1 + x0 * (eB * ((q & 0xff) - bias))
         s1 = s1 + x1 * (eB * (((q >>> 8) & 0xff) - bias))
         s1 = s1 + x2 * (eB * (((q >>> 16) & 0xff) - bias))
@@ -3836,8 +4055,7 @@ function loadWeights(gguf) {
     // 4 rows at a time. GGUF aligns tensor data to 32 bytes, so this only
     // rejects a corrupt file or a shape no model has.
     var block32 = result.unpackRowFunc !== null
-    var halfFloat =
-      type === GGML_TYPE.F16 || type === GGML_TYPE.BF16 || type === 30
+    var halfFloat = type === GGML_TYPE.F16 || type === GGML_TYPE.BF16 || type === 30
     if (
       (off & 3) !== 0 ||
       (block32 ? (rows & 3) !== 0 : result.deqRowFunc === null) ||
@@ -4391,13 +4609,22 @@ function geluGate(hbArr, hb2Arr, n) {
   }
   for (var i = n4; i < n; i = i + 1) {
     var x = hbArr[i]
-    hbArr[i] =
-      0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
+    hbArr[i] = 0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
   }
 }
 
 // Llama RoPE on consecutive pairs; Q also gets the attention scale folded in.
-function ropeLlama(qArr, kArr, qDim, kvDim, half, ropeCos, ropeSin, ropeBase, attnScale) {
+function ropeLlama(
+  qArr,
+  kArr,
+  qDim,
+  kvDim,
+  half,
+  ropeCos,
+  ropeSin,
+  ropeBase,
+  attnScale
+) {
   var kvDim4 = kvDim & ~3
   for (var i = 0; i < kvDim4; i = i + 4) {
     var fi0 = (i >> 1) % half
@@ -4650,10 +4877,24 @@ function transformer(token, pos, computeLogits) {
     if (isGemma) {
       if (lw.attnQNorm && lw.attnKNorm) {
         for (var h = 0; h < nHeads; h = h + 1) {
-          rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+          rmsnormGemmaAt(
+            qArr,
+            h * headSize,
+            lw.attnQNorm,
+            headSize,
+            eps,
+            invHeadSize
+          )
         }
         for (var h = 0; h < nKvHeads; h = h + 1) {
-          rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
+          rmsnormGemmaAt(
+            kArr,
+            h * headSize,
+            lw.attnKNorm,
+            headSize,
+            eps,
+            invHeadSize
+          )
         }
       }
       // NEOX RoPE with fused attnScale on Q
@@ -4667,8 +4908,22 @@ function transformer(token, pos, computeLogits) {
     // Per-head KV cache write
     for (var h = 0; h < nKvHeads; h = h + 1) {
       var headOff = loff + h * s.headSeqBytes + pos * s.headBytesQ8
-      quantizeToQ8_0Cache(kArr, h * headSize, s.keyCache, s.keyCacheInt8, headOff, headSize)
-      quantizeToQ8_0Cache(vArr, h * headSize, s.valueCache, s.valueCacheInt8, headOff, headSize)
+      quantizeToQ8_0Cache(
+        kArr,
+        h * headSize,
+        s.keyCache,
+        s.keyCacheInt8,
+        headOff,
+        headSize
+      )
+      quantizeToQ8_0Cache(
+        vArr,
+        h * headSize,
+        s.valueCache,
+        s.valueCacheInt8,
+        headOff,
+        headSize
+      )
     }
 
     // Quantize all Q heads to Q8_0
@@ -4834,28 +5089,75 @@ function transformerPrefill(allTokens, startPos, n) {
         if (lw.attnQNorm && lw.attnKNorm) {
           if (!kvOnly) {
             for (var h = 0; h < nHeads; h = h + 1) {
-              rmsnormGemmaAt(qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+              rmsnormGemmaAt(
+                qArr,
+                h * headSize,
+                lw.attnQNorm,
+                headSize,
+                eps,
+                invHeadSize
+              )
             }
           }
           for (var h = 0; h < nKvHeads; h = h + 1) {
-            rmsnormGemmaAt(kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
+            rmsnormGemmaAt(
+              kArr,
+              h * headSize,
+              lw.attnKNorm,
+              headSize,
+              eps,
+              invHeadSize
+            )
           }
         }
         // NEOX RoPE with fused attnScale on Q
         if (!kvOnly) {
-          ropeNeox(qArr, nHeads, headSize, half, ropeCos, ropeSin, ropeBase, attnScale)
+          ropeNeox(
+            qArr,
+            nHeads,
+            headSize,
+            half,
+            ropeCos,
+            ropeSin,
+            ropeBase,
+            attnScale
+          )
         }
         ropeNeox(kArr, nKvHeads, headSize, half, ropeCos, ropeSin, ropeBase, 1.0)
       } else {
         // RoPE with fused attnScale on Q
-        ropeLlama(qArr, kArr, qDim, kvDim, half, ropeCos, ropeSin, ropeBase, attnScale)
+        ropeLlama(
+          qArr,
+          kArr,
+          qDim,
+          kvDim,
+          half,
+          ropeCos,
+          ropeSin,
+          ropeBase,
+          attnScale
+        )
       }
 
       // Per-head KV cache write
       for (var h = 0; h < nKvHeads; h = h + 1) {
         var headOff = loff + h * headSeqBytes + pos * headBytesQ8
-        quantizeToQ8_0Cache(kArr, h * headSize, keyCache, keyCacheInt8, headOff, headSize)
-        quantizeToQ8_0Cache(vArr, h * headSize, valueCache, valueCacheInt8, headOff, headSize)
+        quantizeToQ8_0Cache(
+          kArr,
+          h * headSize,
+          keyCache,
+          keyCacheInt8,
+          headOff,
+          headSize
+        )
+        quantizeToQ8_0Cache(
+          vArr,
+          h * headSize,
+          valueCache,
+          valueCacheInt8,
+          headOff,
+          headSize
+        )
       }
 
       if (kvOnly) {
@@ -5607,11 +5909,14 @@ function encodeLlama3Chat(chatHistory, sysPrompt) {
 
   // Chat history messages
   for (var m = 0; m < chatHistory.length; m = m + 1) {
-    var role = chatHistory[m].role
-    var content = chatHistory[m].content
+    var role = chatHistory[m].type
+    var content = getMessageContent(chatHistory[m])
+
+    // Llama uses "assistant" instead of "model"
+    var llamaRole = role === "model" ? "assistant" : role
 
     tokens.push(startHeader)
-    var roleTokens = bpeEncode(role)
+    var roleTokens = bpeEncode(llamaRole)
     for (var i = 0; i < roleTokens.length; i = i + 1) {
       tokens.push(roleTokens[i])
     }
@@ -5638,6 +5943,16 @@ function encodeLlama3Chat(chatHistory, sysPrompt) {
   }
 
   return tokens
+}
+
+// Returns the text of a chat history message: model messages keep it in a
+// "response" array and the rest of them in "text"
+function getMessageContent(message) {
+  if (message.type === "model") {
+    return message.response.join("")
+  }
+
+  return message.text
 }
 
 function encodeGemma3Chat(chatHistory, sysPrompt) {
@@ -5668,18 +5983,15 @@ function encodeGemma3Chat(chatHistory, sysPrompt) {
   // Chat history messages
   var systemUsed = false
   for (var m = 0; m < chatHistory.length; m = m + 1) {
-    var role = chatHistory[m].role
-    var content = chatHistory[m].content
-
-    // Gemma uses "model" instead of "assistant"
-    var gemmaRole = role === "assistant" ? "model" : role
+    var role = chatHistory[m].type
+    var content = getMessageContent(chatHistory[m])
 
     tokens.push(startTurn)
 
-    var roleText = gemmaRole + "\n"
+    var roleText = role + "\n"
     // Merge system prompt into first user message
     if (!systemUsed && role === "user" && sysPrompt && sysPrompt.length > 0) {
-      roleText = gemmaRole + "\n" + sysPrompt + "\n\n"
+      roleText = role + "\n" + sysPrompt + "\n\n"
       systemUsed = true
     }
 
