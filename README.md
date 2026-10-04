@@ -293,7 +293,7 @@ A standalone version is available [here](https://lrusso.github.io/llama3pure/lla
 | [Llama-3-8B-Instruct-Q8_0.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q8_0.gguf?download=true)     | ✅  |   ✅    | ❌  |
 | [Llama-3-8B-Instruct-fp16.gguf](https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-fp16.gguf?download=true)     | ✅  |   ✅    | ❌  |
 
-## Special Keys
+## Special keys
 
 | Action            | macOS Shortcut | Windows Shortcut | Safari Shortcut |
 | :---------------- | :------------: | :--------------: | :-------------: |
