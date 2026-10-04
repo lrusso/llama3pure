@@ -323,15 +323,15 @@
               var uploader = document.querySelector('input[type="file"]')
               var labelDisclaimer = document.querySelector(".disclaimer")
 
-              labelDisclaimer.style.display = "block"
-              labelDisclaimer.innerText = t("disclaimer")
-
               while (content.firstChild) {
                 content.removeChild(content.firstChild)
               }
 
-              inputContainer.style.display = "flex"
               inputTextbox.disabled = false
+              inputContainer.style.display = "flex"
+
+              labelDisclaimer.style.display = "block"
+              labelDisclaimer.innerText = t("disclaimer")
 
               document.addEventListener("keydown", function (event) {
                 var KEY_CTRL = event.ctrlKey || event.metaKey
