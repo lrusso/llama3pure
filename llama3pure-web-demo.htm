@@ -249,7 +249,7 @@
       var TOP_K = 40
 
       var worker = null
-      var responseInProgress = ""
+      var reply = ""
       var lastReply = null
       var lastPrompt = ""
 
@@ -390,17 +390,17 @@
 
             case "token":
               document.title = t("title") + " - " + t("writing")
-              responseInProgress = responseInProgress + data.token
+              reply = reply + data.token
               patchDOM(
                 lastReply,
-                markdownToHTML(responseInProgress.replace(/\</g, "&#60;")) +
+                markdownToHTML(reply.replace(/\</g, "&#60;")) +
                   '<div class="pointer"></div>'
               )
               break
 
             case "complete":
               rendering = false
-              if (responseInProgress === "") {
+              if (reply === "") {
                 lastReply.innerHTML =
                   markdownToHTML(
                     t("error_empty")
@@ -410,11 +410,11 @@
               }
               handleReply(
                 document.querySelector(".content"),
-                responseInProgress,
+                reply,
                 lastReply,
                 lastPrompt
               )
-              responseInProgress = ""
+              reply = ""
               break
 
             case "error":
