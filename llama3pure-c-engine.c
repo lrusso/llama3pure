@@ -5278,6 +5278,9 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
     }
 
     for (int m = 0; m < msg_count; m++) {
+        // The system message is encoded above as the system prompt
+        if (strcmp(messages[m].role, "system") == 0) continue;
+
         // Llama uses "assistant" instead of "model"
         const char* llama_role = (strcmp(messages[m].role, "model") == 0) ? "assistant" : messages[m].role;
 
@@ -5322,6 +5325,9 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
     for (int m = 0; m < msg_count; m++) {
         const char* role = messages[m].role;
         const char* content = messages[m].content;
+
+        // The system message is merged into the first user message
+        if (strcmp(role, "system") == 0) continue;
 
         tokens[(*n_tokens)++] = start_turn;
 
@@ -6092,10 +6098,17 @@ int main(int argc, char *argv[]) {
         }
         free(json);
 
+        // The system prompt is read from the "system" message of the chat history.
+        // Without one, the -system_prompt argument is used
+        const char* history_system_prompt = system_prompt;
+        for (int m = 0; m < msg_count; m++) {
+            if (strcmp(messages[m].role, "system") == 0) history_system_prompt = messages[m].content;
+        }
+
         if (config.is_gemma3) {
-            encode_gemma3_chat_history(messages, msg_count, system_prompt, prompt_tokens, &num_prompt_tokens);
+            encode_gemma3_chat_history(messages, msg_count, history_system_prompt, prompt_tokens, &num_prompt_tokens);
         } else {
-            encode_llama3_chat_history(messages, msg_count, system_prompt, prompt_tokens, &num_prompt_tokens);
+            encode_llama3_chat_history(messages, msg_count, history_system_prompt, prompt_tokens, &num_prompt_tokens);
         }
         free_chat_history(messages, msg_count);
 

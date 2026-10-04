@@ -56,7 +56,7 @@ llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 | -top_k         |    No    | Top-K sampling. Only the K most probable tokens are considered at each step.                            |               40               |
 | -debug         |    No    | Show detailed model loading and performance logs (including tok/s).                                     |            disabled            |
 
-Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt).
+Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt). A message with `"type": "system"` sets the system prompt, taking precedence over `-system_prompt`.
 
 ## Running in Node.js
 
@@ -113,7 +113,7 @@ llama3pure({
 
 - Step 2: Generate a response
 
-Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `type: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations.
+Call `llama3pure` with `type: "generate"` and a `chatHistory` array. The engine uses the `cbRender` callback provided during load to stream tokens. The last message in `chatHistory` should have `type: "user"` - that is the message the model will respond to. Previous messages provide conversation context, enabling multi-turn conversations. A message with `type: "system"` sets the system prompt, taking precedence over `systemPrompt`.
 
 ```javascript
 llama3pure({

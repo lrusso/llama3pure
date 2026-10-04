@@ -6025,11 +6025,24 @@ function encodeGemma3Chat(chatHistory, sysPrompt) {
 function generate(chatHistory) {
   ensureFp16Table()
   ensureVocabTables()
+
+  // The system prompt is read from the "system" message of the chat history.
+  // Without one, the system prompt given when loading the model is used
+  var sysPrompt = systemPrompt
+  var messages = []
+  for (var m = 0; m < chatHistory.length; m = m + 1) {
+    if (chatHistory[m].type === "system") {
+      sysPrompt = chatHistory[m].text
+    } else {
+      messages.push(chatHistory[m])
+    }
+  }
+
   var promptTokens
   if (config.isGemma) {
-    promptTokens = encodeGemma3Chat(chatHistory, systemPrompt)
+    promptTokens = encodeGemma3Chat(messages, sysPrompt)
   } else {
-    promptTokens = encodeLlama3Chat(chatHistory, systemPrompt)
+    promptTokens = encodeLlama3Chat(messages, sysPrompt)
   }
 
   // Release the vocabulary lookup table (only needed to encode the prompt)

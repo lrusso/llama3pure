@@ -379,6 +379,8 @@
 
               resizeInputText()
 
+              chatHistory.push({ type: "system", text: t("system_prompt") })
+
               appendMessage("reply", markdownToHTML(t("system_welcome")))
 
               if (!isMobileDevice()) {
@@ -447,7 +449,6 @@
             {
               type: "load",
               model: arrayBuffer,
-              systemPrompt: t("system_prompt"),
               maxTokens: MAX_TOKENS,
               contextSize: CONTEXT_SIZE,
               temperature: TEMPERATURE,

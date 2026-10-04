@@ -107,6 +107,7 @@ const testModelUsingNode = (model) => {
   llama3pure({
     type: "generate",
     chatHistory: [
+      { type: "system", text: "You are a helpful assistant." },
       { type: "user", text: "Tell me in 1 line what is Microsoft." },
       {
         type: "model",
@@ -147,7 +148,6 @@ const testPerformance = () => {
         mPeak = r
       }
     },
-    systemPrompt: "You are a helpful assistant.",
     maxTokens: 256,
     contextSize: 2048,
     temperature: 0.9,
@@ -164,6 +164,7 @@ const testPerformance = () => {
   llama3pure({
     type: "generate",
     chatHistory: [
+      { type: "system", text: "You are a helpful assistant." },
       { type: "user", text: "Tell me in 1 line what is Microsoft." },
       {
         type: "model",
