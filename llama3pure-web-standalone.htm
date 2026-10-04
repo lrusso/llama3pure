@@ -382,10 +382,7 @@
 
               resizeInputText()
 
-              var welcomeMessage = document.createElement("span")
-              welcomeMessage.className = "reply"
-              welcomeMessage.innerHTML = markdownToHTML(t("system_welcome"))
-              content.appendChild(welcomeMessage)
+              appendMessage("reply", markdownToHTML(t("system_welcome")))
 
               if (!isMobileDevice()) {
                 inputTextbox.focus()
