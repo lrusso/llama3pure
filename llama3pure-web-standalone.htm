@@ -409,7 +409,7 @@
                     t("error_empty")
                       .replace("()", "(" + CONTEXT_SIZE + ")")
                       .replace(/\</g, "&#60;")
-                  ) + lastReply.innerHTML
+                  ) + '<div class="pointer"></div>'
               }
               handleReply(
                 document.querySelector(".content"),
