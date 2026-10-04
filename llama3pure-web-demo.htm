@@ -172,8 +172,6 @@
           system_welcome: "Hello, how can I help you today?",
           disclaimer: "Llama is AI and can make mistakes.",
           copied: "Copied to clipboard.",
-          error_empty:
-            "The AI model returned an empty message, check the context size or the Internet connection.",
           error_filesize:
             "Error. Due to universal browser memory constraints regarding ArrayBuffer size limits, this Web engine can only read GGUF files up to 2 GB.",
           error_download: "Error. Something went wrong during the download process.",
@@ -191,8 +189,6 @@
           system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
           disclaimer: "Llama es una IA y puede cometer errores.",
           copied: "Copiado al portapapeles.",
-          error_empty:
-            "El modelo de IA devolvi\xF3 un mensaje vac\xEDo, verifique el tama\xF1o del contexto o la conexi\xF3n a Internet.",
           error_filesize:
             "Error. Debido a las restricciones de memoria de los navegadores con el tama\xF1o de los ArrayBuffer, este motor Web no puede leer archivos GGUF que superen los 2 GB.",
           error_download:
@@ -404,11 +400,6 @@
               break
 
             case "complete":
-              rendering = false
-              if (reply === "") {
-                lastReply.innerHTML =
-                  markdownToHTML(t("error_empty")) + '<div class="pointer"></div>'
-              }
               handleReply(
                 document.querySelector(".content"),
                 reply,
