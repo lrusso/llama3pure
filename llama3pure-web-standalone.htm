@@ -393,7 +393,10 @@
               break
 
             case "token":
-              document.title = t("title") + " - " + t("writing")
+              // the first token means the reply started
+              if (reply === "") {
+                document.title = t("title") + " - " + t("writing")
+              }
               reply = reply + data.token
               patchDOM(
                 lastReply,
