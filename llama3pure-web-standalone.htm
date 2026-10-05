@@ -412,7 +412,6 @@
                 lastReply,
                 lastPrompt
               )
-              reply = ""
               break
 
             case "error":
@@ -648,6 +647,8 @@
         buttonEdit.style.cursor = "default"
 
         document.title = t("title") + " - " + t("thinking")
+
+        reply = ""
 
         worker.postMessage({
           type: "generate",
