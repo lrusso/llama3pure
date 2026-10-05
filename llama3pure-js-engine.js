@@ -6259,7 +6259,7 @@ function llama3pure(data) {
         if (data.model instanceof ArrayBuffer) {
           loadModel(data.model)
         } else {
-          console.error(
+          console.log(
             "The model parameter is required and must be an ArrayBuffer."
           )
           return
@@ -6279,7 +6279,7 @@ function llama3pure(data) {
         break
     }
   } catch (err) {
-    console.error(err)
+    console.log(err)
   }
 }
 
