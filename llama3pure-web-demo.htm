@@ -656,6 +656,7 @@
           }
 
           promptContent.addEventListener("keydown", handlePromptKeydown)
+          promptContent.addEventListener("input", handlePromptInput)
           promptContent.addEventListener("paste", handlePromptPaste)
 
           buttonEdit = createComponent("button", "action_button edit_button")
@@ -877,7 +878,7 @@
         var selection = window.getSelection()
         var buttonEdit = document.querySelector(".edit_button")
         var buttonCancel = createComponent("button", "action_button active")
-        var buttonUpdate = createComponent("button", "action_button active")
+        var buttonUpdate = createComponent("button", "action_button")
 
         buttonCancel.type = "button"
         buttonCancel.appendChild(ICON_CANCEL())
@@ -885,8 +886,8 @@
         buttonCancel.addEventListener("click", endPromptEdit)
 
         buttonUpdate.type = "button"
+        buttonUpdate.disabled = true
         buttonUpdate.appendChild(ICON_UPDATE())
-        buttonUpdate.children[0].classList.add("active")
         buttonUpdate.addEventListener("click", function () {
           updatePrompt(promptContent)
         })
@@ -971,6 +972,16 @@
         buttonEdit.nextSibling.style.display = ""
       }
 
+      function handlePromptInput(event) {
+        var buttonUpdate = document.querySelector(".update").parentNode
+        var isChanged = event.currentTarget.innerText.trim() !== promptBeforeEdit
+
+        // the update button is only enabled while the prompt is changed
+        buttonUpdate.classList.toggle("active", isChanged)
+        buttonUpdate.children[0].classList.toggle("active", isChanged)
+        buttonUpdate.disabled = !isChanged
+      }
+
       function handlePromptPaste(event) {
         try {
           // pasting only the plain text, so no html gets into the prompt
@@ -987,6 +998,9 @@
 
           selection.removeAllRanges()
           selection.addRange(range)
+
+          // the pasted text doesn't fire the input event, since it's inserted by hand
+          handlePromptInput(event)
         } catch (err) {
           //
         }
