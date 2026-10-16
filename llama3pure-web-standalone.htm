@@ -19,7 +19,7 @@
     >
     <meta
       name="viewport"
-      content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content"
     >
     <style>
       body {
@@ -251,6 +251,7 @@
       var reply = ""
       var lastReply = null
       var lastPrompt = ""
+      var lastTouchEnd = 0
 
       function ICON_REGENERATE() {
         var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
@@ -1342,6 +1343,21 @@
 
         xhr.send()
       }
+
+      // workaround for ios. safari ignores user-scalable=no, so the pinch zoom
+      // is blocked here.
+      document.addEventListener("gesturestart", function (event) {
+        event.preventDefault()
+      })
+
+      // workaround for ios. safari ignores touch-action in fixed elements, so
+      // the double tap zoom is blocked here.
+      document.addEventListener("touchend", function (event) {
+        if (isUsingiOS() && event.timeStamp - lastTouchEnd <= 300) {
+          event.preventDefault()
+        }
+        lastTouchEnd = event.timeStamp
+      })
 
       window.addEventListener("load", function () {
         if (window.top === window.self) {
