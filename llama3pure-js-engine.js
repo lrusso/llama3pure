@@ -119,15 +119,12 @@ function decodeUTF8(bytes) {
   return str
 }
 
+// Streaming decoder (Llama): a cut sequence waits for the next token's bytes
 function createStreamingUTF8Decoder() {
   var pendingBytes = []
   return {
     decode: function decode(bytes, stream) {
       var i
-      var j
-      var b0
-      var seqLen
-      var cp
       var combined
       if (!bytes) {
         bytes = new Uint8Array(0)
@@ -137,67 +134,42 @@ function createStreamingUTF8Decoder() {
         for (i = 0; i < pendingBytes.length; i++) {
           combined[i] = pendingBytes[i]
         }
-        for (j = 0; j < bytes.length; j++) {
-          combined[pendingBytes.length + j] = bytes[j]
+        for (i = 0; i < bytes.length; i++) {
+          combined[pendingBytes.length + i] = bytes[i]
         }
         pendingBytes = []
       } else {
         combined = bytes
       }
-      var str = ""
+      // Streaming: a cut sequence waits for the next token
       var len = combined.length
-      i = 0
-      while (i < len) {
-        b0 = combined[i]
-        if (b0 < 0x80) {
-          seqLen = 1
-        } else if ((b0 & 0xe0) === 0xc0) {
-          seqLen = 2
-        } else if ((b0 & 0xf0) === 0xe0) {
-          seqLen = 3
-        } else if ((b0 & 0xf8) === 0xf0) {
-          seqLen = 4
-        } else {
-          i = i + 1
-          continue
-        }
-        if (i + seqLen > len) {
-          if (stream) {
-            for (j = i; j < len; j++) {
-              pendingBytes.push(combined[j])
-            }
+      var end = len
+      if (stream) {
+        i = 0
+        while (i < len) {
+          var b0 = combined[i]
+          var seqLen = 1
+          if ((b0 & 0xe0) === 0xc0) {
+            seqLen = 2
+          } else if ((b0 & 0xf0) === 0xe0) {
+            seqLen = 3
+          } else if ((b0 & 0xf8) === 0xf0) {
+            seqLen = 4
           }
-          break
+          if (i + seqLen > len) {
+            end = i
+            break
+          }
+          i = i + seqLen
         }
-        if (seqLen === 1) {
-          str = str + String.fromCharCode(b0)
-        } else if (seqLen === 2) {
-          str =
-            str + String.fromCharCode(((b0 & 0x1f) << 6) | (combined[i + 1] & 0x3f))
-        } else if (seqLen === 3) {
-          str =
-            str +
-            String.fromCharCode(
-              ((b0 & 0x0f) << 12) |
-                ((combined[i + 1] & 0x3f) << 6) |
-                (combined[i + 2] & 0x3f)
-            )
-        } else {
-          cp =
-            ((b0 & 0x07) << 18) |
-            ((combined[i + 1] & 0x3f) << 12) |
-            ((combined[i + 2] & 0x3f) << 6) |
-            (combined[i + 3] & 0x3f)
-          cp = cp - 0x10000
-          str = str + String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff))
+        for (i = end; i < len; i++) {
+          pendingBytes.push(combined[i])
         }
-        i = i + seqLen
       }
-      return str
+      return decodeUTF8(end === len ? combined : combined.subarray(0, end))
     },
   }
 }
-
 // ----------------------------------------------------------------------------
 // State
 
@@ -213,9 +185,8 @@ var offset = 0
 var xQ8Buf = null
 var xQ8Int8Buf = null
 var xQ8Size = 0
-// Scratch of one generate() call: holds the tokenizer hash table while the
-// prompt is encoded, then the prefill batch buffers, then the logits (they
-// are never needed at the same time), and is released when the call ends
+// Scratch of one generate() call: tokenizer hash table, then prefill batch
+// buffers, then logits; released when the call ends
 var genScratch = null
 var matmulDeqBuf = null
 // Four row views over matmulDeqBuf (Q8_0 prefill kernel)
@@ -230,8 +201,7 @@ var systemPrompt = "You are a helpful assistant."
 var maxTokens = -1
 var contextSize = 0
 
-// QuantizedTensor: { dataOffset, type, rows, cols, ... }, read on the fly by
-// the matmuls
+// QuantizedTensor records, read on the fly by the matmuls
 
 // ----------------------------------------------------------------------------
 // DataView helpers
@@ -333,8 +303,7 @@ var convBuffer = new ArrayBuffer(4)
 var convInt = new Uint32Array(convBuffer)
 var convFloat = new Float32Array(convBuffer)
 
-// FP16 to FP32 lookup table (256 KB), filled on the first generate() call
-// (ensureFp16Table); until then its pages are never touched
+// FP16 to FP32 table (256 KB), filled on the first generate() (ensureFp16Table)
 var fp16Table = new Float32Array(65536)
 var fp16TableReady = false
 
@@ -344,9 +313,7 @@ function ensureFp16Table() {
   }
   fp16TableReady = true
   var t = fp16Table
-  // Exponent e, mantissa m: (m + 1024) * 2^(e - 25), denormals (e = 0) m * 2^-24;
-  // e = 31 is +-Infinity (m = 0) or NaN. The upper half of the table is the
-  // negative sign bit.
+  // e = 0: m * 2^-24; e = 31: Infinity or NaN; the upper half is the sign bit
   var scale = Math.pow(2, -24)
   for (var e = 0; e < 31; e = e + 1) {
     var base = e << 10
@@ -462,8 +429,7 @@ function quantizeToQ8_0Cache(src, srcOffset, dst, dstInt8, dstOffset, count) {
   }
 }
 
-// out[outOffset...] += weight * (Q8_0 cached vector at cacheOffset), `count`
-// elements (multiple of 32)
+// out[outOffset...] += weight * Q8_0 cached vector (count: multiple of 32)
 function accumQ8_0Cache(
   out,
   outOffset,
@@ -542,8 +508,7 @@ function dequantizeF32(srcOffset, dst, dstOffset, count) {
   dst.set(src, dstOffset)
 }
 
-// Row dequantizers for 4-byte-aligned F16 / BF16 / F32 matrices, same signature
-// as the K-quant ones (view: Int32Array, two values per word, or Float32Array)
+// Row dequantizers for F16 / BF16 (Int32 view, two values per word) and F32
 function deqRowF16(I32, p, dst, dstOff, cols) {
   var tab = fp16Table
   var half = cols >> 1
@@ -692,10 +657,8 @@ function dequantizeQ5_1(srcOffset, dst, dstOffset, count) {
 }
 
 // ----------------------------------------------------------------------------
-// Row dequantizers for the K-quant formats (matmuls and embedding rows).
-// Arguments: the view the matrix is read through (Int32Array for
-// Q2_K/Q4_K/Q5_K, Uint16Array for Q3_K/Q6_K), p = index of the row's first
-// element in it, dst[dstOff...] gets cols values.
+// K-quant row dequantizers: (view, p, dst, dstOff, cols), view = Int32Array
+// (Q2_K/Q4_K/Q5_K) or Uint16Array (Q3_K/Q6_K), p = row start in it
 
 function deqRowQ2_K(I32, p, dst, dstOff, cols) {
   var nb = cols >> 8
@@ -770,8 +733,7 @@ function deqRowQ2_K(I32, p, dst, dstOff, cols) {
 // Scales of the Q3_K / Q6_K blocks being read (16 per row)
 var q3kScales = new Int8Array(64)
 
-// 12 scale bytes of the Q3_K block at word p -> 16 signed 6-bit scales at
-// q3kScales[base...] (same unpacking as llama.cpp).
+// 12 scale bytes of the Q3_K block at word p -> 16 scales at q3kScales[base..]
 function q3kUnpackScales(U16, p, base) {
   var kmask1 = 0x03030303
   var kmask2 = 0x0f0f0f0f
@@ -838,8 +800,7 @@ function deqRowQ3_K(U16, p, dst, dstOff, cols) {
   }
 }
 
-// 6-bit scale/min pair number `is` (0-7) of a Q4_K/Q5_K block from its three
-// scale words; returns sc in the low 8 bits and m in the high 8 bits.
+// Scale/min pair `is` (0-7) of a Q4_K/Q5_K block: sc | m << 8
 function kScaleMin(is, w1, w2, w3) {
   if (is < 4) {
     return ((w1 >> (is << 3)) & 63) | (((w2 >> (is << 3)) & 63) << 8)
@@ -1017,8 +978,7 @@ function dequantizeIQ4_NL(srcOffset, dst, dstOffset, count) {
   }
 }
 
-// Dequantize `count` K-quant values at an absolute buffer offset through a
-// temporary view (small tensors and non-embedding rows)
+// Dequantize count K-quant values at a buffer offset (small tensors)
 function deqKQuantAt(type, srcOffset, dst, count) {
   var bytes = getRowSize(count, type)
   var deqFunc = getDeqRowFunc(type)
@@ -1113,8 +1073,7 @@ function dequantizeRow(dst, srcOffset, nCols, type) {
   }
 }
 
-// Byte-wise dot product of one Q8_0 row, for the matrices the Int32 kernels
-// cannot read (odd number of blocks per row)
+// Byte-wise Q8_0 row dot product (rows with an odd number of blocks)
 function vecDotQ8_0(x, srcOffset, n) {
   var nb = n >> 5
   var sum = 0.0
@@ -1171,13 +1130,10 @@ function vecDotQ8_0(x, srcOffset, n) {
 }
 
 // ----------------------------------------------------------------------------
-// Block-32 formats with Q8_0 activations (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL),
-// prefill: each row is unpacked once into int8 weights and per-block scales
-// (and mins), then a 4-row x 3-token integer tile runs against the Q8_0
-// activations; exact integer block sums, scale products in block order.
+// Block-32 prefill (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL): each row unpacked once to
+// int8 + scales, then a 4-row x 3-token integer tile against the Q8_0 x
 
-// Unpack one row into w8[wOff...] (int8 weights, 32 per block), sc[scOff + b]
-// (fp16 scale as float) and, for the *_1 formats, mn[mnOff + b] (fp16 min).
+// Unpack one row: int8 weights w8[wOff..], scales sc[scOff + b], mins mn (*_1)
 function unpackRowQ4_0(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
   var wi = wOff
   for (var b = 0; b < nb; b = b + 1) {
@@ -1287,9 +1243,8 @@ function block32XSums(bQ8i8, batchSize, nb, sc, xsBase) {
   }
 }
 
-// Integer 4-row x 3-token tile over one group of 4 unpacked rows (w8: int8
-// weights; sc: per-block scales, mins and x block sums) for tokens
-// bt..bt+nTok-1; a short group reuses its last token for the missing lanes.
+// Integer 4-row x 3-token tile for tokens bt..bt+nTok-1 (a short group repeats
+// its last token)
 function block32Tile(
   outs,
   bt,
@@ -1429,18 +1384,15 @@ function block32Tile(
   }
 }
 
-// Scratch layout inside matmulDeqBuf (32 * maxCols bytes) for the integer tile:
-//   bytes   [0, 4 * cols)                int8 weights of the 4 rows (matmulDeqI8)
-//   doubles [cols/2, +4*nb)              per-row, per-block scales
-//   doubles [cols/2 + 4*nb, +4*nb)       per-row, per-block mins (Q4_1 / Q5_1)
-//   doubles [cols/2 + 8*nb, +batch*nb)   per-token, per-block sums of the Q8 x
+// Scratch layout in matmulDeqBuf: int8 weights of the 4 rows, then (doubles
+// from cols/2) 4*nb scales, 4*nb mins (Q4_1 / Q5_1), batch*nb x block sums
 function matmulBlock32Q8Batch(outs, xs, qw, batchSize) {
   var rows = qw.rows
   var cols = qw.cols
   var rowSize = qw.rowSize
   var base = qw.dataOffset
   var nb = cols >> 5
-  var unpack = qw.unpackRowFunc
+  var unpack = qw.k.unpackRowFunc
   var hasMin = qw.type === GGML_TYPE.Q4_1 || qw.type === GGML_TYPE.Q5_1
   var u8 = ggufUint8
   var w8 = matmulDeqI8
@@ -1496,13 +1448,11 @@ function matmulBlock32Q8Batch(outs, xs, qw, batchSize) {
 }
 
 // ----------------------------------------------------------------------------
-// Single-token kernels for the block-32 formats with Q8_0 activations: rows
-// i..i+3 per call (row loop in matmulQuantizedPreQ8), weights read through the
-// Uint16 view, the quantized x once per block for the 4 rows; same math as the
-// prefill tile (the Q4_0/Q5_0 offset is folded out of the inner sum).
+// Single-token block-32 kernels: rows i..i+3 per call, weights through the
+// Uint16 view, x quantized once; same math as the prefill tile
 
 function matmulQ4_0Q8Rows4(out, qw, i) {
-  var U16 = qw.localU16
+  var U16 = qw.view
   var rowWords = qw.rowSize >> 1
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
@@ -1529,7 +1479,7 @@ function matmulQ4_0Q8Rows4(out, qw, i) {
     var xs = 0
     var xg = xo
     var wk = 1
-    // 4 quant bytes per step: weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
+    // weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
     for (var g = 0; g < 4; g = g + 1) {
       var x0 = xq[xg]
       var y0 = xq[(xg + 16) | 0]
@@ -1616,7 +1566,7 @@ function matmulQ4_0Q8Rows4(out, qw, i) {
 }
 
 function matmulQ4_1Q8Rows4(out, qw, i) {
-  var U16 = qw.localU16
+  var U16 = qw.view
   var rowWords = qw.rowSize >> 1
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
@@ -1647,7 +1597,7 @@ function matmulQ4_1Q8Rows4(out, qw, i) {
     var xs = 0
     var xg = xo
     var wk = 2
-    // 4 quant bytes per step: weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
+    // weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
     for (var g = 0; g < 4; g = g + 1) {
       var x0 = xq[xg]
       var y0 = xq[(xg + 16) | 0]
@@ -1734,7 +1684,7 @@ function matmulQ4_1Q8Rows4(out, qw, i) {
 }
 
 function matmulQ5_0Q8Rows4(out, qw, i) {
-  var U16 = qw.localU16
+  var U16 = qw.view
   var rowWords = qw.rowSize >> 1
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
@@ -1765,7 +1715,7 @@ function matmulQ5_0Q8Rows4(out, qw, i) {
     var xs = 0
     var xg = xo
     var wk = 3
-    // 4 quant bytes per step: weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
+    // weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
     for (var g = 0; g < 4; g = g + 1) {
       var x0 = xq[xg]
       var y0 = xq[(xg + 16) | 0]
@@ -1856,7 +1806,7 @@ function matmulQ5_0Q8Rows4(out, qw, i) {
 }
 
 function matmulQ5_1Q8Rows4(out, qw, i) {
-  var U16 = qw.localU16
+  var U16 = qw.view
   var rowWords = qw.rowSize >> 1
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
@@ -1891,7 +1841,7 @@ function matmulQ5_1Q8Rows4(out, qw, i) {
     var xs = 0
     var xg = xo
     var wk = 4
-    // 4 quant bytes per step: weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
+    // weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
     for (var g = 0; g < 4; g = g + 1) {
       var x0 = xq[xg]
       var y0 = xq[(xg + 16) | 0]
@@ -1982,7 +1932,7 @@ function matmulQ5_1Q8Rows4(out, qw, i) {
 }
 
 function matmulIQ4_NLQ8Rows4(out, qw, i) {
-  var U16 = qw.localU16
+  var U16 = qw.view
   var rowWords = qw.rowSize >> 1
   var nb = qw.cols >> 5
   var xq = xQ8Int8Buf
@@ -2009,7 +1959,7 @@ function matmulIQ4_NLQ8Rows4(out, qw, i) {
     var i3 = 0
     var xg = xo
     var wk = 1
-    // 4 quant bytes per step: weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
+    // weights 4g..4g+3 (low nibbles), 4g+16..4g+19 (high)
     for (var g = 0; g < 4; g = g + 1) {
       var x0 = xq[xg]
       var y0 = xq[(xg + 16) | 0]
@@ -2115,9 +2065,8 @@ function getDeqRowFunc(type) {
   }
 }
 
-// Single-token kernel that computes a group of rows per call: (out, qw, i)
-// for the block-32 formats (4 rows, Q8_0 activations), (out, x, qw, i) for
-// the fused ones (2 rows); null for Q8_0 and Q2_K.
+// Single-token group kernel: (out, qw, i) block-32 (4 rows), (out, x, qw, i)
+// fused (4 rows, 2 for F32); null for Q8_0 and Q2_K
 function getRowsFunc(type) {
   switch (type) {
     case GGML_TYPE.Q4_0:
@@ -2157,16 +2106,17 @@ function ensureXQ8Buf() {
 }
 
 function matmulQuantized(out, x, qw) {
-  if (qw.localI32 !== null) {
+  var kind = qw.k.kind
+  if (kind === 1) {
     matmulQ8_0Local(out, x, qw)
-  } else if (qw.deqRowFunc) {
+  } else if (kind === 3) {
     // Fused kernel when the type has one, else dequantize-then-dot
-    if (qw.rowsFunc !== null) {
+    if (qw.k.rowsFunc !== null) {
       matmulRows(out, x, qw)
     } else {
       matmulKQuantLocal(out, x, qw, 0)
     }
-  } else if (qw.rowsFunc !== null) {
+  } else if (kind === 2) {
     // Block-32 formats: quantize x to Q8_0 once, then integer dot products
     ensureXQ8Buf()
     quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, qw.cols)
@@ -2186,7 +2136,7 @@ function matmulQuantized(out, x, qw) {
 function matmulQuantizedPreQ8(out, qw) {
   // 4 rows per call, weights read as Uint16 words, x shared by the 4 rows
   var rows = qw.rows
-  var rowsFunc = qw.rowsFunc
+  var rowsFunc = qw.k.rowsFunc
   for (var i = 0; i < rows; i = i + 4) {
     rowsFunc(out, qw, i)
   }
@@ -2195,18 +2145,21 @@ function matmulQuantizedPreQ8(out, qw) {
 // Batched matmul: several input vectors against the same weight matrix
 var PREFILL_BATCH_SIZE = 32
 
-function matmulQuantizedBatch(outs, xs, qw, batchSize) {
+// xs64: Float64 staging of xs for the float tiles (or null); stage: fill it
+function matmulQuantizedBatch(outs, xs, qw, batchSize, xs64, stage) {
   var rows = qw.rows
   var cols = qw.cols
   var baseOffset = qw.dataOffset
   var rowSize = qw.rowSize
 
-  if (qw.localI32 !== null) {
-    matmulQ8_0LocalBatch(outs, xs, qw, batchSize)
-  } else if (qw.deqRowFunc) {
-    // K-quants and F16/BF16/F32: dequantize 4 rows at a time, 4-row x 3-token tile
-    matmulKQuantLocalBatch(outs, xs, qw, batchSize)
-  } else if (qw.unpackRowFunc) {
+  var kind = qw.k.kind
+  if (kind === 1) {
+    // Q8_0 through the Int32 row dequantizer
+    matmulDeqBatch(outs, xs, xs64, stage, qw, batchSize, deqRowQ8_0I32, qw.view)
+  } else if (kind === 3) {
+    // K-quants and F16/BF16/F32
+    matmulDeqBatch(outs, xs, xs64, stage, qw, batchSize, qw.k.deqRowFunc, qw.view)
+  } else if (kind === 2) {
     // Block-32 formats with Q8 activations: unpack once, integer tile
     matmulBlock32Q8Batch(outs, xs, qw, batchSize)
   } else {
@@ -2219,556 +2172,212 @@ function matmulQuantizedBatch(outs, xs, qw, batchSize) {
   }
 }
 
-// Q8_0 matmul, single token: 4 rows at a time, 4 weights per Int32 load
-// (sign-extracted with a shift pair). Rows are walked in pairs of 34-byte
-// blocks (17 words: scale + weights 0-1, words 1-7 weights 2-29, word 8 weights
-// 30-31 + the next scale, words 9-16 the second block). Same summation order as
-// the byte kernel. The second 16-column group of a block sits in a
-// one-iteration loop on purpose (keeps V8 from hoisting every load and
-// spilling). Requires qw.localI32.
+// Q8_0 matmul, single token: 6 rows per step, one Int32 word (4 weights) per
+// row, so every x load serves 6 rows; q = word of row i, the other rows at fixed
+// strides; blocks walked in pairs (17 words). The last group starts at rows - 6
+// (same values twice). Needs the Int32 view (kind 1).
 function matmulQ8_0Local(out, x, qw) {
-  var I32 = qw.localI32
-  var base = qw.base
+  var I32 = qw.view
   var rows = qw.rows
   var cols = qw.cols
   var rowWords = qw.rowSize >> 2
-  var nbp = cols >> 6
-  var rows4 = rows & ~3
-  for (var i = 0; i < rows4; i = i + 4) {
-    var p0 = base + i * rowWords
-    var p1 = p0 + rowWords
-    var p2 = p1 + rowWords
-    var p3 = p2 + rowWords
+  var lastI = rows - 6
+  var w1 = rowWords
+  var w2 = (w1 + rowWords) | 0
+  var w3 = (w2 + rowWords) | 0
+  var w4 = (w3 + rowWords) | 0
+  var w5 = (w4 + rowWords) | 0
+  var q = 0
+  for (var i = 0; i < rows; i = i + 6) {
+    if (i > lastI) {
+      i = lastI
+    }
+    q = (qw.base + i * rowWords) | 0
     var s0 = 0.0
     var s1 = 0.0
     var s2 = 0.0
     var s3 = 0.0
-    var xb = 0
-    for (var b = 0; b < nbp; b = b + 1) {
-      var d0_0 = fp16Table[I32[p0] & 0xffff]
-      var d0_1 = fp16Table[I32[p1] & 0xffff]
-      var d0_2 = fp16Table[I32[p2] & 0xffff]
-      var d0_3 = fp16Table[I32[p3] & 0xffff]
-      // Even block of the pair (weights 0-31), columns 0-15
-      var xi = xb
-      var w0 = p0
-      var w1 = p1
-      var w2 = p2
-      var w3 = p3
-      var x0 = x[xi]
-      var x1 = x[(xi + 1) | 0]
-      var x2 = x[(xi + 2) | 0]
-      var x3 = x[(xi + 3) | 0]
-      var x4 = x[(xi + 4) | 0]
-      var x5 = x[(xi + 5) | 0]
-      var x6 = x[(xi + 6) | 0]
-      var x7 = x[(xi + 7) | 0]
-      var x8 = x[(xi + 8) | 0]
-      var x9 = x[(xi + 9) | 0]
-      var x10 = x[(xi + 10) | 0]
-      var x11 = x[(xi + 11) | 0]
-      var x12 = x[(xi + 12) | 0]
-      var x13 = x[(xi + 13) | 0]
-      var x14 = x[(xi + 14) | 0]
-      var x15 = x[(xi + 15) | 0]
-      var v0_0 = I32[w0]
-      var v0_1 = I32[(w0 + 1) | 0]
-      var v0_2 = I32[(w0 + 2) | 0]
-      var v0_3 = I32[(w0 + 3) | 0]
-      var v0_4 = I32[(w0 + 4) | 0]
-      var v1_0 = I32[w1]
-      var v1_1 = I32[(w1 + 1) | 0]
-      var v1_2 = I32[(w1 + 2) | 0]
-      var v1_3 = I32[(w1 + 3) | 0]
-      var v1_4 = I32[(w1 + 4) | 0]
-      var v2_0 = I32[w2]
-      var v2_1 = I32[(w2 + 1) | 0]
-      var v2_2 = I32[(w2 + 2) | 0]
-      var v2_3 = I32[(w2 + 3) | 0]
-      var v2_4 = I32[(w2 + 4) | 0]
-      var v3_0 = I32[w3]
-      var v3_1 = I32[(w3 + 1) | 0]
-      var v3_2 = I32[(w3 + 2) | 0]
-      var v3_3 = I32[(w3 + 3) | 0]
-      var v3_4 = I32[(w3 + 4) | 0]
-      var a0 =
-        x0 * ((v0_0 << 8) >> 24) +
-        x1 * (v0_0 >> 24) +
-        x2 * ((v0_1 << 24) >> 24) +
-        x3 * ((v0_1 << 16) >> 24) +
-        x4 * ((v0_1 << 8) >> 24) +
-        x5 * (v0_1 >> 24) +
-        x6 * ((v0_2 << 24) >> 24) +
-        x7 * ((v0_2 << 16) >> 24) +
-        x8 * ((v0_2 << 8) >> 24) +
-        x9 * (v0_2 >> 24) +
-        x10 * ((v0_3 << 24) >> 24) +
-        x11 * ((v0_3 << 16) >> 24) +
-        x12 * ((v0_3 << 8) >> 24) +
-        x13 * (v0_3 >> 24) +
-        x14 * ((v0_4 << 24) >> 24) +
-        x15 * ((v0_4 << 16) >> 24)
-      var a1 =
-        x0 * ((v1_0 << 8) >> 24) +
-        x1 * (v1_0 >> 24) +
-        x2 * ((v1_1 << 24) >> 24) +
-        x3 * ((v1_1 << 16) >> 24) +
-        x4 * ((v1_1 << 8) >> 24) +
-        x5 * (v1_1 >> 24) +
-        x6 * ((v1_2 << 24) >> 24) +
-        x7 * ((v1_2 << 16) >> 24) +
-        x8 * ((v1_2 << 8) >> 24) +
-        x9 * (v1_2 >> 24) +
-        x10 * ((v1_3 << 24) >> 24) +
-        x11 * ((v1_3 << 16) >> 24) +
-        x12 * ((v1_3 << 8) >> 24) +
-        x13 * (v1_3 >> 24) +
-        x14 * ((v1_4 << 24) >> 24) +
-        x15 * ((v1_4 << 16) >> 24)
-      var a2 =
-        x0 * ((v2_0 << 8) >> 24) +
-        x1 * (v2_0 >> 24) +
-        x2 * ((v2_1 << 24) >> 24) +
-        x3 * ((v2_1 << 16) >> 24) +
-        x4 * ((v2_1 << 8) >> 24) +
-        x5 * (v2_1 >> 24) +
-        x6 * ((v2_2 << 24) >> 24) +
-        x7 * ((v2_2 << 16) >> 24) +
-        x8 * ((v2_2 << 8) >> 24) +
-        x9 * (v2_2 >> 24) +
-        x10 * ((v2_3 << 24) >> 24) +
-        x11 * ((v2_3 << 16) >> 24) +
-        x12 * ((v2_3 << 8) >> 24) +
-        x13 * (v2_3 >> 24) +
-        x14 * ((v2_4 << 24) >> 24) +
-        x15 * ((v2_4 << 16) >> 24)
-      var a3 =
-        x0 * ((v3_0 << 8) >> 24) +
-        x1 * (v3_0 >> 24) +
-        x2 * ((v3_1 << 24) >> 24) +
-        x3 * ((v3_1 << 16) >> 24) +
-        x4 * ((v3_1 << 8) >> 24) +
-        x5 * (v3_1 >> 24) +
-        x6 * ((v3_2 << 24) >> 24) +
-        x7 * ((v3_2 << 16) >> 24) +
-        x8 * ((v3_2 << 8) >> 24) +
-        x9 * (v3_2 >> 24) +
-        x10 * ((v3_3 << 24) >> 24) +
-        x11 * ((v3_3 << 16) >> 24) +
-        x12 * ((v3_3 << 8) >> 24) +
-        x13 * (v3_3 >> 24) +
-        x14 * ((v3_4 << 24) >> 24) +
-        x15 * ((v3_4 << 16) >> 24)
-      // Columns 16-31 (one-iteration loop: bounds the basic block for V8)
-      for (var g = 1; g < 2; g = g + 1) {
-        xi = xi + 16
-        w0 = w0 + 4
-        w1 = w1 + 4
-        w2 = w2 + 4
-        w3 = w3 + 4
-        var x0 = x[xi]
-        var x1 = x[(xi + 1) | 0]
-        var x2 = x[(xi + 2) | 0]
-        var x3 = x[(xi + 3) | 0]
-        var x4 = x[(xi + 4) | 0]
-        var x5 = x[(xi + 5) | 0]
-        var x6 = x[(xi + 6) | 0]
-        var x7 = x[(xi + 7) | 0]
-        var x8 = x[(xi + 8) | 0]
-        var x9 = x[(xi + 9) | 0]
-        var x10 = x[(xi + 10) | 0]
-        var x11 = x[(xi + 11) | 0]
-        var x12 = x[(xi + 12) | 0]
-        var x13 = x[(xi + 13) | 0]
-        var x14 = x[(xi + 14) | 0]
-        var x15 = x[(xi + 15) | 0]
-        var v0_0 = I32[w0]
-        var v0_1 = I32[(w0 + 1) | 0]
-        var v0_2 = I32[(w0 + 2) | 0]
-        var v0_3 = I32[(w0 + 3) | 0]
-        var v0_4 = I32[(w0 + 4) | 0]
-        var v1_0 = I32[w1]
-        var v1_1 = I32[(w1 + 1) | 0]
-        var v1_2 = I32[(w1 + 2) | 0]
-        var v1_3 = I32[(w1 + 3) | 0]
-        var v1_4 = I32[(w1 + 4) | 0]
-        var v2_0 = I32[w2]
-        var v2_1 = I32[(w2 + 1) | 0]
-        var v2_2 = I32[(w2 + 2) | 0]
-        var v2_3 = I32[(w2 + 3) | 0]
-        var v2_4 = I32[(w2 + 4) | 0]
-        var v3_0 = I32[w3]
-        var v3_1 = I32[(w3 + 1) | 0]
-        var v3_2 = I32[(w3 + 2) | 0]
-        var v3_3 = I32[(w3 + 3) | 0]
-        var v3_4 = I32[(w3 + 4) | 0]
+    var s4 = 0.0
+    var s5 = 0.0
+    for (var xb = 0; xb < cols; xb = xb + 64) {
+      // Even block: word 0 holds the scale (low half) and weights 0-1
+      var v0 = I32[q]
+      var v1 = I32[(q + w1) | 0]
+      var v2 = I32[(q + w2) | 0]
+      var v3 = I32[(q + w3) | 0]
+      var v4 = I32[(q + w4) | 0]
+      var v5 = I32[(q + w5) | 0]
+      var e0 = v0 & 0xffff
+      var e1 = v1 & 0xffff
+      var e2 = v2 & 0xffff
+      var e3 = v3 & 0xffff
+      var e4 = v4 & 0xffff
+      var e5 = v5 & 0xffff
+      var xa = x[xb]
+      var xd = x[(xb + 1) | 0]
+      var a0 = xa * ((v0 << 8) >> 24) + xd * (v0 >> 24)
+      var a1 = xa * ((v1 << 8) >> 24) + xd * (v1 >> 24)
+      var a2 = xa * ((v2 << 8) >> 24) + xd * (v2 >> 24)
+      var a3 = xa * ((v3 << 8) >> 24) + xd * (v3 >> 24)
+      var a4 = xa * ((v4 << 8) >> 24) + xd * (v4 >> 24)
+      var a5 = xa * ((v5 << 8) >> 24) + xd * (v5 >> 24)
+      // Words 1-7: weights 2-29
+      var j = (xb + 2) | 0
+      var qEnd = (q + 8) | 0
+      for (q = (q + 1) | 0; q < qEnd; q = (q + 1) | 0) {
+        v0 = I32[q]
+        v1 = I32[(q + w1) | 0]
+        v2 = I32[(q + w2) | 0]
+        v3 = I32[(q + w3) | 0]
+        v4 = I32[(q + w4) | 0]
+        v5 = I32[(q + w5) | 0]
+        xa = x[j]
+        var xb1 = x[(j + 1) | 0]
+        var xc = x[(j + 2) | 0]
+        xd = x[(j + 3) | 0]
+        j = (j + 4) | 0
         a0 =
           a0 +
-          x0 * ((v0_0 << 8) >> 24) +
-          x1 * (v0_0 >> 24) +
-          x2 * ((v0_1 << 24) >> 24) +
-          x3 * ((v0_1 << 16) >> 24) +
-          x4 * ((v0_1 << 8) >> 24) +
-          x5 * (v0_1 >> 24) +
-          x6 * ((v0_2 << 24) >> 24) +
-          x7 * ((v0_2 << 16) >> 24) +
-          x8 * ((v0_2 << 8) >> 24) +
-          x9 * (v0_2 >> 24) +
-          x10 * ((v0_3 << 24) >> 24) +
-          x11 * ((v0_3 << 16) >> 24) +
-          x12 * ((v0_3 << 8) >> 24) +
-          x13 * (v0_3 >> 24) +
-          x14 * ((v0_4 << 24) >> 24) +
-          x15 * ((v0_4 << 16) >> 24)
+          xa * ((v0 << 24) >> 24) +
+          xb1 * ((v0 << 16) >> 24) +
+          xc * ((v0 << 8) >> 24) +
+          xd * (v0 >> 24)
         a1 =
           a1 +
-          x0 * ((v1_0 << 8) >> 24) +
-          x1 * (v1_0 >> 24) +
-          x2 * ((v1_1 << 24) >> 24) +
-          x3 * ((v1_1 << 16) >> 24) +
-          x4 * ((v1_1 << 8) >> 24) +
-          x5 * (v1_1 >> 24) +
-          x6 * ((v1_2 << 24) >> 24) +
-          x7 * ((v1_2 << 16) >> 24) +
-          x8 * ((v1_2 << 8) >> 24) +
-          x9 * (v1_2 >> 24) +
-          x10 * ((v1_3 << 24) >> 24) +
-          x11 * ((v1_3 << 16) >> 24) +
-          x12 * ((v1_3 << 8) >> 24) +
-          x13 * (v1_3 >> 24) +
-          x14 * ((v1_4 << 24) >> 24) +
-          x15 * ((v1_4 << 16) >> 24)
+          xa * ((v1 << 24) >> 24) +
+          xb1 * ((v1 << 16) >> 24) +
+          xc * ((v1 << 8) >> 24) +
+          xd * (v1 >> 24)
         a2 =
           a2 +
-          x0 * ((v2_0 << 8) >> 24) +
-          x1 * (v2_0 >> 24) +
-          x2 * ((v2_1 << 24) >> 24) +
-          x3 * ((v2_1 << 16) >> 24) +
-          x4 * ((v2_1 << 8) >> 24) +
-          x5 * (v2_1 >> 24) +
-          x6 * ((v2_2 << 24) >> 24) +
-          x7 * ((v2_2 << 16) >> 24) +
-          x8 * ((v2_2 << 8) >> 24) +
-          x9 * (v2_2 >> 24) +
-          x10 * ((v2_3 << 24) >> 24) +
-          x11 * ((v2_3 << 16) >> 24) +
-          x12 * ((v2_3 << 8) >> 24) +
-          x13 * (v2_3 >> 24) +
-          x14 * ((v2_4 << 24) >> 24) +
-          x15 * ((v2_4 << 16) >> 24)
+          xa * ((v2 << 24) >> 24) +
+          xb1 * ((v2 << 16) >> 24) +
+          xc * ((v2 << 8) >> 24) +
+          xd * (v2 >> 24)
         a3 =
           a3 +
-          x0 * ((v3_0 << 8) >> 24) +
-          x1 * (v3_0 >> 24) +
-          x2 * ((v3_1 << 24) >> 24) +
-          x3 * ((v3_1 << 16) >> 24) +
-          x4 * ((v3_1 << 8) >> 24) +
-          x5 * (v3_1 >> 24) +
-          x6 * ((v3_2 << 24) >> 24) +
-          x7 * ((v3_2 << 16) >> 24) +
-          x8 * ((v3_2 << 8) >> 24) +
-          x9 * (v3_2 >> 24) +
-          x10 * ((v3_3 << 24) >> 24) +
-          x11 * ((v3_3 << 16) >> 24) +
-          x12 * ((v3_3 << 8) >> 24) +
-          x13 * (v3_3 >> 24) +
-          x14 * ((v3_4 << 24) >> 24) +
-          x15 * ((v3_4 << 16) >> 24)
+          xa * ((v3 << 24) >> 24) +
+          xb1 * ((v3 << 16) >> 24) +
+          xc * ((v3 << 8) >> 24) +
+          xd * (v3 >> 24)
+        a4 =
+          a4 +
+          xa * ((v4 << 24) >> 24) +
+          xb1 * ((v4 << 16) >> 24) +
+          xc * ((v4 << 8) >> 24) +
+          xd * (v4 >> 24)
+        a5 =
+          a5 +
+          xa * ((v5 << 24) >> 24) +
+          xb1 * ((v5 << 16) >> 24) +
+          xc * ((v5 << 8) >> 24) +
+          xd * (v5 >> 24)
       }
-      s0 = s0 + d0_0 * a0
-      s1 = s1 + d0_1 * a1
-      s2 = s2 + d0_2 * a2
-      s3 = s3 + d0_3 * a3
-      // Odd block of the pair (weights 32-63): scale in the high half of word 8
-      var d1_0 = fp16Table[I32[(p0 + 8) | 0] >>> 16]
-      var d1_1 = fp16Table[I32[(p1 + 8) | 0] >>> 16]
-      var d1_2 = fp16Table[I32[(p2 + 8) | 0] >>> 16]
-      var d1_3 = fp16Table[I32[(p3 + 8) | 0] >>> 16]
-      xi = xb + 32
-      w0 = p0 + 9
-      w1 = p1 + 9
-      w2 = p2 + 9
-      w3 = p3 + 9
-      var x0 = x[xi]
-      var x1 = x[(xi + 1) | 0]
-      var x2 = x[(xi + 2) | 0]
-      var x3 = x[(xi + 3) | 0]
-      var x4 = x[(xi + 4) | 0]
-      var x5 = x[(xi + 5) | 0]
-      var x6 = x[(xi + 6) | 0]
-      var x7 = x[(xi + 7) | 0]
-      var x8 = x[(xi + 8) | 0]
-      var x9 = x[(xi + 9) | 0]
-      var x10 = x[(xi + 10) | 0]
-      var x11 = x[(xi + 11) | 0]
-      var x12 = x[(xi + 12) | 0]
-      var x13 = x[(xi + 13) | 0]
-      var x14 = x[(xi + 14) | 0]
-      var x15 = x[(xi + 15) | 0]
-      var v0_0 = I32[w0]
-      var v0_1 = I32[(w0 + 1) | 0]
-      var v0_2 = I32[(w0 + 2) | 0]
-      var v0_3 = I32[(w0 + 3) | 0]
-      var v1_0 = I32[w1]
-      var v1_1 = I32[(w1 + 1) | 0]
-      var v1_2 = I32[(w1 + 2) | 0]
-      var v1_3 = I32[(w1 + 3) | 0]
-      var v2_0 = I32[w2]
-      var v2_1 = I32[(w2 + 1) | 0]
-      var v2_2 = I32[(w2 + 2) | 0]
-      var v2_3 = I32[(w2 + 3) | 0]
-      var v3_0 = I32[w3]
-      var v3_1 = I32[(w3 + 1) | 0]
-      var v3_2 = I32[(w3 + 2) | 0]
-      var v3_3 = I32[(w3 + 3) | 0]
-      a0 =
-        x0 * ((v0_0 << 24) >> 24) +
-        x1 * ((v0_0 << 16) >> 24) +
-        x2 * ((v0_0 << 8) >> 24) +
-        x3 * (v0_0 >> 24) +
-        x4 * ((v0_1 << 24) >> 24) +
-        x5 * ((v0_1 << 16) >> 24) +
-        x6 * ((v0_1 << 8) >> 24) +
-        x7 * (v0_1 >> 24) +
-        x8 * ((v0_2 << 24) >> 24) +
-        x9 * ((v0_2 << 16) >> 24) +
-        x10 * ((v0_2 << 8) >> 24) +
-        x11 * (v0_2 >> 24) +
-        x12 * ((v0_3 << 24) >> 24) +
-        x13 * ((v0_3 << 16) >> 24) +
-        x14 * ((v0_3 << 8) >> 24) +
-        x15 * (v0_3 >> 24)
-      a1 =
-        x0 * ((v1_0 << 24) >> 24) +
-        x1 * ((v1_0 << 16) >> 24) +
-        x2 * ((v1_0 << 8) >> 24) +
-        x3 * (v1_0 >> 24) +
-        x4 * ((v1_1 << 24) >> 24) +
-        x5 * ((v1_1 << 16) >> 24) +
-        x6 * ((v1_1 << 8) >> 24) +
-        x7 * (v1_1 >> 24) +
-        x8 * ((v1_2 << 24) >> 24) +
-        x9 * ((v1_2 << 16) >> 24) +
-        x10 * ((v1_2 << 8) >> 24) +
-        x11 * (v1_2 >> 24) +
-        x12 * ((v1_3 << 24) >> 24) +
-        x13 * ((v1_3 << 16) >> 24) +
-        x14 * ((v1_3 << 8) >> 24) +
-        x15 * (v1_3 >> 24)
-      a2 =
-        x0 * ((v2_0 << 24) >> 24) +
-        x1 * ((v2_0 << 16) >> 24) +
-        x2 * ((v2_0 << 8) >> 24) +
-        x3 * (v2_0 >> 24) +
-        x4 * ((v2_1 << 24) >> 24) +
-        x5 * ((v2_1 << 16) >> 24) +
-        x6 * ((v2_1 << 8) >> 24) +
-        x7 * (v2_1 >> 24) +
-        x8 * ((v2_2 << 24) >> 24) +
-        x9 * ((v2_2 << 16) >> 24) +
-        x10 * ((v2_2 << 8) >> 24) +
-        x11 * (v2_2 >> 24) +
-        x12 * ((v2_3 << 24) >> 24) +
-        x13 * ((v2_3 << 16) >> 24) +
-        x14 * ((v2_3 << 8) >> 24) +
-        x15 * (v2_3 >> 24)
-      a3 =
-        x0 * ((v3_0 << 24) >> 24) +
-        x1 * ((v3_0 << 16) >> 24) +
-        x2 * ((v3_0 << 8) >> 24) +
-        x3 * (v3_0 >> 24) +
-        x4 * ((v3_1 << 24) >> 24) +
-        x5 * ((v3_1 << 16) >> 24) +
-        x6 * ((v3_1 << 8) >> 24) +
-        x7 * (v3_1 >> 24) +
-        x8 * ((v3_2 << 24) >> 24) +
-        x9 * ((v3_2 << 16) >> 24) +
-        x10 * ((v3_2 << 8) >> 24) +
-        x11 * (v3_2 >> 24) +
-        x12 * ((v3_3 << 24) >> 24) +
-        x13 * ((v3_3 << 16) >> 24) +
-        x14 * ((v3_3 << 8) >> 24) +
-        x15 * (v3_3 >> 24)
-      for (var g = 1; g < 2; g = g + 1) {
-        xi = xi + 16
-        w0 = w0 + 4
-        w1 = w1 + 4
-        w2 = w2 + 4
-        w3 = w3 + 4
-        var x0 = x[xi]
-        var x1 = x[(xi + 1) | 0]
-        var x2 = x[(xi + 2) | 0]
-        var x3 = x[(xi + 3) | 0]
-        var x4 = x[(xi + 4) | 0]
-        var x5 = x[(xi + 5) | 0]
-        var x6 = x[(xi + 6) | 0]
-        var x7 = x[(xi + 7) | 0]
-        var x8 = x[(xi + 8) | 0]
-        var x9 = x[(xi + 9) | 0]
-        var x10 = x[(xi + 10) | 0]
-        var x11 = x[(xi + 11) | 0]
-        var x12 = x[(xi + 12) | 0]
-        var x13 = x[(xi + 13) | 0]
-        var x14 = x[(xi + 14) | 0]
-        var x15 = x[(xi + 15) | 0]
-        var v0_0 = I32[w0]
-        var v0_1 = I32[(w0 + 1) | 0]
-        var v0_2 = I32[(w0 + 2) | 0]
-        var v0_3 = I32[(w0 + 3) | 0]
-        var v1_0 = I32[w1]
-        var v1_1 = I32[(w1 + 1) | 0]
-        var v1_2 = I32[(w1 + 2) | 0]
-        var v1_3 = I32[(w1 + 3) | 0]
-        var v2_0 = I32[w2]
-        var v2_1 = I32[(w2 + 1) | 0]
-        var v2_2 = I32[(w2 + 2) | 0]
-        var v2_3 = I32[(w2 + 3) | 0]
-        var v3_0 = I32[w3]
-        var v3_1 = I32[(w3 + 1) | 0]
-        var v3_2 = I32[(w3 + 2) | 0]
-        var v3_3 = I32[(w3 + 3) | 0]
+      // Word 8 (q): weights 30-31 (low half); the odd scale is in its high half
+      v0 = I32[q]
+      v1 = I32[(q + w1) | 0]
+      v2 = I32[(q + w2) | 0]
+      v3 = I32[(q + w3) | 0]
+      v4 = I32[(q + w4) | 0]
+      v5 = I32[(q + w5) | 0]
+      var o0 = v0 >>> 16
+      var o1 = v1 >>> 16
+      var o2 = v2 >>> 16
+      var o3 = v3 >>> 16
+      var o4 = v4 >>> 16
+      var o5 = v5 >>> 16
+      xa = x[(xb + 30) | 0]
+      xd = x[(xb + 31) | 0]
+      a0 = a0 + xa * ((v0 << 24) >> 24) + xd * ((v0 << 16) >> 24)
+      a1 = a1 + xa * ((v1 << 24) >> 24) + xd * ((v1 << 16) >> 24)
+      a2 = a2 + xa * ((v2 << 24) >> 24) + xd * ((v2 << 16) >> 24)
+      a3 = a3 + xa * ((v3 << 24) >> 24) + xd * ((v3 << 16) >> 24)
+      a4 = a4 + xa * ((v4 << 24) >> 24) + xd * ((v4 << 16) >> 24)
+      a5 = a5 + xa * ((v5 << 24) >> 24) + xd * ((v5 << 16) >> 24)
+      s0 = s0 + fp16Table[e0] * a0
+      s1 = s1 + fp16Table[e1] * a1
+      s2 = s2 + fp16Table[e2] * a2
+      s3 = s3 + fp16Table[e3] * a3
+      s4 = s4 + fp16Table[e4] * a4
+      s5 = s5 + fp16Table[e5] * a5
+      // Odd block: words 9-16, weights 32-63 (0.0 + p is p)
+      a0 = 0.0
+      a1 = 0.0
+      a2 = 0.0
+      a3 = 0.0
+      a4 = 0.0
+      a5 = 0.0
+      j = (xb + 32) | 0
+      qEnd = (q + 9) | 0
+      for (q = (q + 1) | 0; q < qEnd; q = (q + 1) | 0) {
+        v0 = I32[q]
+        v1 = I32[(q + w1) | 0]
+        v2 = I32[(q + w2) | 0]
+        v3 = I32[(q + w3) | 0]
+        v4 = I32[(q + w4) | 0]
+        v5 = I32[(q + w5) | 0]
+        xa = x[j]
+        var xb1 = x[(j + 1) | 0]
+        var xc = x[(j + 2) | 0]
+        xd = x[(j + 3) | 0]
+        j = (j + 4) | 0
         a0 =
           a0 +
-          x0 * ((v0_0 << 24) >> 24) +
-          x1 * ((v0_0 << 16) >> 24) +
-          x2 * ((v0_0 << 8) >> 24) +
-          x3 * (v0_0 >> 24) +
-          x4 * ((v0_1 << 24) >> 24) +
-          x5 * ((v0_1 << 16) >> 24) +
-          x6 * ((v0_1 << 8) >> 24) +
-          x7 * (v0_1 >> 24) +
-          x8 * ((v0_2 << 24) >> 24) +
-          x9 * ((v0_2 << 16) >> 24) +
-          x10 * ((v0_2 << 8) >> 24) +
-          x11 * (v0_2 >> 24) +
-          x12 * ((v0_3 << 24) >> 24) +
-          x13 * ((v0_3 << 16) >> 24) +
-          x14 * ((v0_3 << 8) >> 24) +
-          x15 * (v0_3 >> 24)
+          xa * ((v0 << 24) >> 24) +
+          xb1 * ((v0 << 16) >> 24) +
+          xc * ((v0 << 8) >> 24) +
+          xd * (v0 >> 24)
         a1 =
           a1 +
-          x0 * ((v1_0 << 24) >> 24) +
-          x1 * ((v1_0 << 16) >> 24) +
-          x2 * ((v1_0 << 8) >> 24) +
-          x3 * (v1_0 >> 24) +
-          x4 * ((v1_1 << 24) >> 24) +
-          x5 * ((v1_1 << 16) >> 24) +
-          x6 * ((v1_1 << 8) >> 24) +
-          x7 * (v1_1 >> 24) +
-          x8 * ((v1_2 << 24) >> 24) +
-          x9 * ((v1_2 << 16) >> 24) +
-          x10 * ((v1_2 << 8) >> 24) +
-          x11 * (v1_2 >> 24) +
-          x12 * ((v1_3 << 24) >> 24) +
-          x13 * ((v1_3 << 16) >> 24) +
-          x14 * ((v1_3 << 8) >> 24) +
-          x15 * (v1_3 >> 24)
+          xa * ((v1 << 24) >> 24) +
+          xb1 * ((v1 << 16) >> 24) +
+          xc * ((v1 << 8) >> 24) +
+          xd * (v1 >> 24)
         a2 =
           a2 +
-          x0 * ((v2_0 << 24) >> 24) +
-          x1 * ((v2_0 << 16) >> 24) +
-          x2 * ((v2_0 << 8) >> 24) +
-          x3 * (v2_0 >> 24) +
-          x4 * ((v2_1 << 24) >> 24) +
-          x5 * ((v2_1 << 16) >> 24) +
-          x6 * ((v2_1 << 8) >> 24) +
-          x7 * (v2_1 >> 24) +
-          x8 * ((v2_2 << 24) >> 24) +
-          x9 * ((v2_2 << 16) >> 24) +
-          x10 * ((v2_2 << 8) >> 24) +
-          x11 * (v2_2 >> 24) +
-          x12 * ((v2_3 << 24) >> 24) +
-          x13 * ((v2_3 << 16) >> 24) +
-          x14 * ((v2_3 << 8) >> 24) +
-          x15 * (v2_3 >> 24)
+          xa * ((v2 << 24) >> 24) +
+          xb1 * ((v2 << 16) >> 24) +
+          xc * ((v2 << 8) >> 24) +
+          xd * (v2 >> 24)
         a3 =
           a3 +
-          x0 * ((v3_0 << 24) >> 24) +
-          x1 * ((v3_0 << 16) >> 24) +
-          x2 * ((v3_0 << 8) >> 24) +
-          x3 * (v3_0 >> 24) +
-          x4 * ((v3_1 << 24) >> 24) +
-          x5 * ((v3_1 << 16) >> 24) +
-          x6 * ((v3_1 << 8) >> 24) +
-          x7 * (v3_1 >> 24) +
-          x8 * ((v3_2 << 24) >> 24) +
-          x9 * ((v3_2 << 16) >> 24) +
-          x10 * ((v3_2 << 8) >> 24) +
-          x11 * (v3_2 >> 24) +
-          x12 * ((v3_3 << 24) >> 24) +
-          x13 * ((v3_3 << 16) >> 24) +
-          x14 * ((v3_3 << 8) >> 24) +
-          x15 * (v3_3 >> 24)
+          xa * ((v3 << 24) >> 24) +
+          xb1 * ((v3 << 16) >> 24) +
+          xc * ((v3 << 8) >> 24) +
+          xd * (v3 >> 24)
+        a4 =
+          a4 +
+          xa * ((v4 << 24) >> 24) +
+          xb1 * ((v4 << 16) >> 24) +
+          xc * ((v4 << 8) >> 24) +
+          xd * (v4 >> 24)
+        a5 =
+          a5 +
+          xa * ((v5 << 24) >> 24) +
+          xb1 * ((v5 << 16) >> 24) +
+          xc * ((v5 << 8) >> 24) +
+          xd * (v5 >> 24)
       }
-      s0 = s0 + d1_0 * a0
-      s1 = s1 + d1_1 * a1
-      s2 = s2 + d1_2 * a2
-      s3 = s3 + d1_3 * a3
-      p0 = p0 + 17
-      p1 = p1 + 17
-      p2 = p2 + 17
-      p3 = p3 + 17
-      xb = xb + 64
+      s0 = s0 + fp16Table[o0] * a0
+      s1 = s1 + fp16Table[o1] * a1
+      s2 = s2 + fp16Table[o2] * a2
+      s3 = s3 + fp16Table[o3] * a3
+      s4 = s4 + fp16Table[o4] * a4
+      s5 = s5 + fp16Table[o5] * a5
     }
     out[i] = s0
     out[i + 1] = s1
     out[i + 2] = s2
     out[i + 3] = s3
-  }
-  for (var i = rows4; i < rows; i = i + 1) {
-    out[i] = dotRowQ8_0I32(x, I32, base + i * rowWords, nbp)
+    out[i + 4] = s4
+    out[i + 5] = s5
   }
 }
 
-// One row of a Q8_0 matrix against x, same layout and summation order as
-// matmulQ8_0Local (row remainder)
-function dotRowQ8_0I32(x, I32, p, nbp) {
-  var s = 0.0
-  var xb = 0
-  for (var b = 0; b < nbp; b = b + 1) {
-    var v0 = I32[p]
-    var d0 = fp16Table[v0 & 0xffff]
-    var a = x[xb] * ((v0 << 8) >> 24) + x[xb + 1] * (v0 >> 24)
-    for (var k = 1; k < 8; k = k + 1) {
-      var v = I32[p + k]
-      var j = xb + 4 * k - 2
-      a =
-        a +
-        x[j] * ((v << 24) >> 24) +
-        x[j + 1] * ((v << 16) >> 24) +
-        x[j + 2] * ((v << 8) >> 24) +
-        x[j + 3] * (v >> 24)
-    }
-    var v8 = I32[p + 8]
-    a = a + x[xb + 30] * ((v8 << 24) >> 24) + x[xb + 31] * ((v8 << 16) >> 24)
-    s = s + d0 * a
-    var d1 = fp16Table[v8 >>> 16]
-    var v9 = I32[p + 9]
-    a =
-      x[xb + 32] * ((v9 << 24) >> 24) +
-      x[xb + 33] * ((v9 << 16) >> 24) +
-      x[xb + 34] * ((v9 << 8) >> 24) +
-      x[xb + 35] * (v9 >> 24)
-    for (var k = 10; k < 17; k = k + 1) {
-      var v = I32[p + k]
-      var j = xb + 4 * k - 4
-      a =
-        a +
-        x[j] * ((v << 24) >> 24) +
-        x[j + 1] * ((v << 16) >> 24) +
-        x[j + 2] * ((v << 8) >> 24) +
-        x[j + 3] * (v >> 24)
-    }
-    s = s + d1 * a
-    p = p + 17
-    xb = xb + 64
-  }
-  return s
-}
 
-// Dequantize one Q8_0 row (even number of blocks) into dst[dstOff...] through
-// the Int32 block-pair layout, bit-identical to the byte-wise dequantizer
-function deqRowQ8_0I32(I32, p, dst, dstOff, nbp) {
+// Dequantize one Q8_0 row (even number of blocks) through the Int32 view
+function deqRowQ8_0I32(I32, p, dst, dstOff, cols) {
+  var nbp = cols >> 6
   var o = dstOff
   for (var b = 0; b < nbp; b = b + 1) {
     var v0 = I32[p]
@@ -2800,172 +2409,24 @@ function deqRowQ8_0I32(I32, p, dst, dstOff, nbp) {
   }
 }
 
-// Q8_0 batch matmul (prefill): dequantize 4 rows into the row views of
-// matmulDeqBuf, then a 4-row x 3-token tile, one column per step (12
-// accumulators, the largest shape V8 keeps in registers); same column order as
-// the byte kernel.
-function matmulQ8_0LocalBatch(outs, xs, qw, batchSize) {
-  var I32 = qw.localI32
-  var base = qw.base
-  var rows = qw.rows
-  var cols = qw.cols
-  var rowWords = qw.rowSize >> 2
-  var nbp = cols >> 6
-  var rows4 = rows & ~3
-  var batch3 = batchSize - (batchSize % 3)
-  var buf0 = matmulDeqRows[0]
-  var buf1 = matmulDeqRows[1]
-  var buf2 = matmulDeqRows[2]
-  var buf3 = matmulDeqRows[3]
-  for (var i = 0; i < rows4; i = i + 4) {
-    var p = base + i * rowWords
-    deqRowQ8_0I32(I32, p, buf0, 0, nbp)
-    deqRowQ8_0I32(I32, p + rowWords, buf1, 0, nbp)
-    deqRowQ8_0I32(I32, p + rowWords + rowWords, buf2, 0, nbp)
-    deqRowQ8_0I32(I32, p + rowWords + rowWords + rowWords, buf3, 0, nbp)
-    for (var bt = 0; bt < batch3; bt = bt + 3) {
-      var xA = xs[bt]
-      var xB = xs[bt + 1]
-      var xC = xs[bt + 2]
-      var s0 = 0.0
-      var s1 = 0.0
-      var s2 = 0.0
-      var s3 = 0.0
-      var t0 = 0.0
-      var t1 = 0.0
-      var t2 = 0.0
-      var t3 = 0.0
-      var u0 = 0.0
-      var u1 = 0.0
-      var u2 = 0.0
-      var u3 = 0.0
-      for (var j = 0; j < cols; j = j + 1) {
-        var a = xA[j]
-        var e = xB[j]
-        var q = xC[j]
-        var w0 = buf0[j]
-        var w1 = buf1[j]
-        var w2 = buf2[j]
-        var w3 = buf3[j]
-        s0 = s0 + a * w0
-        t0 = t0 + e * w0
-        u0 = u0 + q * w0
-        s1 = s1 + a * w1
-        t1 = t1 + e * w1
-        u1 = u1 + q * w1
-        s2 = s2 + a * w2
-        t2 = t2 + e * w2
-        u2 = u2 + q * w2
-        s3 = s3 + a * w3
-        t3 = t3 + e * w3
-        u3 = u3 + q * w3
-      }
-      var oA = outs[bt]
-      var oB = outs[bt + 1]
-      var oC = outs[bt + 2]
-      oA[i] = s0
-      oA[i + 1] = s1
-      oA[i + 2] = s2
-      oA[i + 3] = s3
-      oB[i] = t0
-      oB[i + 1] = t1
-      oB[i + 2] = t2
-      oB[i + 3] = t3
-      oC[i] = u0
-      oC[i + 1] = u1
-      oC[i + 2] = u2
-      oC[i + 3] = u3
-    }
-    // Remaining 2 tokens of the batch: 4-row x 2-token tile
-    if (batchSize - batch3 === 2) {
-      var xA = xs[batch3]
-      var xB = xs[batch3 + 1]
-      var s0 = 0.0
-      var s1 = 0.0
-      var s2 = 0.0
-      var s3 = 0.0
-      var t0 = 0.0
-      var t1 = 0.0
-      var t2 = 0.0
-      var t3 = 0.0
-      for (var j = 0; j < cols; j = j + 1) {
-        var a = xA[j]
-        var e = xB[j]
-        var w0 = buf0[j]
-        var w1 = buf1[j]
-        var w2 = buf2[j]
-        var w3 = buf3[j]
-        s0 = s0 + a * w0
-        t0 = t0 + e * w0
-        s1 = s1 + a * w1
-        t1 = t1 + e * w1
-        s2 = s2 + a * w2
-        t2 = t2 + e * w2
-        s3 = s3 + a * w3
-        t3 = t3 + e * w3
-      }
-      var oA = outs[batch3]
-      var oB = outs[batch3 + 1]
-      oA[i] = s0
-      oA[i + 1] = s1
-      oA[i + 2] = s2
-      oA[i + 3] = s3
-      oB[i] = t0
-      oB[i + 1] = t1
-      oB[i + 2] = t2
-      oB[i + 3] = t3
-    } else if (batchSize - batch3 === 1) {
-      // Remaining single token
-      var xArr = xs[batch3]
-      var s0 = 0.0
-      var s1 = 0.0
-      var s2 = 0.0
-      var s3 = 0.0
-      for (var j = 0; j < cols; j = j + 1) {
-        var a = xArr[j]
-        s0 = s0 + a * buf0[j]
-        s1 = s1 + a * buf1[j]
-        s2 = s2 + a * buf2[j]
-        s3 = s3 + a * buf3[j]
-      }
-      var oArr = outs[batch3]
-      oArr[i] = s0
-      oArr[i + 1] = s1
-      oArr[i + 2] = s2
-      oArr[i + 3] = s3
-    }
-  }
-  // Remaining 1-3 rows
-  for (var i = rows4; i < rows; i = i + 1) {
-    deqRowQ8_0I32(I32, base + i * rowWords, buf0, 0, nbp)
-    for (var bt = 0; bt < batchSize; bt = bt + 1) {
-      var xArr = xs[bt]
-      var s = 0.0
-      for (var j = 0; j < cols; j = j + 1) {
-        s = s + xArr[j] * buf0[j]
-      }
-      outs[bt][i] = s
-    }
-  }
-}
-
 // ----------------------------------------------------------------------------
-// Fused single-token kernels: rows i .. i + 1 of a matrix against x, straight
-// from the matrix view. Each weight is computed as in its row dequantizer and
-// each row is summed left to right, so the results are bit-identical. Words are
-// shifted with >> (not >>>) so they stay int32 (JavaScriptCore keeps the loop
-// in integer registers).
+// Fused single-token kernels: rows i.. of a matrix against x from the matrix
+// view; weights as in the row dequantizers, rows summed left to right (bit-
+// identical); >> not >>> keeps the words int32 (JavaScriptCore)
 
-// F16 / BF16: two weights per Int32 load, converted through the 64K-entry
-// lookup table.
+// F16 / BF16: two weights per Int32 load through the 64K table, 4 rows per call
 function matmulF16Rows(out, x, qw, i) {
-  var I32 = qw.deqView
+  var I32 = qw.view
   var half = qw.cols >> 1
   var tab = qw.type === GGML_TYPE.F16 ? fp16Table : bf16Table
   var o0 = (qw.base + i * half) | 0
   var o1 = (o0 + half) | 0
+  var o2 = (o1 + half) | 0
+  var o3 = (o2 + half) | 0
   var s0 = 0.0
   var s1 = 0.0
+  var s2 = 0.0
+  var s3 = 0.0
   for (var k = 0; k < half; k = k + 1) {
     var a = x[k << 1]
     var c = x[((k << 1) + 1) | 0]
@@ -2975,14 +2436,22 @@ function matmulF16Rows(out, x, qw, i) {
     v = I32[(o1 + k) | 0]
     s1 = s1 + a * tab[v & 0xffff]
     s1 = s1 + c * tab[v >>> 16]
+    v = I32[(o2 + k) | 0]
+    s2 = s2 + a * tab[v & 0xffff]
+    s2 = s2 + c * tab[v >>> 16]
+    v = I32[(o3 + k) | 0]
+    s3 = s3 + a * tab[v & 0xffff]
+    s3 = s3 + c * tab[v >>> 16]
   }
   out[i] = s0
   out[i + 1] = s1
+  out[i + 2] = s2
+  out[i + 3] = s3
 }
 
 // F32: through the Float32 view.
 function matmulF32Rows(out, x, qw, i) {
-  var F32 = qw.deqView
+  var F32 = qw.view
   var cols = qw.cols
   var o0 = (qw.base + i * cols) | 0
   var o1 = (o0 + cols) | 0
@@ -2997,139 +2466,211 @@ function matmulF32Rows(out, x, qw, i) {
   out[i + 1] = s1
 }
 
-// Q4_K: 8 groups of 32 columns per block. Group c reads the 32 quant bytes
-// of pair c >> 1 (low nibbles when c is even, high nibbles when odd) with
-// scale/min number c.
+// Q4_K: 8 groups of 32 columns per block; group c: nibbles (low: c even) of
+// pair c >> 1 with scale/min c. Rows i .. i + 3 per call (row r at rw * r words)
 function matmulQ4_KRows(out, x, qw, i) {
-  var I32 = qw.deqView
+  var I32 = qw.view
   var nb = qw.cols >> 8
-  var rowWords = qw.rowSize >> 2
-  var p0 = (qw.base + i * rowWords) | 0
-  var p1 = (p0 + rowWords) | 0
+  var rw = qw.rowSize >> 2
+  var rw2 = (rw * 2) | 0
+  var rw3 = (rw * 3) | 0
+  var p = (qw.base + i * rw) | 0
   var s0 = 0.0
   var s1 = 0.0
+  var s2 = 0.0
+  var s3 = 0.0
   var xb = 0
   for (var b = 0; b < nb; b = b + 1) {
-    var hA = I32[p0]
-    var dA = fp16Table[hA & 0xffff]
-    var nA = fp16Table[hA >>> 16]
-    var uA = I32[(p0 + 1) | 0]
-    var vA = I32[(p0 + 2) | 0]
-    var wA = I32[(p0 + 3) | 0]
-    var hB = I32[p1]
-    var dB = fp16Table[hB & 0xffff]
-    var nB = fp16Table[hB >>> 16]
-    var uB = I32[(p1 + 1) | 0]
-    var vB = I32[(p1 + 2) | 0]
-    var wB = I32[(p1 + 3) | 0]
+    // d, dmin and the three scale words of each row's block
+    var h
+    h = I32[p]
+    var d0 = fp16Table[h & 0xffff]
+    var n0 = fp16Table[h >>> 16]
+    var u0 = I32[(p + 1) | 0]
+    var v0 = I32[(p + 2) | 0]
+    var w0 = I32[(p + 3) | 0]
+    h = I32[(p + rw) | 0]
+    var d1 = fp16Table[h & 0xffff]
+    var n1 = fp16Table[h >>> 16]
+    var u1 = I32[(p + rw + 1) | 0]
+    var v1 = I32[(p + rw + 2) | 0]
+    var w1 = I32[(p + rw + 3) | 0]
+    h = I32[(p + rw2) | 0]
+    var d2 = fp16Table[h & 0xffff]
+    var n2 = fp16Table[h >>> 16]
+    var u2 = I32[(p + rw2 + 1) | 0]
+    var v2 = I32[(p + rw2 + 2) | 0]
+    var w2 = I32[(p + rw2 + 3) | 0]
+    h = I32[(p + rw3) | 0]
+    var d3 = fp16Table[h & 0xffff]
+    var n3 = fp16Table[h >>> 16]
+    var u3 = I32[(p + rw3 + 1) | 0]
+    var v3 = I32[(p + rw3 + 2) | 0]
+    var w3 = I32[(p + rw3 + 3) | 0]
     for (var c = 0; c < 8; c = c + 1) {
       var sm
-      sm = kScaleMin(c, uA, vA, wA)
-      var kA = dA * (sm & 0xff)
-      var mA = nA * (sm >>> 8)
-      sm = kScaleMin(c, uB, vB, wB)
-      var kB = dB * (sm & 0xff)
-      var mB = nB * (sm >>> 8)
+      sm = kScaleMin(c, u0, v0, w0)
+      var k0 = d0 * (sm & 0xff)
+      var m0 = n0 * (sm >>> 8)
+      sm = kScaleMin(c, u1, v1, w1)
+      var k1 = d1 * (sm & 0xff)
+      var m1 = n1 * (sm >>> 8)
+      sm = kScaleMin(c, u2, v2, w2)
+      var k2 = d2 * (sm & 0xff)
+      var m2 = n2 * (sm >>> 8)
+      sm = kScaleMin(c, u3, v3, w3)
+      var k3 = d3 * (sm & 0xff)
+      var m3 = n3 * (sm >>> 8)
       var sh = (c & 1) << 2
-      var qo = (4 + ((c >> 1) << 3)) | 0
+      var pq = (p + 4 + ((c >> 1) << 3)) | 0
       for (var k = 0; k < 8; k = k + 1) {
         var j = (xb + (k << 2)) | 0
         var x0 = x[j]
         var x1 = x[(j + 1) | 0]
         var x2 = x[(j + 2) | 0]
         var x3 = x[(j + 3) | 0]
+        var pk = (pq + k) | 0
         var q
-        q = I32[(p0 + qo + k) | 0] >> sh
-        s0 = s0 + x0 * (kA * (q & 0xf) - mA)
-        s0 = s0 + x1 * (kA * ((q >>> 8) & 0xf) - mA)
-        s0 = s0 + x2 * (kA * ((q >>> 16) & 0xf) - mA)
-        s0 = s0 + x3 * (kA * ((q >>> 24) & 0xf) - mA)
-        q = I32[(p1 + qo + k) | 0] >> sh
-        s1 = s1 + x0 * (kB * (q & 0xf) - mB)
-        s1 = s1 + x1 * (kB * ((q >>> 8) & 0xf) - mB)
-        s1 = s1 + x2 * (kB * ((q >>> 16) & 0xf) - mB)
-        s1 = s1 + x3 * (kB * ((q >>> 24) & 0xf) - mB)
+        q = (I32[pk] >> sh) & 0x0f0f0f0f
+        s0 = s0 + x0 * (k0 * (q & 0xff) - m0)
+        s0 = s0 + x1 * (k0 * ((q >>> 8) & 0xff) - m0)
+        s0 = s0 + x2 * (k0 * ((q >>> 16) & 0xff) - m0)
+        s0 = s0 + x3 * (k0 * (q >>> 24) - m0)
+        q = (I32[(pk + rw) | 0] >> sh) & 0x0f0f0f0f
+        s1 = s1 + x0 * (k1 * (q & 0xff) - m1)
+        s1 = s1 + x1 * (k1 * ((q >>> 8) & 0xff) - m1)
+        s1 = s1 + x2 * (k1 * ((q >>> 16) & 0xff) - m1)
+        s1 = s1 + x3 * (k1 * (q >>> 24) - m1)
+        q = (I32[(pk + rw2) | 0] >> sh) & 0x0f0f0f0f
+        s2 = s2 + x0 * (k2 * (q & 0xff) - m2)
+        s2 = s2 + x1 * (k2 * ((q >>> 8) & 0xff) - m2)
+        s2 = s2 + x2 * (k2 * ((q >>> 16) & 0xff) - m2)
+        s2 = s2 + x3 * (k2 * (q >>> 24) - m2)
+        q = (I32[(pk + rw3) | 0] >> sh) & 0x0f0f0f0f
+        s3 = s3 + x0 * (k3 * (q & 0xff) - m3)
+        s3 = s3 + x1 * (k3 * ((q >>> 8) & 0xff) - m3)
+        s3 = s3 + x2 * (k3 * ((q >>> 16) & 0xff) - m3)
+        s3 = s3 + x3 * (k3 * (q >>> 24) - m3)
       }
       xb = xb + 32
     }
-    p0 = p0 + 36
-    p1 = p1 + 36
+    p = (p + 36) | 0
   }
   out[i] = s0
   out[i + 1] = s1
+  out[i + 2] = s2
+  out[i + 3] = s3
 }
 
-// Q5_K: like Q4_K plus the fifth bit of every quant (bit c of the 32 high-bit
-// bytes), merged into the four quants of a word before they are extracted.
+// Q5_K: Q4_K plus the fifth bit (bit c of the 32 high-bit bytes) of every quant
 function matmulQ5_KRows(out, x, qw, i) {
-  var I32 = qw.deqView
+  var I32 = qw.view
   var nb = qw.cols >> 8
-  var rowWords = qw.rowSize >> 2
-  var p0 = (qw.base + i * rowWords) | 0
-  var p1 = (p0 + rowWords) | 0
+  var rw = qw.rowSize >> 2
+  var rw2 = (rw * 2) | 0
+  var rw3 = (rw * 3) | 0
+  var p = (qw.base + i * rw) | 0
   var s0 = 0.0
   var s1 = 0.0
+  var s2 = 0.0
+  var s3 = 0.0
   var xb = 0
   for (var b = 0; b < nb; b = b + 1) {
-    var hA = I32[p0]
-    var dA = fp16Table[hA & 0xffff]
-    var nA = fp16Table[hA >>> 16]
-    var uA = I32[(p0 + 1) | 0]
-    var vA = I32[(p0 + 2) | 0]
-    var wA = I32[(p0 + 3) | 0]
-    var hB = I32[p1]
-    var dB = fp16Table[hB & 0xffff]
-    var nB = fp16Table[hB >>> 16]
-    var uB = I32[(p1 + 1) | 0]
-    var vB = I32[(p1 + 2) | 0]
-    var wB = I32[(p1 + 3) | 0]
+    // d, dmin and the three scale words of each row's block
+    var h
+    h = I32[p]
+    var d0 = fp16Table[h & 0xffff]
+    var n0 = fp16Table[h >>> 16]
+    var u0 = I32[(p + 1) | 0]
+    var v0 = I32[(p + 2) | 0]
+    var w0 = I32[(p + 3) | 0]
+    h = I32[(p + rw) | 0]
+    var d1 = fp16Table[h & 0xffff]
+    var n1 = fp16Table[h >>> 16]
+    var u1 = I32[(p + rw + 1) | 0]
+    var v1 = I32[(p + rw + 2) | 0]
+    var w1 = I32[(p + rw + 3) | 0]
+    h = I32[(p + rw2) | 0]
+    var d2 = fp16Table[h & 0xffff]
+    var n2 = fp16Table[h >>> 16]
+    var u2 = I32[(p + rw2 + 1) | 0]
+    var v2 = I32[(p + rw2 + 2) | 0]
+    var w2 = I32[(p + rw2 + 3) | 0]
+    h = I32[(p + rw3) | 0]
+    var d3 = fp16Table[h & 0xffff]
+    var n3 = fp16Table[h >>> 16]
+    var u3 = I32[(p + rw3 + 1) | 0]
+    var v3 = I32[(p + rw3 + 2) | 0]
+    var w3 = I32[(p + rw3 + 3) | 0]
     for (var c = 0; c < 8; c = c + 1) {
       var sm
-      sm = kScaleMin(c, uA, vA, wA)
-      var kA = dA * (sm & 0xff)
-      var mA = nA * (sm >>> 8)
-      sm = kScaleMin(c, uB, vB, wB)
-      var kB = dB * (sm & 0xff)
-      var mB = nB * (sm >>> 8)
+      sm = kScaleMin(c, u0, v0, w0)
+      var k0 = d0 * (sm & 0xff)
+      var m0 = n0 * (sm >>> 8)
+      sm = kScaleMin(c, u1, v1, w1)
+      var k1 = d1 * (sm & 0xff)
+      var m1 = n1 * (sm >>> 8)
+      sm = kScaleMin(c, u2, v2, w2)
+      var k2 = d2 * (sm & 0xff)
+      var m2 = n2 * (sm >>> 8)
+      sm = kScaleMin(c, u3, v3, w3)
+      var k3 = d3 * (sm & 0xff)
+      var m3 = n3 * (sm >>> 8)
       var sh = (c & 1) << 2
-      var qo = (12 + ((c >> 1) << 3)) | 0
+      var pq = (p + 12 + ((c >> 1) << 3)) | 0
       for (var k = 0; k < 8; k = k + 1) {
         var j = (xb + (k << 2)) | 0
         var x0 = x[j]
         var x1 = x[(j + 1) | 0]
         var x2 = x[(j + 2) | 0]
         var x3 = x[(j + 3) | 0]
+        var pk = (pq + k) | 0
+        var hk = (p + 4 + k) | 0
         var q
         q =
-          ((I32[(p0 + qo + k) | 0] >> sh) & 0x0f0f0f0f) |
-          (((I32[(p0 + 4 + k) | 0] >> c) & 0x01010101) << 4)
-        s0 = s0 + x0 * (kA * (q & 0xff) - mA)
-        s0 = s0 + x1 * (kA * ((q >>> 8) & 0xff) - mA)
-        s0 = s0 + x2 * (kA * ((q >>> 16) & 0xff) - mA)
-        s0 = s0 + x3 * (kA * (q >>> 24) - mA)
+          ((I32[pk] >> sh) & 0x0f0f0f0f) |
+          (((I32[hk] >> c) & 0x01010101) << 4)
+        s0 = s0 + x0 * (k0 * (q & 0xff) - m0)
+        s0 = s0 + x1 * (k0 * ((q >>> 8) & 0xff) - m0)
+        s0 = s0 + x2 * (k0 * ((q >>> 16) & 0xff) - m0)
+        s0 = s0 + x3 * (k0 * (q >>> 24) - m0)
         q =
-          ((I32[(p1 + qo + k) | 0] >> sh) & 0x0f0f0f0f) |
-          (((I32[(p1 + 4 + k) | 0] >> c) & 0x01010101) << 4)
-        s1 = s1 + x0 * (kB * (q & 0xff) - mB)
-        s1 = s1 + x1 * (kB * ((q >>> 8) & 0xff) - mB)
-        s1 = s1 + x2 * (kB * ((q >>> 16) & 0xff) - mB)
-        s1 = s1 + x3 * (kB * (q >>> 24) - mB)
+          ((I32[(pk + rw) | 0] >> sh) & 0x0f0f0f0f) |
+          (((I32[(hk + rw) | 0] >> c) & 0x01010101) << 4)
+        s1 = s1 + x0 * (k1 * (q & 0xff) - m1)
+        s1 = s1 + x1 * (k1 * ((q >>> 8) & 0xff) - m1)
+        s1 = s1 + x2 * (k1 * ((q >>> 16) & 0xff) - m1)
+        s1 = s1 + x3 * (k1 * (q >>> 24) - m1)
+        q =
+          ((I32[(pk + rw2) | 0] >> sh) & 0x0f0f0f0f) |
+          (((I32[(hk + rw2) | 0] >> c) & 0x01010101) << 4)
+        s2 = s2 + x0 * (k2 * (q & 0xff) - m2)
+        s2 = s2 + x1 * (k2 * ((q >>> 8) & 0xff) - m2)
+        s2 = s2 + x2 * (k2 * ((q >>> 16) & 0xff) - m2)
+        s2 = s2 + x3 * (k2 * (q >>> 24) - m2)
+        q =
+          ((I32[(pk + rw3) | 0] >> sh) & 0x0f0f0f0f) |
+          (((I32[(hk + rw3) | 0] >> c) & 0x01010101) << 4)
+        s3 = s3 + x0 * (k3 * (q & 0xff) - m3)
+        s3 = s3 + x1 * (k3 * ((q >>> 8) & 0xff) - m3)
+        s3 = s3 + x2 * (k3 * ((q >>> 16) & 0xff) - m3)
+        s3 = s3 + x3 * (k3 * (q >>> 24) - m3)
       }
       xb = xb + 32
     }
-    p0 = p0 + 44
-    p1 = p1 + 44
+    p = (p + 44) | 0
   }
   out[i] = s0
   out[i + 1] = s1
+  out[i + 2] = s2
+  out[i + 3] = s3
 }
 
-// Q3_K / Q6_K: 16 groups of 16 columns per block (group t: half h = t >> 3,
-// position g = (t >> 1) & 3, scale number t), 4 quants per DataView load (the
-// blocks are only 2-byte aligned): low bits merged with high bits (Q6_K: ql
-// nibbles + 2 qh bits; Q3_K: 2 qs bits + 1 mask bit).
+// Q3_K / Q6_K: 16 groups of 16 columns per block (group t: half t >> 3, position
+// (t >> 1) & 3, scale t), 4 quants per DataView load (blocks are 2-byte
+// aligned), low bits merged with the high bits; rows i .. i + 3 per call
 function matmulK16Rows(out, x, qw, i) {
-  var U16 = qw.deqView
+  var U16 = qw.view
   var DV = rowsDataView
   var sc = q3kScales
   var q6 = qw.type === GGML_TYPE.Q6_K
@@ -3141,35 +2682,44 @@ function matmulK16Rows(out, x, qw, i) {
   var scBias = q6 ? 0 : 32
   var nb = qw.cols >> 8
   var rowWords = qw.rowSize >> 1
-  // r: 16-bit word index of each row's block inside the matrix (what the
-  // DataView covers); vb: matrix start in the Uint16 view
+  // r0: 16-bit word index of row i's block inside the matrix (what the
+  // DataView covers); vb: matrix start in the Uint16 view; rb: row stride in bytes
   var vb = qw.base
-  var r0 = i * rowWords
-  var r1 = r0 + rowWords
+  var r0 = (i * rowWords) | 0
+  var rb = rowWords << 1
+  var rb2 = (rb * 2) | 0
+  var rb3 = (rb * 3) | 0
   var s0 = 0.0
   var s1 = 0.0
+  var s2 = 0.0
+  var s3 = 0.0
   var xb = 0
-  for (var b = 0; b < nb; b = b + 1) {
-    var dA = fp16Table[U16[(vb + r0 + blockWords - 1) | 0]]
-    var dB = fp16Table[U16[(vb + r1 + blockWords - 1) | 0]]
-    if (q6) {
-      // 16 int8 scales in the 8 words before d
-      for (var t = 0; t < 8; t = t + 1) {
-        var w
-        w = U16[(vb + r0 + 96 + t) | 0]
-        sc[(0 << 4) + (t << 1)] = w
-        sc[(0 << 4) + (t << 1) + 1] = w >> 8
-        w = U16[(vb + r1 + 96 + t) | 0]
-        sc[(1 << 4) + (t << 1)] = w
-        sc[(1 << 4) + (t << 1) + 1] = w >> 8
+  for (var blk = 0; blk < nb; blk = blk + 1) {
+    var d0 = fp16Table[U16[(vb + r0 + blockWords - 1) | 0]]
+    var d1 = fp16Table[U16[(vb + r0 + 1 * rowWords + blockWords - 1) | 0]]
+    var d2 = fp16Table[U16[(vb + r0 + 2 * rowWords + blockWords - 1) | 0]]
+    var d3 = fp16Table[U16[(vb + r0 + 3 * rowWords + blockWords - 1) | 0]]
+    // Scales of the 4 rows into sc[16 * r ..] (one loop, so the compiled code
+    // holds one copy of the unpacking)
+    var sp = (vb + r0) | 0
+    for (var r = 0; r < 64; r = r + 16) {
+      if (q6) {
+        // 16 int8 scales in the 8 words before d
+        for (var t = 0; t < 8; t = t + 1) {
+          var w = U16[(sp + 96 + t) | 0]
+          sc[(r + (t << 1)) | 0] = w
+          sc[(r + (t << 1) + 1) | 0] = w >> 8
+        }
+      } else {
+        q3kUnpackScales(U16, sp, r)
       }
-    } else {
-      q3kUnpackScales(U16, (vb + r0) | 0, 0 << 4)
-      q3kUnpackScales(U16, (vb + r1) | 0, 1 << 4)
+      sp = (sp + rowWords) | 0
     }
     for (var t = 0; t < 16; t = t + 1) {
-      var eA = dA * (sc[(0 << 4) + t] - scBias)
-      var eB = dB * (sc[(1 << 4) + t] - scBias)
+      var e0 = d0 * (sc[(0 + t) | 0] - scBias)
+      var e1 = d1 * (sc[(16 + t) | 0] - scBias)
+      var e2 = d2 * (sc[(32 + t) | 0] - scBias)
+      var e3 = d3 * (sc[(48 + t) | 0] - scBias)
       var h = t >> 3
       var g = (t >> 1) & 3
       var ss = (t & 1) << 3
@@ -3184,53 +2734,70 @@ function matmulK16Rows(out, x, qw, i) {
         loShift = (g >> 1) << 2
         hiShift = g << 1
       }
-      for (var k = 0; k < 8; k = k + 2) {
-        var j = (xb + (k << 1)) | 0
+      // Byte offsets of row i's low and high words in the DataView
+      var lb = ((r0 + lo) << 1) | 0
+      var hb = ((r0 + ho) << 1) | 0
+      for (var k = 0; k < 16; k = k + 4) {
+        var j = (xb + k) | 0
         var x0 = x[j]
         var x1 = x[(j + 1) | 0]
         var x2 = x[(j + 2) | 0]
         var x3 = x[(j + 3) | 0]
+        var lk = (lb + k) | 0
+        var hk = (hb + k) | 0
         var q
         q =
-          ((DV.getInt32(((r0 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
-          (((DV.getInt32(((r0 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) <<
-            hiUp)
-        s0 = s0 + x0 * (eA * ((q & 0xff) - bias))
-        s0 = s0 + x1 * (eA * (((q >>> 8) & 0xff) - bias))
-        s0 = s0 + x2 * (eA * (((q >>> 16) & 0xff) - bias))
-        s0 = s0 + x3 * (eA * ((q >>> 24) - bias))
+          ((DV.getInt32((lk) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32((hk) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s0 = s0 + x0 * (e0 * ((q & 0xff) - bias))
+        s0 = s0 + x1 * (e0 * (((q >>> 8) & 0xff) - bias))
+        s0 = s0 + x2 * (e0 * (((q >>> 16) & 0xff) - bias))
+        s0 = s0 + x3 * (e0 * ((q >>> 24) - bias))
         q =
-          ((DV.getInt32(((r1 + lo + k) << 1) | 0, true) >> loShift) & loMask) |
-          (((DV.getInt32(((r1 + ho + k) << 1) | 0, true) >> hiShift) & hiMask) <<
-            hiUp)
-        s1 = s1 + x0 * (eB * ((q & 0xff) - bias))
-        s1 = s1 + x1 * (eB * (((q >>> 8) & 0xff) - bias))
-        s1 = s1 + x2 * (eB * (((q >>> 16) & 0xff) - bias))
-        s1 = s1 + x3 * (eB * ((q >>> 24) - bias))
+          ((DV.getInt32((lk + rb) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32((hk + rb) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s1 = s1 + x0 * (e1 * ((q & 0xff) - bias))
+        s1 = s1 + x1 * (e1 * (((q >>> 8) & 0xff) - bias))
+        s1 = s1 + x2 * (e1 * (((q >>> 16) & 0xff) - bias))
+        s1 = s1 + x3 * (e1 * ((q >>> 24) - bias))
+        q =
+          ((DV.getInt32((lk + rb2) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32((hk + rb2) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s2 = s2 + x0 * (e2 * ((q & 0xff) - bias))
+        s2 = s2 + x1 * (e2 * (((q >>> 8) & 0xff) - bias))
+        s2 = s2 + x2 * (e2 * (((q >>> 16) & 0xff) - bias))
+        s2 = s2 + x3 * (e2 * ((q >>> 24) - bias))
+        q =
+          ((DV.getInt32((lk + rb3) | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32((hk + rb3) | 0, true) >> hiShift) & hiMask) << hiUp)
+        s3 = s3 + x0 * (e3 * ((q & 0xff) - bias))
+        s3 = s3 + x1 * (e3 * (((q >>> 8) & 0xff) - bias))
+        s3 = s3 + x2 * (e3 * (((q >>> 16) & 0xff) - bias))
+        s3 = s3 + x3 * (e3 * ((q >>> 24) - bias))
       }
       xb = xb + 16
     }
-    r0 = r0 + blockWords
-    r1 = r1 + blockWords
+    r0 = (r0 + blockWords) | 0
   }
   out[i] = s0
   out[i + 1] = s1
+  out[i + 2] = s2
+  out[i + 3] = s3
 }
 
 // DataView of the matrix being multiplied (Q3_K / Q6_K, see matmulRows)
 var rowsDataView = null
 
-// Single-token matmul through a fused kernel, 2 rows per call; the rows left
-// over go through the generic kernel below.
+// Single-token matmul through a fused kernel; leftover rows: generic kernel
 function matmulRows(out, x, qw) {
-  var rowsFunc = qw.rowsFunc
-  var rowsN = qw.rows & ~1
-  if (qw.deqView.BYTES_PER_ELEMENT === 2) {
-    // Q3_K / Q6_K kernels read 4 bytes at a time through a DataView that only
-    // lives during the call
+  var rowsFunc = qw.k.rowsFunc
+  var step = rowsFunc === matmulF32Rows ? 2 : 4
+  var rowsN = qw.rows - (qw.rows % step)
+  if (qw.view.BYTES_PER_ELEMENT === 2) {
+    // Q3_K / Q6_K: DataView for 4-byte loads, only during the call
     rowsDataView = new DataView(ggufData, qw.dataOffset, qw.rows * qw.rowSize)
   }
-  for (var i = 0; i < rowsN; i = i + 2) {
+  for (var i = 0; i < rowsN; i = i + step) {
     rowsFunc(out, x, qw, i)
   }
   rowsDataView = null
@@ -3239,15 +2806,13 @@ function matmulRows(out, x, qw) {
   }
 }
 
-// K-quant matmul: dequantize 4 rows into a scratch buffer, then flat dot
-// product, from startRow on. Scratch: matmulDeqBuf during prefill, else an idle
-// buffer (logits while running the layers, hb while computing the logits),
-// fewer rows per pass if it is small.
+// K-quant matmul from startRow: 4 rows dequantized into a scratch (matmulDeqBuf
+// in prefill, else an idle buffer: logits during the layers, hb for the logits)
 function matmulKQuantLocal(out, x, qw, startRow) {
   var rows = qw.rows
   var cols = qw.cols
   var rowSize = qw.rowSize
-  var deqFunc = qw.deqRowFunc
+  var deqFunc = qw.k.deqRowFunc
   var buf = matmulDeqBuf
   var rows4 = startRow + ((rows - startRow) & ~3)
   if (buf === null) {
@@ -3265,7 +2830,7 @@ function matmulKQuantLocal(out, x, qw, startRow) {
   var off1 = cols
   var off2 = cols + cols
   var off3 = off2 + cols
-  var view = qw.deqView
+  var view = qw.view
   // Row length and position in elements of the view
   var rowEl = rowSize / view.BYTES_PER_ELEMENT
   var base = qw.base
@@ -3301,18 +2866,17 @@ function matmulKQuantLocal(out, x, qw, startRow) {
   }
 }
 
-// K-quant / F16 / BF16 / F32 batch matmul (prefill): dequantize 4 rows into the
-// row views of matmulDeqBuf, then a 4-row x 3-token tile per group of tokens (a
-// short last group reuses its last token for the missing lanes); every sum runs
-// over the columns left to right.
-function kQuantTile(outs, xs, bt, nTok, i, cols) {
+// Prefill matmul of the formats with a row dequantizer (Q8_0 Int32, K-quants,
+// F16 / BF16 / F32): 4 rows into matmulDeqBuf, then a 4-row x 3-token tile (12
+// accumulators; 1-2 tokens left: 2 lanes), same column order as the single-
+// token kernels. With stage, xs64 is filled first, last token first and each
+// backwards: the w2 staging lies over hb itself (slot b covers tokens 2b, 2b+1)
+function deqTile(outs, xs, bt, nTok, i, cols) {
   var buf0 = matmulDeqRows[0]
   var buf1 = matmulDeqRows[1]
   var buf2 = matmulDeqRows[2]
   var buf3 = matmulDeqRows[3]
   var xA = xs[bt]
-  var xB = xs[nTok > 1 ? bt + 1 : bt]
-  var xC = xs[nTok > 2 ? bt + 2 : bt]
   var s0 = 0.0
   var s1 = 0.0
   var s2 = 0.0
@@ -3325,26 +2889,53 @@ function kQuantTile(outs, xs, bt, nTok, i, cols) {
   var u1 = 0.0
   var u2 = 0.0
   var u3 = 0.0
-  for (var j = 0; j < cols; j = j + 1) {
-    var a = xA[j]
-    var e = xB[j]
-    var q = xC[j]
-    var w0 = buf0[j]
-    var w1 = buf1[j]
-    var w2 = buf2[j]
-    var w3 = buf3[j]
-    s0 = s0 + a * w0
-    t0 = t0 + e * w0
-    u0 = u0 + q * w0
-    s1 = s1 + a * w1
-    t1 = t1 + e * w1
-    u1 = u1 + q * w1
-    s2 = s2 + a * w2
-    t2 = t2 + e * w2
-    u2 = u2 + q * w2
-    s3 = s3 + a * w3
-    t3 = t3 + e * w3
-    u3 = u3 + q * w3
+  if (nTok === 3) {
+    var xB = xs[bt + 1]
+    var xC = xs[bt + 2]
+    for (var j = 0; j < cols; j = j + 1) {
+      var a = xA[j]
+      var e = xB[j]
+      var q = xC[j]
+      var w0 = buf0[j]
+      var w1 = buf1[j]
+      var w2 = buf2[j]
+      var w3 = buf3[j]
+      s0 = s0 + a * w0
+      t0 = t0 + e * w0
+      u0 = u0 + q * w0
+      s1 = s1 + a * w1
+      t1 = t1 + e * w1
+      u1 = u1 + q * w1
+      s2 = s2 + a * w2
+      t2 = t2 + e * w2
+      u2 = u2 + q * w2
+      s3 = s3 + a * w3
+      t3 = t3 + e * w3
+      u3 = u3 + q * w3
+    }
+    var oC = outs[bt + 2]
+    oC[i] = u0
+    oC[i + 1] = u1
+    oC[i + 2] = u2
+    oC[i + 3] = u3
+  } else {
+    var xB = xs[nTok > 1 ? bt + 1 : bt]
+    for (var j = 0; j < cols; j = j + 1) {
+      var a = xA[j]
+      var e = xB[j]
+      var w0 = buf0[j]
+      var w1 = buf1[j]
+      var w2 = buf2[j]
+      var w3 = buf3[j]
+      s0 = s0 + a * w0
+      t0 = t0 + e * w0
+      s1 = s1 + a * w1
+      t1 = t1 + e * w1
+      s2 = s2 + a * w2
+      t2 = t2 + e * w2
+      s3 = s3 + a * w3
+      t3 = t3 + e * w3
+    }
   }
   var oA = outs[bt]
   oA[i] = s0
@@ -3358,28 +2949,30 @@ function kQuantTile(outs, xs, bt, nTok, i, cols) {
     oB[i + 2] = t2
     oB[i + 3] = t3
   }
-  if (nTok > 2) {
-    var oC = outs[bt + 2]
-    oC[i] = u0
-    oC[i + 1] = u1
-    oC[i + 2] = u2
-    oC[i + 3] = u3
-  }
 }
 
-function matmulKQuantLocalBatch(outs, xs, qw, batchSize) {
+function matmulDeqBatch(outs, xs, xs64, stage, qw, batchSize, deqFunc, view) {
   var rows = qw.rows
   var cols = qw.cols
-  var rowSize = qw.rowSize
-  var deqFunc = qw.deqRowFunc
+  if (xs64 !== null) {
+    if (stage) {
+      for (var b = batchSize - 1; b >= 0; b = b - 1) {
+        var d = xs64[b]
+        var x = xs[b]
+        for (var j = cols - 1; j >= 0; j = j - 1) {
+          d[j] = x[j]
+        }
+      }
+    }
+    xs = xs64
+  }
   var rows4 = rows & ~3
   var buf0 = matmulDeqRows[0]
   var buf1 = matmulDeqRows[1]
   var buf2 = matmulDeqRows[2]
   var buf3 = matmulDeqRows[3]
-  var view = qw.deqView
   // Row length and position in elements of the view
-  var rowEl = rowSize / view.BYTES_PER_ELEMENT
+  var rowEl = qw.rowSize / view.BYTES_PER_ELEMENT
   var base = qw.base
   for (var i = 0; i < rows4; i = i + 4) {
     var p = base + i * rowEl
@@ -3392,7 +2985,7 @@ function matmulKQuantLocalBatch(outs, xs, qw, batchSize) {
       if (nTok > 3) {
         nTok = 3
       }
-      kQuantTile(outs, xs, bt, nTok, i, cols)
+      deqTile(outs, xs, bt, nTok, i, cols)
     }
   }
   // Remaining 1-3 rows
@@ -3408,7 +3001,6 @@ function matmulKQuantLocalBatch(outs, xs, qw, batchSize) {
     }
   }
 }
-
 // ----------------------------------------------------------------------------
 // Math functions
 
@@ -3428,149 +3020,39 @@ function fastTanh(x) {
   )
 }
 
-function rmsnorm(out, x, w, size, invSize, eps) {
-  eps = eps || 1e-5
+// RMS norm of x[off..off+size) into out (w from 0); Gemma weights already
+// carry the +1. Also the per-head QK norms
+function rmsnorm(out, x, off, w, size, eps, invSize) {
   invSize = invSize || 1.0 / size
   var ss = 0.0
-  // Loop unrolling: process 4 elements at a time
-  var size4 = size & ~3 // size - (size % 4)
-  var i = 0
-  for (; i < size4; i = i + 4) {
-    var x0 = x[i]
-    var x1 = x[i + 1]
-    var x2 = x[i + 2]
-    var x3 = x[i + 3]
-    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
-  }
-  for (; i < size; i = i + 1) {
-    ss = ss + x[i] * x[i]
+  var end = off + size
+  for (var i = off; i < end; i = i + 1) {
+    var v = x[i]
+    ss = ss + v * v
   }
   ss = 1.0 / Math.sqrt(ss * invSize + eps)
-  i = 0
-  for (; i < size4; i = i + 4) {
-    out[i] = w[i] * ss * x[i]
-    out[i + 1] = w[i + 1] * ss * x[i + 1]
-    out[i + 2] = w[i + 2] * ss * x[i + 2]
-    out[i + 3] = w[i + 3] * ss * x[i + 3]
-  }
-  for (; i < size; i = i + 1) {
-    out[i] = w[i] * ss * x[i]
-  }
-}
-
-function rmsnormGemma(out, x, w, size, eps, invSize) {
-  // Note: GGUF conversion already adds +1 to Gemma norm weights
-  invSize = invSize || 1.0 / size
-  var ss = 0.0
-  // Loop unrolling: process 4 elements at a time
-  var size4 = size & ~3
-  var i = 0
-  for (; i < size4; i = i + 4) {
-    var x0 = x[i]
-    var x1 = x[i + 1]
-    var x2 = x[i + 2]
-    var x3 = x[i + 3]
-    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
-  }
-  for (; i < size; i = i + 1) {
-    ss = ss + x[i] * x[i]
-  }
-  ss = 1.0 / Math.sqrt(ss * invSize + eps)
-  i = 0
-  for (; i < size4; i = i + 4) {
-    out[i] = w[i] * ss * x[i]
-    out[i + 1] = w[i + 1] * ss * x[i + 1]
-    out[i + 2] = w[i + 2] * ss * x[i + 2]
-    out[i + 3] = w[i + 3] * ss * x[i + 3]
-  }
-  for (; i < size; i = i + 1) {
-    out[i] = w[i] * ss * x[i]
-  }
-}
-
-// In-place RMS norm at an offset into arr (avoids subarray allocation)
-function rmsnormGemmaAt(arr, arrOffset, w, size, eps, invSize) {
-  var ss = 0.0
-  var size4 = size & ~3
-  var end4 = arrOffset + size4
-  var end = arrOffset + size
-  var i = arrOffset
   var wi = 0
-  for (; i < end4; i = i + 4, wi = wi + 4) {
-    var x0 = arr[i]
-    var x1 = arr[i + 1]
-    var x2 = arr[i + 2]
-    var x3 = arr[i + 3]
-    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
+  for (var i = off; i < end; i = i + 1, wi = wi + 1) {
+    out[i] = w[wi] * ss * x[i]
   }
-  for (; i < end; i = i + 1) {
-    ss = ss + arr[i] * arr[i]
-  }
-  ss = 1.0 / Math.sqrt(ss * invSize + eps)
-  i = arrOffset
-  wi = 0
-  for (; i < end4; i = i + 4, wi = wi + 4) {
-    arr[i] = w[wi] * ss * arr[i]
-    arr[i + 1] = w[wi + 1] * ss * arr[i + 1]
-    arr[i + 2] = w[wi + 2] * ss * arr[i + 2]
-    arr[i + 3] = w[wi + 3] * ss * arr[i + 3]
-  }
-  for (; i < end; i = i + 1, wi = wi + 1) {
-    arr[i] = w[wi] * ss * arr[i]
-  }
-}
-
-// Fused embedding scale + RMS norm for Gemma first layer
-// Scales x in-place and computes rmsnorm in 2 passes instead of 3
+}// Fused embedding scale + RMS norm for Gemma first layer (scales x in place)
 function rmsnormGemmaFusedScale(out, x, w, size, eps, invSize, scale) {
   var ss = 0.0
-  var size4 = size & ~3
-  var i = 0
-  // Pass 1: scale x in-place and accumulate sum of squares
-  for (; i < size4; i = i + 4) {
-    var x0 = x[i] * scale
-    var x1 = x[i + 1] * scale
-    var x2 = x[i + 2] * scale
-    var x3 = x[i + 3] * scale
-    x[i] = x0
-    x[i + 1] = x1
-    x[i + 2] = x2
-    x[i + 3] = x3
-    ss = ss + x0 * x0 + x1 * x1 + x2 * x2 + x3 * x3
-  }
-  for (; i < size; i = i + 1) {
+  for (var i = 0; i < size; i = i + 1) {
     var xv = x[i] * scale
     x[i] = xv
     ss = ss + xv * xv
   }
-  // Pass 2: normalize
   ss = 1.0 / Math.sqrt(ss * invSize + eps)
-  i = 0
-  for (; i < size4; i = i + 4) {
-    out[i] = w[i] * ss * x[i]
-    out[i + 1] = w[i + 1] * ss * x[i + 1]
-    out[i + 2] = w[i + 2] * ss * x[i + 2]
-    out[i + 3] = w[i + 3] * ss * x[i + 3]
-  }
-  for (; i < size; i = i + 1) {
+  for (var i = 0; i < size; i = i + 1) {
     out[i] = w[i] * ss * x[i]
   }
 }
-
 function accum(a, b, size) {
-  var size4 = size & ~3
-  var i = 0
-  for (; i < size4; i = i + 4) {
-    a[i] = a[i] + b[i]
-    a[i + 1] = a[i + 1] + b[i + 1]
-    a[i + 2] = a[i + 2] + b[i + 2]
-    a[i + 3] = a[i + 3] + b[i + 3]
-  }
-  for (; i < size; i = i + 1) {
+  for (var i = 0; i < size; i = i + 1) {
     a[i] = a[i] + b[i]
   }
 }
-
 // ----------------------------------------------------------------------------
 // GGUF parsing
 
@@ -3607,9 +3089,8 @@ var SKIP_METADATA_KEYS = {
   "general.size_label": true,
 }
 
-// Advance offset past n GGUF strings without decoding them and return the
-// longest one; 4 strings per iteration keeps JavaScriptCore from bringing up
-// its top compiler tier during the load.
+// Skip n GGUF strings, return the longest; 4 per iteration keeps
+// JavaScriptCore's top tier out of the load
 function skipStrings(n) {
   var dv = dataView
   var p = offset
@@ -3772,9 +3253,8 @@ function parseGGUF(arrayBuffer) {
   }
 }
 
-// The token strings of the vocabulary stay in the file: this only notes where
-// the array starts and its longest string (the per-token tables are built by
-// ensureVocabTables on the first use)
+// The token strings stay in the file: note where the array starts and its
+// longest string (per-token tables: ensureVocabTables)
 function readStringRefs(arrLen) {
   var start = offset
   var maxLen = skipStrings(arrLen)
@@ -3933,9 +3413,7 @@ function loadModel(arrayBuffer) {
   }
 
   tokenizer = {
-    // Where the token strings start in the file and the longest one; the
-    // per-token tables and the end-of-turn token come from ensureVocabTables()
-    // on the first generate() call
+    // Token strings start / longest one (per-token tables: ensureVocabTables)
     vocabOffset: vocabOffset,
     vocabMaxLen: vocabMaxLen,
     vocabLengths: null,
@@ -3951,7 +3429,7 @@ function loadModel(arrayBuffer) {
   postMessage({ type: "progress", message: "Loading weights..." })
 
   weights = loadWeights(gguf)
-  state = createRunState(config)
+  state = createRunState(config, weights.hasBlock32)
 
   postMessage({ type: "progress", message: "Model loaded!" })
 
@@ -3961,11 +3439,21 @@ function loadModel(arrayBuffer) {
   }
 }
 
+// Kernels record of the Q8_0 matrices read through the Int32 view
+var Q8_LOCAL_KERNELS = {
+  kind: 1,
+  deqRowFunc: null,
+  unpackRowFunc: null,
+  rowsFunc: null,
+}
+
 function loadWeights(gguf) {
   var tensors = gguf.tensors
   var baseOffset = gguf.tensorDataOffset
   var w = {}
   w.hasKQuant = false
+  // Some matrix is block-32 (the prefill keeps a Q8_0 copy of every input)
+  w.hasBlock32 = false
   // Some layer matrix goes through the Q8_0 Int32 kernels (see generate)
   w.q8Layers = false
 
@@ -3983,10 +3471,8 @@ function loadWeights(gguf) {
     return dequantizeTensor(off, t.nElements, t.type)
   }
 
-  // View a matrix is read through (kind 0: Int32Array, 1: Uint16Array, 2:
-  // Float32Array): one shared view per kind over the whole file, the matrix
-  // position in elements in `base`; files too big for int32 indices get a view
-  // per matrix.
+  // Matrix views (0 Int32Array, 1 Uint16Array, 2 Float32Array): one per kind
+  // over the whole file, `base` = matrix start; >2 GB files: one per matrix
   var sharedViews = [null, null, null]
   function matrixView(rec, off, totalBytes, kind) {
     var Ctor = kind === 0 ? Int32Array : kind === 1 ? Uint16Array : Float32Array
@@ -4005,7 +3491,8 @@ function loadWeights(gguf) {
     return sharedViews[kind]
   }
 
-  // Kernels of the tensor types, looked up once per type
+  // Kernels per tensor type; kind: 1 Q8_0 (Int32 view), 2 block-32, 3 row
+  // dequantizer, 0 byte-wise fallback
   var typeKernels = []
 
   // Load tensor keeping it quantized (for large weight matrices)
@@ -4019,9 +3506,15 @@ function loadWeights(gguf) {
     var kernels = typeKernels[type]
     if (!kernels) {
       kernels = {
+        kind: 0,
         deqRowFunc: getDeqRowFunc(type),
         unpackRowFunc: getUnpackRowFunc(type),
         rowsFunc: getRowsFunc(type),
+      }
+      if (kernels.deqRowFunc !== null) {
+        kernels.kind = 3
+      } else if (kernels.unpackRowFunc !== null) {
+        kernels.kind = 2
       }
       typeKernels[type] = kernels
     }
@@ -4034,46 +3527,42 @@ function loadWeights(gguf) {
       rows: rows,
       cols: cols,
       rowSize: rs,
-      deqRowFunc: kernels.deqRowFunc,
-      unpackRowFunc: kernels.unpackRowFunc,
-      rowsFunc: kernels.rowsFunc,
-      // Views the matrix is read through (Int32: Q8_0 kernels, Uint16: block-32
-      // kernels, deqView: row dequantizers) and its position in them
-      localI32: null,
-      localU16: null,
-      deqView: null,
+      // Kernels of the type and the view with the matrix position in it
+      k: kernels,
+      view: null,
       base: 0,
     }
     if (type === GGML_TYPE.Q8_0) {
       // Rows with an odd number of blocks keep the byte-wise kernel
       if (((off | rs) & 3) === 0) {
-        result.localI32 = matrixView(result, off, totalBytes, 0)
+        result.view = matrixView(result, off, totalBytes, 0)
+        result.k = Q8_LOCAL_KERNELS
       }
       return result
     }
-    // The other formats are read through 16/32-bit words, the block-32 ones
-    // 4 rows at a time. GGUF aligns tensor data to 32 bytes, so this only
-    // rejects a corrupt file or a shape no model has.
-    var block32 = result.unpackRowFunc !== null
+    // The other formats are read as 16/32-bit words (GGUF aligns tensor data
+    // to 32 bytes: this only rejects a corrupt file)
+    var block32 = kernels.kind === 2
     var halfFloat = type === GGML_TYPE.F16 || type === GGML_TYPE.BF16 || type === 30
     if (
       (off & 3) !== 0 ||
-      (block32 ? (rows & 3) !== 0 : result.deqRowFunc === null) ||
+      (block32 ? (rows & 3) !== 0 : kernels.kind !== 3) ||
       (halfFloat && (cols & 1) !== 0)
     ) {
       throw new Error("Unsupported tensor layout: " + name)
     }
     if (block32) {
-      result.localU16 = matrixView(result, off, totalBytes, 1)
+      w.hasBlock32 = true
+      result.view = matrixView(result, off, totalBytes, 1)
     } else {
       w.hasKQuant = true
-      var kind = 0
+      var viewKind = 0
       if (type === GGML_TYPE.Q3_K || type === GGML_TYPE.Q6_K) {
-        kind = 1
+        viewKind = 1
       } else if (type === GGML_TYPE.F32) {
-        kind = 2
+        viewKind = 2
       }
-      result.deqView = matrixView(result, off, totalBytes, kind)
+      result.view = matrixView(result, off, totalBytes, viewKind)
     }
     return result
   }
@@ -4086,7 +3575,7 @@ function loadWeights(gguf) {
   function loadLayerTensorQuantized(layer, suffix, rows, cols) {
     var name = "blk." + layer + "." + suffix
     var result = loadTensorQuantized(name, rows, cols)
-    if (result !== null && result.localI32 !== null) {
+    if (result !== null && result.k.kind === 1) {
       w.q8Layers = true
     }
     return result
@@ -4107,7 +3596,7 @@ function loadWeights(gguf) {
   // Use per-layer arrays
   w.layers = []
 
-  // Tensors of one layer (kept out of the loop below so the loop stays small)
+  // Tensors of one layer
   function loadLayer(l) {
     var layer = {}
 
@@ -4186,14 +3675,13 @@ function ropeFrequencies(theta, headSize) {
   return freqs
 }
 
-function createRunState(p) {
+function createRunState(p, hasBlock32) {
   var headSize = p.headDim
   var kvDim = p.nKvHeads * headSize
   var qDim = p.nHeads * headSize
   var maxDim = Math.max(p.dim, qDim)
 
-  // RoPE frequencies (ropeSize floats each); cos/sin are filled per forward
-  // pass by fillRopeBuffers()
+  // RoPE frequencies (ropeSize floats); cos/sin filled per pass (fillRopeBuffers)
   var ropeSize = headSize / 2
   var ropeFreqs = ropeFrequencies(p.ropeTheta, headSize)
   var ropeSwaFreqs = ropeFreqs
@@ -4204,9 +3692,8 @@ function createRunState(p) {
     )
   }
 
-  // Q8_0 KV cache: 34 bytes per 32 floats, layout
-  // [layer][kv_head][position][head_data]. It starts empty and grows on demand
-  // (ensureKvCapacity) up to seqLen.
+  // Q8_0 KV cache, [layer][kv_head][position][head_data], grown on demand
+  // (ensureKvCapacity) up to seqLen
   var headBytesQ8 = (headSize >> 5) * Q8_0_BLOCK_SIZE
   var initialCap = 0
   var headSeqBytes = 0
@@ -4223,16 +3710,17 @@ function createRunState(p) {
   xQ8Buf = null
   xQ8Int8Buf = null
 
-  // Bytes of the generate() scratch: the largest of the hash table
-  // (buildVocabHash), the prefill batch buffers (ensureBatchBuffers) and
+  // generate() scratch: the largest of the hash table, the batch buffers and
   // the logits
   var hashBuckets = 256
   while (hashBuckets * 4 < p.vocabSize) {
     hashBuckets = hashBuckets << 1
   }
+  // Per-token Q8_0 copy of the input, only for block-32 matrices
+  var batchQ8Stride = hasBlock32 ? (xQ8Size + 7) & ~7 : 0
   var batchTokenBytes =
     (p.dim + maxDim + p.dim + qDim + kvDim + kvDim + p.hiddenDim + p.hiddenDim) * 4 +
-    ((xQ8Size + 7) & ~7)
+    batchQ8Stride
   var scratchBytes = Math.max(
     (hashBuckets + p.vocabSize) * 4,
     maxCols * 32 + PREFILL_BATCH_SIZE * batchTokenBytes,
@@ -4243,32 +3731,32 @@ function createRunState(p) {
   var qQ8TotalBytes = p.nHeads * headBytesQ8
   var qQ8Buffer = new ArrayBuffer(qQ8TotalBytes)
 
-  // Prefill batch buffers: allocated on first prefill (ensureBatchBuffers),
-  // these arrays are the placeholders
-  var batchX = new Array(PREFILL_BATCH_SIZE)
-  var batchXb = new Array(PREFILL_BATCH_SIZE)
-  var batchXb2 = new Array(PREFILL_BATCH_SIZE)
-  var batchQ = new Array(PREFILL_BATCH_SIZE)
-  var batchK = new Array(PREFILL_BATCH_SIZE)
-  var batchV = new Array(PREFILL_BATCH_SIZE)
-  var batchHb = new Array(PREFILL_BATCH_SIZE)
-  var batchHb2 = new Array(PREFILL_BATCH_SIZE)
-  var batchQ8 = new Array(PREFILL_BATCH_SIZE)
-  var batchQ8i8 = new Array(PREFILL_BATCH_SIZE)
-
+  // xb2 lives in hb and q, k, v in hb2 (never live with the FFN activations)
   var hbBuf = new Float32Array(p.hiddenDim)
+  var hb2Buf = new Float32Array(p.hiddenDim)
+  var xb2Buf = new Float32Array(p.dim)
+  var qBuf = new Float32Array(qDim)
+  var kBuf = new Float32Array(kvDim)
+  var vBuf = new Float32Array(kvDim)
+  if (p.dim <= p.hiddenDim) {
+    xb2Buf = new Float32Array(hbBuf.buffer, 0, p.dim)
+  }
+  if (qDim + kvDim + kvDim <= p.hiddenDim) {
+    qBuf = new Float32Array(hb2Buf.buffer, 0, qDim)
+    kBuf = new Float32Array(hb2Buf.buffer, qDim * 4, kvDim)
+    vBuf = new Float32Array(hb2Buf.buffer, (qDim + kvDim) * 4, kvDim)
+  }
 
   var runState = {
     x: new Float32Array(p.dim),
     xb: new Float32Array(maxDim),
-    xb2: new Float32Array(p.dim),
+    xb2: xb2Buf,
     hb: hbBuf,
-    hb2: new Float32Array(p.hiddenDim),
-    q: new Float32Array(qDim),
-    k: new Float32Array(kvDim),
-    v: new Float32Array(kvDim),
-    // Attention scores, nHeads x kvCapacity: (re)allocated by
-    // ensureKvCapacity together with the KV cache.
+    hb2: hb2Buf,
+    q: qBuf,
+    k: kBuf,
+    v: vBuf,
+    // Attention scores, nHeads x kvCapacity (ensureKvCapacity)
     att: null,
     // Allocated on the first forward pass that needs it (ensureLogits)
     logits: null,
@@ -4284,6 +3772,7 @@ function createRunState(p) {
     _batchKvDim: kvDim,
     _batchHiddenDim: p.hiddenDim,
     _batchXQ8Size: xQ8Size,
+    _batchQ8Stride: batchQ8Stride,
     _batchMatmulDeqCols: maxCols,
     _batchBuffersReady: false,
     scratchBytes: scratchBytes,
@@ -4298,9 +3787,8 @@ function createRunState(p) {
     qQ8i8: new Int8Array(qQ8Buffer),
     // Cache layout info
     headSeqBytes: headSeqBytes,
-    // RoPE scratch filled by fillRopeBuffers(), [batchIdx * ropeSize + i];
-    // sized by setRopeSlots() (1 position, PREFILL_BATCH_SIZE during prefill).
-    // Non-Gemma: SwaAll === All.
+    // RoPE scratch (fillRopeBuffers), [batchIdx * ropeSize + i], sized by
+    // setRopeSlots(); non-Gemma: SwaAll === All
     ropeCosAll: null,
     ropeSinAll: null,
     ropeCosSwaAll: null,
@@ -4313,12 +3801,10 @@ function createRunState(p) {
     kvDim: kvDim,
     qDim: qDim,
     kvMul: p.nHeads / p.nKvHeads,
-    // Layer size in bytes of the Q8_0 cache (nKvHeads * kvCapacity *
-    // headBytesQ8)
+    // Layer size in bytes of the Q8_0 cache
     kvCacheLayerSize: kvCacheLayerBytes,
     kvCapacity: initialCap,
-    // Token of every cached position (kvTokens[0 .. kvCount - 1]); generate()
-    // keeps the positions whose tokens match the start of the next prompt.
+    // Token of every cached position; generate() keeps the matching prefix
     kvTokens: new Int32Array(0),
     kvCount: 0,
     // How many of the leading positions were written by the batched prefill
@@ -4344,17 +3830,20 @@ function createRunState(p) {
     topKIndices: new Int32Array(topK),
     topKValues: new Float32Array(topK),
     headBytesQ8: headBytesQ8,
-    // Batch buffers for prefill
-    batchX: batchX,
-    batchXb: batchXb,
-    batchXb2: batchXb2,
-    batchQ: batchQ,
-    batchK: batchK,
-    batchV: batchV,
-    batchHb: batchHb,
-    batchHb2: batchHb2,
-    batchQ8: batchQ8,
-    batchQ8i8: batchQ8i8,
+    // Batch buffers of the prefill (ensureBatchBuffers / freeBatchBuffers)
+    batchX: null,
+    batchXb: null,
+    batchXb2: null,
+    batchQ: null,
+    batchK: null,
+    batchV: null,
+    batchHb: null,
+    batchHb2: null,
+    batchQ8: null,
+    batchQ8i8: null,
+    // Float64 staging views of the matmul inputs (ensureBatchBuffers)
+    batchStageB: null,
+    batchStageC: null,
   }
   runState.hb64 = new Float64Array(hbBuf.buffer, 0, p.hiddenDim >> 1)
   setRopeSlots(runState, 1)
@@ -4378,6 +3867,15 @@ function setRopeSlots(s, slots) {
 // ----------------------------------------------------------------------------
 // Transformer forward pass
 
+// n views of len elements, stride bytes apart from off (per-token buffers)
+function tokenViews(Ctor, buf, off, stride, len, n) {
+  var views = new Array(n)
+  for (var b = 0; b < n; b = b + 1) {
+    views[b] = new Ctor(buf, off + b * stride, len)
+  }
+  return views
+}
+
 // Allocate the prefill batch buffers (2.5 MB) on first prefill
 function ensureBatchBuffers(s) {
   if (s._batchBuffersReady) {
@@ -4389,65 +3887,66 @@ function ensureBatchBuffers(s) {
   var qDim = s._batchQDim
   var kvDim = s._batchKvDim
   var hiddenDim = s._batchHiddenDim
-  var xQ8Size = s._batchXQ8Size
   var deqCols = s._batchMatmulDeqCols
   ensureGenScratch(s)
   var buf = genScratch
-  // matmulDeqBuf is a global read by the batch-matmul kernels: the first
-  // 32 * deqCols bytes of the scratch, then one block per token
+  // matmulDeqBuf: the first 32 * deqCols bytes, read by the batch kernels
   matmulDeqBuf = new Float64Array(buf, 0, 4 * deqCols)
   matmulDeqI8 = new Int8Array(buf, 0, 32 * deqCols)
-  matmulDeqRows = [
-    new Float64Array(buf, 0, deqCols),
-    new Float64Array(buf, deqCols * 8, deqCols),
-    new Float64Array(buf, deqCols * 16, deqCols),
-    new Float64Array(buf, deqCols * 24, deqCols),
-  ]
+  matmulDeqRows = tokenViews(Float64Array, buf, 0, deqCols * 8, deqCols, 4)
+  // One region per kind of buffer, tokens one after another; the regions idle
+  // during a matmul hold the Float64 staging of its input: B over xb2/q/k/v
+  // (w1, w3), C over hb and hb2 (QKV, wo, w2)
   var off = deqCols * 32
-  for (var b = 0; b < n; b = b + 1) {
-    s.batchX[b] = new Float32Array(buf, off, dim)
-    off = off + dim * 4
-    s.batchXb[b] = new Float32Array(buf, off, maxDim)
-    off = off + maxDim * 4
-    s.batchXb2[b] = new Float32Array(buf, off, dim)
-    off = off + dim * 4
-    s.batchQ[b] = new Float32Array(buf, off, qDim)
-    off = off + qDim * 4
-    s.batchK[b] = new Float32Array(buf, off, kvDim)
-    off = off + kvDim * 4
-    s.batchV[b] = new Float32Array(buf, off, kvDim)
-    off = off + kvDim * 4
-    s.batchHb[b] = new Float32Array(buf, off, hiddenDim)
-    off = off + hiddenDim * 4
-    s.batchHb2[b] = new Float32Array(buf, off, hiddenDim)
-    off = off + hiddenDim * 4
-    s.batchQ8[b] = new Uint8Array(buf, off, xQ8Size)
-    s.batchQ8i8[b] = new Int8Array(buf, off, xQ8Size)
-    off = off + ((xQ8Size + 7) & ~7)
+  s.batchX = tokenViews(Float32Array, buf, off, dim * 4, dim, n)
+  off = off + n * dim * 4
+  s.batchXb = tokenViews(Float32Array, buf, off, maxDim * 4, maxDim, n)
+  off = off + n * maxDim * 4
+  var offB = off
+  s.batchXb2 = tokenViews(Float32Array, buf, off, dim * 4, dim, n)
+  off = off + n * dim * 4
+  s.batchQ = tokenViews(Float32Array, buf, off, qDim * 4, qDim, n)
+  off = off + n * qDim * 4
+  s.batchK = tokenViews(Float32Array, buf, off, kvDim * 4, kvDim, n)
+  off = off + n * kvDim * 4
+  s.batchV = tokenViews(Float32Array, buf, off, kvDim * 4, kvDim, n)
+  off = off + n * kvDim * 4
+  var offC = off
+  s.batchHb = tokenViews(Float32Array, buf, off, hiddenDim * 4, hiddenDim, n)
+  off = off + n * hiddenDim * 4
+  s.batchHb2 = tokenViews(Float32Array, buf, off, hiddenDim * 4, hiddenDim, n)
+  off = off + n * hiddenDim * 4
+  if (maxDim <= hiddenDim && dim + qDim + 2 * kvDim >= 2 * maxDim) {
+    s.batchStageB = tokenViews(Float64Array, buf, offB, maxDim * 8, maxDim, n)
+    s.batchStageC = tokenViews(Float64Array, buf, offC, hiddenDim * 8, hiddenDim, n)
+  }
+  var q8Stride = s._batchQ8Stride
+  if (q8Stride > 0) {
+    var xQ8Size = s._batchXQ8Size
+    s.batchQ8 = tokenViews(Uint8Array, buf, off, q8Stride, xQ8Size, n)
+    s.batchQ8i8 = tokenViews(Int8Array, buf, off, q8Stride, xQ8Size, n)
   }
   setRopeSlots(s, PREFILL_BATCH_SIZE)
   s._batchBuffersReady = true
 }
 
-// Release the prefill batch buffers once prefill is over (single-token
-// generation doesn't use them)
+// Release the prefill batch buffers once prefill is over
 function freeBatchBuffers(s) {
   if (!s._batchBuffersReady) {
     return
   }
-  var n = PREFILL_BATCH_SIZE
-  for (var b = 0; b < n; b = b + 1) {
-    s.batchX[b] = null
-    s.batchXb[b] = null
-    s.batchXb2[b] = null
-    s.batchQ[b] = null
-    s.batchK[b] = null
-    s.batchV[b] = null
-    s.batchHb[b] = null
-    s.batchHb2[b] = null
-    s.batchQ8[b] = null
-    s.batchQ8i8[b] = null
-  }
+  s.batchX = null
+  s.batchXb = null
+  s.batchXb2 = null
+  s.batchQ = null
+  s.batchK = null
+  s.batchV = null
+  s.batchHb = null
+  s.batchHb2 = null
+  s.batchQ8 = null
+  s.batchQ8i8 = null
+  s.batchStageB = null
+  s.batchStageC = null
   matmulDeqBuf = null
   matmulDeqRows = null
   matmulDeqI8 = null
@@ -4455,14 +3954,12 @@ function freeBatchBuffers(s) {
   s._batchBuffersReady = false
 }
 
-// Allocate the vocabSize-sized logits buffer on the first forward pass that
-// needs it
+// Allocate the logits buffer on the first forward pass that needs it
 function ensureLogits(s) {
   if (s.logits === null) {
     ensureGenScratch(s)
     s.logits = new Float32Array(genScratch, 0, s.vocabSize)
-    // Float64 view over the same bytes: idle scratch for K-quant matmuls while
-    // the layers run
+    // Float64 view over the same bytes: K-quant scratch while the layers run
     s.logits64 = new Float64Array(genScratch, 0, s.vocabSize >> 1)
   }
 }
@@ -4473,17 +3970,14 @@ function ensureGenScratch(s) {
   }
 }
 
-// Grow the KV cache (doubling, capped at seqLen) when the next forward pass
-// needs positions past its capacity; the positions written so far are copied to
-// their place in the new buffer.
+// Grow the KV cache (doubling, capped at seqLen), copying the positions written
 function ensureKvCapacity(s, needed) {
   var cap = s.kvCapacity
   if (needed <= cap) {
     return
   }
   var maxCap = s.seqLen
-  // Start at cap (common case after the first allocation) or 1 so the
-  // doubling loop can reach `needed` from zero on the first forward pass.
+  // From cap, or 1 on the first pass, doubling up to needed
   var newCap = cap > 0 ? cap : 1
   while (newCap < needed) {
     newCap = newCap * 2
@@ -4528,13 +4022,11 @@ function ensureKvCapacity(s, needed) {
   var newTokens = new Int32Array(newCap)
   newTokens.set(s.kvTokens)
   s.kvTokens = newTokens
-  // Scores of one position against every cached position (plain scratch,
-  // nothing to carry over)
+  // Scores of one position against every cached position (plain scratch)
   s.att = new Float32Array(s.nHeads * newCap)
 }
 
-// Fill the RoPE cos/sin scratch for batchSize positions starting at startPos,
-// indexed [b * ropeSize + i] (b: batch slot)
+// Fill the RoPE cos/sin scratch for batchSize positions from startPos
 function fillRopeBuffers(s, startPos, batchSize) {
   var ropeSize = s.ropeSize
   var freqs = s.ropeFreqs
@@ -4566,53 +4058,25 @@ function fillRopeBuffers(s, startPos, batchSize) {
 }
 
 // ----------------------------------------------------------------------------
-// Per-token element loops of the transformer. They live in small functions so
-// the compiled code of the big transformer functions stays small.
+// Per-token element loops (small functions keep the transformer code small)
 
 // SwiGLU gate: hb = silu(hb) * hb2 with silu(x) = 0.5 * x * (1 + tanh(x / 2))
 function siluGate(hbArr, hb2Arr, n) {
-  var n4 = n & ~3
-  for (var i = 0; i < n4; i = i + 4) {
-    var v0 = hbArr[i]
-    var v1 = hbArr[i + 1]
-    var v2 = hbArr[i + 2]
-    var v3 = hbArr[i + 3]
-    hbArr[i] = 0.5 * v0 * (1.0 + fastTanh(0.5 * v0)) * hb2Arr[i]
-    hbArr[i + 1] = 0.5 * v1 * (1.0 + fastTanh(0.5 * v1)) * hb2Arr[i + 1]
-    hbArr[i + 2] = 0.5 * v2 * (1.0 + fastTanh(0.5 * v2)) * hb2Arr[i + 2]
-    hbArr[i + 3] = 0.5 * v3 * (1.0 + fastTanh(0.5 * v3)) * hb2Arr[i + 3]
-  }
-  for (var i = n4; i < n; i = i + 1) {
+  for (var i = 0; i < n; i = i + 1) {
     var val = hbArr[i]
     hbArr[i] = 0.5 * val * (1.0 + fastTanh(0.5 * val)) * hb2Arr[i]
   }
 }
-
 // GeGLU gate: hb = gelu(hb) * hb2 (tanh approximation)
 function geluGate(hbArr, hb2Arr, n) {
-  var n4 = n & ~3
   var GELU_A = 0.7978845608
   var GELU_B = 0.035677408137
-  for (var i = 0; i < n4; i = i + 4) {
-    var x0 = hbArr[i]
-    var x1 = hbArr[i + 1]
-    var x2 = hbArr[i + 2]
-    var x3 = hbArr[i + 3]
+  for (var i = 0; i < n; i = i + 1) {
+    var xv = hbArr[i]
     hbArr[i] =
-      0.5 * x0 * (1.0 + fastTanh(x0 * (GELU_A + GELU_B * x0 * x0))) * hb2Arr[i]
-    hbArr[i + 1] =
-      0.5 * x1 * (1.0 + fastTanh(x1 * (GELU_A + GELU_B * x1 * x1))) * hb2Arr[i + 1]
-    hbArr[i + 2] =
-      0.5 * x2 * (1.0 + fastTanh(x2 * (GELU_A + GELU_B * x2 * x2))) * hb2Arr[i + 2]
-    hbArr[i + 3] =
-      0.5 * x3 * (1.0 + fastTanh(x3 * (GELU_A + GELU_B * x3 * x3))) * hb2Arr[i + 3]
-  }
-  for (var i = n4; i < n; i = i + 1) {
-    var x = hbArr[i]
-    hbArr[i] = 0.5 * x * (1.0 + fastTanh(x * (GELU_A + GELU_B * x * x))) * hb2Arr[i]
+      0.5 * xv * (1.0 + fastTanh(xv * (GELU_A + GELU_B * xv * xv))) * hb2Arr[i]
   }
 }
-
 // Llama RoPE on consecutive pairs; Q also gets the attention scale folded in.
 function ropeLlama(
   qArr,
@@ -4625,32 +4089,7 @@ function ropeLlama(
   ropeBase,
   attnScale
 ) {
-  var kvDim4 = kvDim & ~3
-  for (var i = 0; i < kvDim4; i = i + 4) {
-    var fi0 = (i >> 1) % half
-    var fi1 = ((i + 2) >> 1) % half
-    var fcr0 = ropeCos[ropeBase + fi0]
-    var fci0 = ropeSin[ropeBase + fi0]
-    var fcr1 = ropeCos[ropeBase + fi1]
-    var fci1 = ropeSin[ropeBase + fi1]
-    var qv0 = qArr[i]
-    var qv1 = qArr[i + 1]
-    qArr[i] = (qv0 * fcr0 - qv1 * fci0) * attnScale
-    qArr[i + 1] = (qv0 * fci0 + qv1 * fcr0) * attnScale
-    var qv2 = qArr[i + 2]
-    var qv3 = qArr[i + 3]
-    qArr[i + 2] = (qv2 * fcr1 - qv3 * fci1) * attnScale
-    qArr[i + 3] = (qv2 * fci1 + qv3 * fcr1) * attnScale
-    var kv0 = kArr[i]
-    var kv1 = kArr[i + 1]
-    kArr[i] = kv0 * fcr0 - kv1 * fci0
-    kArr[i + 1] = kv0 * fci0 + kv1 * fcr0
-    var kv2 = kArr[i + 2]
-    var kv3 = kArr[i + 3]
-    kArr[i + 2] = kv2 * fcr1 - kv3 * fci1
-    kArr[i + 3] = kv2 * fci1 + kv3 * fcr1
-  }
-  for (var i = kvDim4; i < kvDim; i = i + 2) {
+  for (var i = 0; i < kvDim; i = i + 2) {
     var freqIdx = (i >> 1) % half
     var fcr = ropeCos[ropeBase + freqIdx]
     var fci = ropeSin[ropeBase + freqIdx]
@@ -4673,9 +4112,7 @@ function ropeLlama(
     qArr[i + 1] = (v0 * fci + v1 * fcr) * attnScale
   }
 }
-
-// Gemma (NEOX) RoPE on pairs (i, i + half) of every head, times scale
-// (attention scale for Q, 1.0 for K: multiplying by 1.0 is exact).
+// Gemma (NEOX) RoPE on pairs (i, i + half) of every head, times scale (1.0 for K)
 function ropeNeox(arr, nHeads, headSize, half, ropeCos, ropeSin, ropeBase, scale) {
   for (var h = 0; h < nHeads; h = h + 1) {
     var idx = h * headSize
@@ -4690,16 +4127,13 @@ function ropeNeox(arr, nHeads, headSize, half, ropeCos, ropeSin, ropeBase, scale
   }
 }
 
-function zeroFloats(arr, n) {
-  for (var i = 0; i < n; i = i + 1) {
-    arr[i] = 0
-  }
-}
-
-// GQA-batched attention with Q8 scoring for one layer and position: every Q
-// head of a KV group against the cached keys, softmax per head over [startT,
-// pos], the Q8 values accumulated into xbArr.
+// GQA attention with Q8 scoring for one layer and position: the Q heads of a
+// KV group against the cache, softmax over [startT, pos], values into xbArr
 function attendQ8(s, loff, pos, startT, xbArr) {
+  var qDim = s.qDim
+  for (var i = 0; i < qDim; i = i + 1) {
+    xbArr[i] = 0
+  }
   var nKvHeads = s.nKvHeads
   var kvMul = s.kvMul
   var headSeqBytes = s.headSeqBytes
@@ -4775,10 +4209,9 @@ function attendQ8(s, loff, pos, startT, xbArr) {
   }
 }
 
-// Single-token matmuls of two or three matrices over the same input: when all
-// of them take Q8_0 activations, x is quantized once for all.
+// Two or three single-token matmuls over one input (block-32: x quantized once)
 function matmulSameInput(x, cols, o1, q1, o2, q2, o3, q3) {
-  if (q1.unpackRowFunc && q2.unpackRowFunc && (q3 === null || q3.unpackRowFunc)) {
+  if (q1.k.kind === 2 && q2.k.kind === 2 && (q3 === null || q3.k.kind === 2)) {
     ensureXQ8Buf()
     quantizeToQ8_0Cache(x, 0, xQ8Buf, xQ8Int8Buf, 0, cols)
     matmulQuantizedPreQ8(o1, q1)
@@ -4802,11 +4235,9 @@ function softcapLogits(logits, n, cap) {
   }
 }
 
-// Transformer forward pass, Llama and Gemma (per-head KV layout, Q8 attention,
-// GQA batching; Gemma adds QK norms, NEOX RoPE, sliding-window attention, GELU
-// and post-norms), in two shapes.
-// transformer: one token at position pos (generation and the last prompt
-// token), through the single-token kernels, plus the final norm and the logits.
+// Transformer forward pass, Llama and Gemma (Gemma adds QK norms, NEOX RoPE,
+// sliding window, GELU, post-norms). transformer: one token at pos, single-
+// token kernels, final norm and logits
 function transformer(token, pos, computeLogits) {
   var w = weights
   var s = state
@@ -4814,20 +4245,24 @@ function transformer(token, pos, computeLogits) {
     // K-quant matmuls borrow the logits buffer as scratch during generation
     ensureLogits(s)
   }
-  ensureKvCapacity(s, pos + 1)
+  if (pos >= s.kvCapacity) {
+    ensureKvCapacity(s, pos + 1)
+  }
   var isGemma = s.isGemma
   var dim = s.dim
-  var headSize = s.headSize
-  var qDim = s.qDim
   var hiddenDim = s.hiddenDim
   var eps = s.rmsNormEps
-  var nLayers = s.nLayers
+  var headSize = s.headSize
+  var qDim = s.qDim
   var nHeads = s.nHeads
   var nKvHeads = s.nKvHeads
-  var invDim = s.invDim
   var invHeadSize = s.invHeadSize
   var attnScale = s.attnScale
   var half = headSize >> 1
+  // Llama norms keep their 1e-5
+  var normEps = isGemma ? eps : 1e-5
+  var nLayers = s.nLayers
+  var invDim = s.invDim
 
   var xArr = s.x
   var xbArr = s.xb
@@ -4847,21 +4282,11 @@ function transformer(token, pos, computeLogits) {
   for (var l = 0; l < nLayers; l = l + 1) {
     var lw = w.layers[l]
 
-    if (!isGemma) {
-      rmsnorm(xbArr, xArr, lw.rmsAttWeight, dim, invDim)
-    } else if (l === 0) {
+    if (isGemma && l === 0) {
       // First layer: fused embed scale + rmsnorm
-      rmsnormGemmaFusedScale(
-        xbArr,
-        xArr,
-        lw.rmsAttWeight,
-        dim,
-        eps,
-        invDim,
-        s.embedScale
-      )
+      rmsnormGemmaFusedScale(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim, s.embedScale)
     } else {
-      rmsnormGemma(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim)
+      rmsnorm(xbArr, xArr, 0, lw.rmsAttWeight, dim, normEps, invDim)
     }
 
     // QKV matmuls
@@ -4877,24 +4302,10 @@ function transformer(token, pos, computeLogits) {
     if (isGemma) {
       if (lw.attnQNorm && lw.attnKNorm) {
         for (var h = 0; h < nHeads; h = h + 1) {
-          rmsnormGemmaAt(
-            qArr,
-            h * headSize,
-            lw.attnQNorm,
-            headSize,
-            eps,
-            invHeadSize
-          )
+          rmsnorm(qArr, qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
         }
         for (var h = 0; h < nKvHeads; h = h + 1) {
-          rmsnormGemmaAt(
-            kArr,
-            h * headSize,
-            lw.attnKNorm,
-            headSize,
-            eps,
-            invHeadSize
-          )
+          rmsnorm(kArr, kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
         }
       }
       // NEOX RoPE with fused attnScale on Q
@@ -4929,8 +4340,6 @@ function transformer(token, pos, computeLogits) {
     // Quantize all Q heads to Q8_0
     quantizeToQ8_0Cache(qArr, 0, s.qQ8, s.qQ8i8, 0, qDim)
 
-    zeroFloats(xbArr, qDim)
-
     // SWA window enforcement
     var startT =
       isSwaLayer && config.swaWindow > 0
@@ -4942,16 +4351,12 @@ function transformer(token, pos, computeLogits) {
     // Attention output
     matmulQuantized(xb2Arr, xbArr, lw.wo)
     if (isGemma && lw.attnPostNorm) {
-      rmsnormGemma(xb2Arr, xb2Arr, lw.attnPostNorm, dim, eps, invDim)
+      rmsnorm(xb2Arr, xb2Arr, 0, lw.attnPostNorm, dim, eps, invDim)
     }
     accum(xArr, xb2Arr, dim)
 
     // FFN
-    if (isGemma) {
-      rmsnormGemma(xbArr, xArr, lw.rmsFfnWeight, dim, eps, invDim)
-    } else {
-      rmsnorm(xbArr, xArr, lw.rmsFfnWeight, dim, invDim)
-    }
+    rmsnorm(xbArr, xArr, 0, lw.rmsFfnWeight, dim, normEps, invDim)
     matmulSameInput(xbArr, dim, hbArr, lw.w1, hb2Arr, lw.w3, null, null)
     if (isGemma) {
       geluGate(hbArr, hb2Arr, hiddenDim)
@@ -4960,17 +4365,13 @@ function transformer(token, pos, computeLogits) {
     }
     matmulQuantized(xbArr, hbArr, lw.w2)
     if (isGemma && lw.ffnPostNorm) {
-      rmsnormGemma(xbArr, xbArr, lw.ffnPostNorm, dim, eps, invDim)
+      rmsnorm(xbArr, xbArr, 0, lw.ffnPostNorm, dim, eps, invDim)
     }
     accum(xArr, xbArr, dim)
   }
 
   // Final norm
-  if (isGemma) {
-    rmsnormGemma(xArr, xArr, w.rmsFinalWeight, dim, eps, invDim)
-  } else {
-    rmsnorm(xArr, xArr, w.rmsFinalWeight, dim, invDim)
-  }
+  rmsnorm(xArr, xArr, 0, w.rmsFinalWeight, dim, normEps, invDim)
 
   // Classifier into logits
   if (computeLogits !== false) {
@@ -4989,37 +4390,39 @@ function transformer(token, pos, computeLogits) {
   }
 }
 
-// transformerPrefill: the prompt tokens allTokens[startPos .. startPos + n - 1]
-// in one batch. Every weight matrix is read once for the whole batch and only
-// the KV cache is produced.
+// transformerPrefill: tokens allTokens[startPos .. startPos + n - 1] in one
+// batch; every matrix is read once, only the KV cache is produced
 function transformerPrefill(allTokens, startPos, n) {
   var w = weights
   var s = state
-  ensureKvCapacity(s, startPos + n)
+  if (startPos + n > s.kvCapacity) {
+    ensureKvCapacity(s, startPos + n)
+  }
   ensureBatchBuffers(s)
   var isGemma = s.isGemma
   var dim = s.dim
-  var headSize = s.headSize
-  var kvDim = s.kvDim
   var qDim = s.qDim
   var hiddenDim = s.hiddenDim
   var eps = s.rmsNormEps
-  var nLayers = s.nLayers
+  var headSize = s.headSize
   var nHeads = s.nHeads
   var nKvHeads = s.nKvHeads
-  var invDim = s.invDim
   var invHeadSize = s.invHeadSize
-  var headBytesQ8 = s.headBytesQ8
-  var headSeqBytes = s.headSeqBytes
   var attnScale = s.attnScale
   var half = headSize >> 1
-
+  var kvDim = s.kvDim
+  var headBytesQ8 = s.headBytesQ8
+  var headSeqBytes = s.headSeqBytes
   var keyCache = s.keyCache
   var valueCache = s.valueCache
   var keyCacheInt8 = s.keyCacheInt8
   var valueCacheInt8 = s.valueCacheInt8
   var qQ8 = s.qQ8
   var qQ8i8 = s.qQ8i8
+  // Llama norms keep their 1e-5
+  var normEps = isGemma ? eps : 1e-5
+  var nLayers = s.nLayers
+  var invDim = s.invDim
 
   // One buffer of each kind per token
   var bX = s.batchX
@@ -5030,6 +4433,9 @@ function transformerPrefill(allTokens, startPos, n) {
   var bV = s.batchV
   var bHb = s.batchHb
   var bHb2 = s.batchHb2
+  // Float64 staging views: C for QKV, wo and w2, B for w1 and w3
+  var stB = s.batchStageB
+  var stC = s.batchStageC
 
   // Embedding (Gemma: scaling fused into the first rmsnorm)
   for (var b = 0; b < n; b = b + 1) {
@@ -5045,32 +4451,24 @@ function transformerPrefill(allTokens, startPos, n) {
     var kvOnly = l === nLayers - 1
 
     for (var b = 0; b < n; b = b + 1) {
-      if (!isGemma) {
-        rmsnorm(bXb[b], bX[b], lw.rmsAttWeight, dim, invDim)
-      } else if (l === 0) {
+      if (isGemma && l === 0) {
         // First layer: fused embed scale + rmsnorm
-        rmsnormGemmaFusedScale(
-          bXb[b],
-          bX[b],
-          lw.rmsAttWeight,
-          dim,
-          eps,
-          invDim,
-          s.embedScale
-        )
+        rmsnormGemmaFusedScale(bXb[b], bX[b], lw.rmsAttWeight, dim, eps, invDim, s.embedScale)
       } else {
-        rmsnormGemma(bXb[b], bX[b], lw.rmsAttWeight, dim, eps, invDim)
+        rmsnorm(bXb[b], bX[b], 0, lw.rmsAttWeight, dim, normEps, invDim)
       }
     }
 
-    // QKV matmuls
+    // QKV matmuls; the first float tile (odd kind) fills the staging
+    var tq = !kvOnly && (lw.wq.k.kind & 1) !== 0
+    var tk = (lw.wk.k.kind & 1) !== 0
     if (!kvOnly) {
-      matmulQuantizedBatch(bQ, bXb, lw.wq, n)
+      matmulQuantizedBatch(bQ, bXb, lw.wq, n, stC, tq)
     }
-    matmulQuantizedBatch(bK, bXb, lw.wk, n)
-    matmulQuantizedBatch(bV, bXb, lw.wv, n)
+    matmulQuantizedBatch(bK, bXb, lw.wk, n, stC, tk && !tq)
+    matmulQuantizedBatch(bV, bXb, lw.wv, n, stC, (lw.wv.k.kind & 1) !== 0 && !tq && !tk)
 
-    // Per token: QK norms, RoPE, KV cache write, attention
+    // QK norms, RoPE, KV cache write, attention of every token
     var loff = l * s.kvCacheLayerSize
     var isSwaLayer =
       isGemma && s.swaPattern > 0 && l % s.swaPattern < s.swaPattern - 1
@@ -5089,25 +4487,11 @@ function transformerPrefill(allTokens, startPos, n) {
         if (lw.attnQNorm && lw.attnKNorm) {
           if (!kvOnly) {
             for (var h = 0; h < nHeads; h = h + 1) {
-              rmsnormGemmaAt(
-                qArr,
-                h * headSize,
-                lw.attnQNorm,
-                headSize,
-                eps,
-                invHeadSize
-              )
+              rmsnorm(qArr, qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
             }
           }
           for (var h = 0; h < nKvHeads; h = h + 1) {
-            rmsnormGemmaAt(
-              kArr,
-              h * headSize,
-              lw.attnKNorm,
-              headSize,
-              eps,
-              invHeadSize
-            )
+            rmsnorm(kArr, kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
           }
         }
         // NEOX RoPE with fused attnScale on Q
@@ -5167,9 +4551,7 @@ function transformerPrefill(allTokens, startPos, n) {
       // Quantize all Q heads to Q8_0
       quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-      zeroFloats(xbArr, qDim)
-
-      // SWA window enforcement
+        // SWA window enforcement
       var startT =
         isSwaLayer && config.swaWindow > 0
           ? Math.max(0, pos - config.swaWindow + 1)
@@ -5183,24 +4565,21 @@ function transformerPrefill(allTokens, startPos, n) {
     }
 
     // Attention output
-    matmulQuantizedBatch(bXb2, bXb, lw.wo, n)
+    matmulQuantizedBatch(bXb2, bXb, lw.wo, n, stC, (lw.wo.k.kind & 1) !== 0)
     for (var b = 0; b < n; b = b + 1) {
       if (isGemma && lw.attnPostNorm) {
-        rmsnormGemma(bXb2[b], bXb2[b], lw.attnPostNorm, dim, eps, invDim)
+        rmsnorm(bXb2[b], bXb2[b], 0, lw.attnPostNorm, dim, eps, invDim)
       }
       accum(bX[b], bXb2[b], dim)
     }
 
     // FFN
     for (var b = 0; b < n; b = b + 1) {
-      if (isGemma) {
-        rmsnormGemma(bXb[b], bX[b], lw.rmsFfnWeight, dim, eps, invDim)
-      } else {
-        rmsnorm(bXb[b], bX[b], lw.rmsFfnWeight, dim, invDim)
-      }
+      rmsnorm(bXb[b], bX[b], 0, lw.rmsFfnWeight, dim, normEps, invDim)
     }
-    matmulQuantizedBatch(bHb, bXb, lw.w1, n)
-    matmulQuantizedBatch(bHb2, bXb, lw.w3, n)
+    var t1 = (lw.w1.k.kind & 1) !== 0
+    matmulQuantizedBatch(bHb, bXb, lw.w1, n, stB, t1)
+    matmulQuantizedBatch(bHb2, bXb, lw.w3, n, stB, (lw.w3.k.kind & 1) !== 0 && !t1)
     for (var b = 0; b < n; b = b + 1) {
       if (isGemma) {
         geluGate(bHb[b], bHb2[b], hiddenDim)
@@ -5208,10 +4587,11 @@ function transformerPrefill(allTokens, startPos, n) {
         siluGate(bHb[b], bHb2[b], hiddenDim)
       }
     }
-    matmulQuantizedBatch(bXb, bHb, lw.w2, n)
+    // hb is consumed by its staging (w2 is its only reader)
+    matmulQuantizedBatch(bXb, bHb, lw.w2, n, stC, (lw.w2.k.kind & 1) !== 0)
     for (var b = 0; b < n; b = b + 1) {
       if (isGemma && lw.ffnPostNorm) {
-        rmsnormGemma(bXb[b], bXb[b], lw.ffnPostNorm, dim, eps, invDim)
+        rmsnorm(bXb[b], bXb[b], 0, lw.ffnPostNorm, dim, eps, invDim)
       }
       accum(bX[b], bXb[b], dim)
     }
@@ -5227,14 +4607,13 @@ function transformerPrefill(allTokens, startPos, n) {
   }
 }
 
-// Dequantize one token's embedding row into dst (through the matrix view when
-// the format has a row dequantizer)
+// Dequantize one token's embedding row into dst
 function embedToken(dst, token) {
   var emb = weights.tokenEmbedding
-  if (emb.deqRowFunc) {
-    emb.deqRowFunc(
-      emb.deqView,
-      emb.base + (token * emb.rowSize) / emb.deqView.BYTES_PER_ELEMENT,
+  if (emb.k.kind === 3) {
+    emb.k.deqRowFunc(
+      emb.view,
+      emb.base + (token * emb.rowSize) / emb.view.BYTES_PER_ELEMENT,
       dst,
       0,
       emb.cols
@@ -5378,9 +4757,8 @@ function sample(logits, temp) {
 // ----------------------------------------------------------------------------
 // Tokenizer
 
-// Vocab strings stay as bytes in the GGUF buffer and are decoded on demand.
-// Offset of token i: its sparse checkpoint plus the lengths of the tokens
-// before it in the bucket (at most 255 adds).
+// Vocab strings stay in the GGUF buffer; offset of token i: its checkpoint plus
+// the lengths of the tokens before it in the bucket
 function vocabOffsetOf(i) {
   var bucket = i >> 8
   var base = tokenizer.vocabSparseCum[bucket]
@@ -5406,10 +4784,9 @@ function vocabString(i) {
   return decodeUTF8(ggufUint8.subarray(off, off + len))
 }
 
-// Tokenizer lookup: chained hash table over the bytes of every non-empty token,
-// built on the first bpeEncode() of a generate() call and released once the
-// prompt is encoded (head[hash & mask] = highest id of the chain, next[id] =
-// the next lower one, -1 ends it).
+// Tokenizer lookup: chained hash table over the token bytes, built on the first
+// bpeEncode() of a generate() call and released after the prompt (head[hash &
+// mask] = highest id of the chain, next[id] = the next lower one, -1 ends)
 var vocabHashHead = null
 var vocabHashNext = null
 
@@ -5473,8 +4850,7 @@ function buildVocabHash() {
   for (var b = 0; b < buckets; b = b + 1) {
     head[b] = -1
   }
-  // Running byte offset of token i, re-anchored at every sparse checkpoint
-  // (same walk as findSpecialToken)
+  // Byte offset of token i, re-anchored at every checkpoint
   var off = 0
   for (var i = 0; i < vocabLen; i = i + 1) {
     if ((i & 255) === 0) {
@@ -5495,9 +4871,8 @@ function buildVocabHash() {
   vocabHashNext = next
 }
 
-// First use of the vocabulary (first generate() call): per-token byte lengths
-// (Uint8 when every token is shorter than 256 bytes), one offset checkpoint
-// every 256 tokens, and the model-specific end-of-turn token
+// First use of the vocabulary: per-token byte lengths, one offset checkpoint
+// every 256 tokens, the end-of-turn token
 function ensureVocabTables() {
   var t = tokenizer
   if (t.vocabLengths !== null) {
@@ -5529,8 +4904,7 @@ function ensureVocabTables() {
   }
 }
 
-// Id of a special token given its text: a linear scan of the token strings in
-// the file, done once per text (the few lookups of a model are cached)
+// Id of a special token given its text (linear scan, cached per text)
 function findSpecialToken(tokenStr) {
   var cache = tokenizer.specialTokens
   if (cache[tokenStr] !== undefined) {
@@ -5789,8 +5163,7 @@ function decodeToken(token) {
   return decodeUTF8(bytes)
 }
 
-// Longest token whose bytes are a prefix of bytes[pos .. pos + limit), or -1:
-// the hash of every prefix is looked up as it grows, the last hit wins.
+// Longest token that is a prefix of bytes[pos .. pos + limit), or -1
 function vocabLongestMatch(bytes, pos, limit) {
   var head = vocabHashHead
   var next = vocabHashNext
@@ -6062,7 +5435,7 @@ function generate(chatHistory) {
   // Token stream for repeat detection (avoids string search on growing output)
   var generatedTokens = []
 
-  // Use streaming UTF-8 decoder for Llama to handle multi-byte sequences across token boundaries
+  // Streaming UTF-8 decoder for Llama (sequences cut by token boundaries)
   var streamDecoder = config.isGemma ? null : createStreamingUTF8Decoder()
 
   var effectiveMaxTokens = maxTokens
@@ -6070,12 +5443,10 @@ function generate(chatHistory) {
     effectiveMaxTokens = config.seqLen
   }
 
-  // Reuse the KV cache of the previous call: the positions whose tokens match
-  // the start of this prompt keep their keys and values. The last prompt token
-  // always runs again (its logits are needed). With Q8_0 layer matrices only
-  // the positions written by the batched prefill are kept: the single-token
-  // Q8_0 kernel sums in another order, so a position it wrote is not
-  // bit-identical to a prefilled one.
+  // Reuse the KV cache of the previous call: positions whose tokens match the
+  // start of this prompt stay (the last prompt token always runs again). With
+  // Q8_0 layer matrices only prefilled positions are kept: the single-token
+  // kernel sums in another order
   var kvTokens = state.kvTokens
   var reuse = state.kvCount
   if (weights.q8Layers && reuse > state.kvBatch) {
@@ -6200,8 +5571,7 @@ function generate(chatHistory) {
     }
   }
 
-  // A prompt longer than the context window ran past the end of the KV cache:
-  // nothing of it can be trusted by the next call.
+  // A prompt longer than the context ran past the KV cache: nothing is trusted
   if (numPromptTokens - 1 > config.seqLen) {
     state.kvCount = 0
     state.kvBatch = 0
