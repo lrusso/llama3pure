@@ -247,7 +247,7 @@ typedef struct {
     cached_q8_func q8_func;        // cached Q8_0 input dot function
     cached_dot_func dot_func;      // cached float input dot function
     deq_row_func deq_func;        // cached dequantize-row function (Q8_0 + K-quants)
-    rows4_func rows4_func;        // cached 4-row float conversion (F16, BF16, F32)
+    rows4_func rows4_func;        // cached 4-row interleaved conversion (float formats, Q8_0, K-quants)
 } QuantizedTensor;
 
 typedef struct {
@@ -292,8 +292,8 @@ typedef struct {
     float *att;    // buffer for scores/attention values (n_heads, seq_len)
     float *logits; // output logits
     // kv cache - Q8_0 quantized for memory efficiency (34 bytes per 32 floats)
-    uint8_t* key_cache;    // Q8_0 quantized (layer, seq_len, kv_dim)
-    uint8_t* value_cache;  // Q8_0 quantized (layer, seq_len, kv_dim)
+    uint8_t* key_cache;    // Q8_0 KV cache, [layer][kv_head][position][K head, V head]
+    uint8_t* value_cache;  // key_cache + head_q8_bytes: the V head of every position
     // pre-computed RoPE frequencies (avoids powf in hot loop)
     float* rope_freqs;      // (head_size / 2,) - for dense (non-SWA) layers
     float* rope_freqs_swa;  // (head_size / 2,) - for SWA layers (different theta)
@@ -308,7 +308,8 @@ typedef struct {
     int kv_dim;
     int q_dim;
     int kv_mul;
-    size_t head_seq_bytes;       // seq_len * head_q8_bytes (per-head KV stride)
+    size_t head_seq_bytes;       // seq_len * kv_pos_bytes (per-head KV stride)
+    int kv_pos_bytes;            // 2 * head_q8_bytes: K and V of one position
     size_t kv_cache_layer_size;  // n_kv_heads * head_seq_bytes (for layer offset calculation)
     int head_q8_bytes;        // bytes per head in Q8_0 format (precomputed)
     float attn_scale;         // 1/sqrt(head_size) for attention scaling
@@ -372,17 +373,19 @@ void malloc_run_state(RunState* s, Config* p) {
     s->att = calloc((size_t)p->n_heads * p->seq_len, sizeof(float));
     s->logits = NULL;  // set by use_logits_buffer() once the prefill is done
     // Q8_0 KV cache: 34 bytes per 32 floats
-    // Per-head layout: [layer][kv_head][position][head_data] for cache locality
+    // Per-head layout: [layer][kv_head][position][K head][V head] for cache
+    // locality; K and V of a position side by side, so the pages the positions
+    // used so far touch are as few as possible (calloc only maps what is written)
     int head_q8_bytes_init = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
-    int head_seq_bytes = p->seq_len * head_q8_bytes_init;
-    int kv_cache_layer_bytes = p->n_kv_heads * head_seq_bytes;
+    size_t head_seq_bytes = (size_t)p->seq_len * 2 * head_q8_bytes_init;
+    size_t kv_cache_layer_bytes = p->n_kv_heads * head_seq_bytes;
     size_t kv_cache_total = (size_t)p->n_layers * kv_cache_layer_bytes;
     s->key_cache = calloc(kv_cache_total, 1);
-    s->value_cache = calloc(kv_cache_total, 1);
-    if (!s->key_cache || !s->value_cache) {
+    s->value_cache = s->key_cache ? s->key_cache + head_q8_bytes_init : NULL;
+    if (!s->key_cache) {
         fprintf(stderr, "Failed to allocate KV cache (%.1f GB requested per cache, %.1f GB total)\n",
-                (double)kv_cache_total / (1024.0 * 1024.0 * 1024.0),
-                (double)kv_cache_total * 2.0 / (1024.0 * 1024.0 * 1024.0));
+                (double)kv_cache_total / 2.0 / (1024.0 * 1024.0 * 1024.0),
+                (double)kv_cache_total / (1024.0 * 1024.0 * 1024.0));
         fprintf(stderr, "Try reducing with: -context_size 4096\n");
         exit(1);
     }
@@ -425,7 +428,8 @@ void malloc_run_state(RunState* s, Config* p) {
     s->kv_mul = kv_mul;
     int head_q8_bytes = (head_size / QK8_0) * Q8_0_BLOCK_SIZE;
     s->head_q8_bytes = head_q8_bytes;
-    s->head_seq_bytes = p->seq_len * head_q8_bytes;
+    s->kv_pos_bytes = 2 * head_q8_bytes;
+    s->head_seq_bytes = (size_t)p->seq_len * s->kv_pos_bytes;
     s->kv_cache_layer_size = p->n_kv_heads * s->head_seq_bytes;
     s->attn_scale = 1.0f / sqrtf((float)head_size);
     s->embed_scale = sqrtf((float)p->dim);
@@ -473,7 +477,7 @@ void malloc_run_state(RunState* s, Config* p) {
 
     if (!s->x || !s->xb || !s->xb2 || !s->hb || !s->hb2 || !s->q
      || !s->k || !s->v || !s->att || !s->key_cache
-     || !s->value_cache || !s->rope_freqs || !s->rope_freqs_swa
+     || !s->rope_freqs || !s->rope_freqs_swa
      || !s->rope_cos_all || !s->rope_sin_all || !s->rope_cos_swa_all || !s->rope_sin_swa_all
      || !s->head_q_offsets || !s->head_att_offsets
      || !s->head_kv_indices || !s->head_kv_byte_offsets
@@ -555,8 +559,7 @@ void free_run_state(RunState* s) {
     free(s->k);
     free(s->v);
     free(s->att);
-    free(s->key_cache);
-    free(s->value_cache);
+    free(s->key_cache);  // value_cache points inside it
     free(s->rope_freqs);
     free(s->rope_freqs_swa);
     free(s->rope_cos_all);
@@ -631,6 +634,14 @@ static inline uint16_t fp32_to_fp16(float f) {
     if (exp >= 31) return sign | 0x7C00;
     return sign | (exp << 10) | mant;
 }
+
+// The hot kernels start on a 64-byte boundary (one instruction-fetch line), so
+// their speed does not move with the code laid out before them
+#if defined(__GNUC__)
+#define HOT_KERNEL __attribute__((aligned(64)))
+#else
+#define HOT_KERNEL
+#endif
 
 // BF16 (bfloat16) to FP32 conversion
 // BF16 is simply the upper 16 bits of a float32
@@ -722,7 +733,7 @@ void dequantize_row_q5_1(const void* src, float* dst, int k) {
     }
 }
 
-void dequantize_row_q8_0(const void* src, float* restrict dst, int k) {
+void HOT_KERNEL dequantize_row_q8_0(const void* src, float* restrict dst, int k) {
     const block_q8_0* blocks = (const block_q8_0*)src;
     int nb = k / QK8_0;
 
@@ -754,7 +765,7 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t
     }
 }
 
-void dequantize_row_q4_K(const void* src, float* restrict dst, int k) {
+void HOT_KERNEL dequantize_row_q4_K(const void* src, float* restrict dst, int k) {
     const block_q4_K* blocks = (const block_q4_K*)src;
     int nb = k / QK_K;
 
@@ -798,7 +809,7 @@ static inline void dequantize_q2_K_32(float* restrict y, const uint8_t* restrict
     }
 }
 
-void dequantize_row_q2_K(const void* src, float* restrict dst, int k) {
+void HOT_KERNEL dequantize_row_q2_K(const void* src, float* restrict dst, int k) {
     const block_q2_K* blocks = (const block_q2_K*)src;
     int nb = k / QK_K;
 
@@ -829,7 +840,7 @@ void dequantize_row_q2_K(const void* src, float* restrict dst, int k) {
     }
 }
 
-void dequantize_row_q3_K(const void* src, float* restrict dst, int k) {
+void HOT_KERNEL dequantize_row_q3_K(const void* src, float* restrict dst, int k) {
     const block_q3_K* x = (const block_q3_K*)src;
     int nb = k / QK_K;
 
@@ -872,7 +883,7 @@ void dequantize_row_q3_K(const void* src, float* restrict dst, int k) {
     }
 }
 
-void dequantize_row_q5_K(const void* src, float* dst, int k) {
+void HOT_KERNEL dequantize_row_q5_K(const void* src, float* dst, int k) {
     const block_q5_K* x = (const block_q5_K*)src;
     int nb = k / QK_K;
 
@@ -911,7 +922,7 @@ void dequantize_row_q5_K(const void* src, float* dst, int k) {
     }
 }
 
-void dequantize_row_q6_K(const void* src, float* restrict dst, int k) {
+void HOT_KERNEL dequantize_row_q6_K(const void* src, float* restrict dst, int k) {
     const block_q6_K* x = (const block_q6_K*)src;
     int nb = k / QK_K;
 
@@ -1583,7 +1594,7 @@ static void quantize_row_q8_0(const float* x, block_q8_0* y, int n) {
 // Q8_0 format: 2 bytes (FP16 scale) + 32 bytes (int8 quants) = 34 bytes per 32 floats
 
 // Quantize a float vector to Q8_0 format in cache buffer
-static void quantize_to_q8_0_cache(const float* src, uint8_t* dst, int count) {
+static void HOT_KERNEL quantize_to_q8_0_cache(const float* src, uint8_t* dst, int count) {
     int nb = count / QK8_0;
     int bo = 0;
 
@@ -1622,7 +1633,7 @@ static void quantize_to_q8_0_cache(const float* src, uint8_t* dst, int count) {
 
 // Dot product of Q8_0 quantized query with Q8_0 cached key (int8 * int8)
 // Both sides are Q8_0: avoids float*int8, uses cheaper integer arithmetic
-static float dot_q8_0_q8_0_cache(const uint8_t* aQ8, const int8_t* aI8,
+static float HOT_KERNEL dot_q8_0_q8_0_cache(const uint8_t* aQ8, const int8_t* aI8,
                                   const uint8_t* bQ8, const int8_t* bI8, int count) {
     int nb = count / QK8_0;
     float sum = 0.0f;
@@ -1648,7 +1659,7 @@ static float dot_q8_0_q8_0_cache(const uint8_t* aQ8, const int8_t* aI8,
 }
 
 // Weighted accumulation from Q8_0 cached value to float output
-static void accum_q8_0_cache(float* out, const uint8_t* cache, float weight, int count) {
+static void HOT_KERNEL accum_q8_0_cache(float* restrict out, const uint8_t* restrict cache, float weight, int count) {
     // Skip near-zero attention weights
     if (weight > -1e-8f && weight < 1e-8f) {
         return;
@@ -2337,7 +2348,7 @@ static void dot4_b32_q8_0_min(const int8_t* restrict w8, int n, const float* res
 // region (at most PREFILL_BATCH_SIZE * nb <= n ints), so nothing overlaps.
 
 // Block-32 matmul for one Q8_0-quantized activation row, 4 weight rows per pass.
-static void matmul_b32_q8_0(float* xout, const QuantizedTensor* qw, const block_q8_0* xq,
+static void HOT_KERNEL matmul_b32_q8_0(float* xout, const QuantizedTensor* qw, const block_q8_0* xq,
                             unpack_b32_func unpack, int has_min) {
     int d = qw->rows;
     int n = qw->cols;
@@ -2376,7 +2387,7 @@ static void matmul_b32_q8_0(float* xout, const QuantizedTensor* qw, const block_
 
 // Batched block-32 matmul: every 4-row group is unpacked once and multiplied
 // with all the quantized activation rows of the batch.
-static void matmul_b32_q8_0_batch(float* xout, const QuantizedTensor* qw, int batch_size, int out_stride,
+static void HOT_KERNEL matmul_b32_q8_0_batch(float* xout, const QuantizedTensor* qw, int batch_size, int out_stride,
                                   const block_q8_0* q8_bufs, int q8_stride,
                                   unpack_b32_func unpack, int has_min) {
     int d = qw->rows;
@@ -2451,7 +2462,7 @@ typedef uint16_t fp16_elem;
 #define FP16_ELEM_TO_FP32(v) fp16_to_fp32(v)
 #endif
 
-static void rows4_f16(const void* src, size_t row_size, float* restrict dst, int k) {
+static void HOT_KERNEL rows4_f16(const void* src, size_t row_size, float* restrict dst, int k) {
     const fp16_elem* restrict r0 = (const fp16_elem*)src;
     const fp16_elem* restrict r1 = (const fp16_elem*)((const char*)src + row_size);
     const fp16_elem* restrict r2 = (const fp16_elem*)((const char*)src + 2 * row_size);
@@ -2464,7 +2475,7 @@ static void rows4_f16(const void* src, size_t row_size, float* restrict dst, int
     }
 }
 
-static void rows4_bf16(const void* src, size_t row_size, float* restrict dst, int k) {
+static void HOT_KERNEL rows4_bf16(const void* src, size_t row_size, float* restrict dst, int k) {
     const uint16_t* restrict r0 = (const uint16_t*)src;
     const uint16_t* restrict r1 = (const uint16_t*)((const char*)src + row_size);
     const uint16_t* restrict r2 = (const uint16_t*)((const char*)src + 2 * row_size);
@@ -2477,7 +2488,7 @@ static void rows4_bf16(const void* src, size_t row_size, float* restrict dst, in
     }
 }
 
-static void rows4_f32(const void* src, size_t row_size, float* restrict dst, int k) {
+static void HOT_KERNEL rows4_f32(const void* src, size_t row_size, float* restrict dst, int k) {
     const float* restrict r0 = (const float*)src;
     const float* restrict r1 = (const float*)((const char*)src + row_size);
     const float* restrict r2 = (const float*)((const char*)src + 2 * row_size);
@@ -2490,11 +2501,232 @@ static void rows4_f32(const void* src, size_t row_size, float* restrict dst, int
     }
 }
 
-// Get the 4-row float conversion for a tensor (NULL: not a float format, or
-// rows whose length is not a multiple of 4)
+// 4 rows of Q8_0 blocks (k a multiple of 32) -> interleaved floats, the same
+// (float)q * d per element as dequantize_row_q8_0, without the per-row float
+// pass of rows4_convert
+static void HOT_KERNEL rows4_q8_0(const void* src, size_t row_size, float* restrict dst, int k) {
+    const block_q8_0* restrict b0 = (const block_q8_0*)src;
+    const block_q8_0* restrict b1 = (const block_q8_0*)((const char*)src + row_size);
+    const block_q8_0* restrict b2 = (const block_q8_0*)((const char*)src + 2 * row_size);
+    const block_q8_0* restrict b3 = (const block_q8_0*)((const char*)src + 3 * row_size);
+    int nb = k / QK8_0;
+    for (int i = 0; i < nb; i++) {
+        const float d0 = fp16_to_fp32(b0[i].d);
+        const float d1 = fp16_to_fp32(b1[i].d);
+        const float d2 = fp16_to_fp32(b2[i].d);
+        const float d3 = fp16_to_fp32(b3[i].d);
+        const int8_t* restrict q0 = b0[i].qs;
+        const int8_t* restrict q1 = b1[i].qs;
+        const int8_t* restrict q2 = b2[i].qs;
+        const int8_t* restrict q3 = b3[i].qs;
+        float* restrict out = dst + i * (4 * QK8_0);
+        for (int j = 0; j < QK8_0; j++) {
+            out[4 * j]     = q0[j] * d0;
+            out[4 * j + 1] = q1[j] * d1;
+            out[4 * j + 2] = q2[j] * d2;
+            out[4 * j + 3] = q3[j] * d3;
+        }
+    }
+}
+
+// 4 rows of a Q2_K / Q4_K block -> interleaved floats: the per-element
+// expressions of the row dequantizers above, one row per lane of 4, written
+// straight into the interleaved layout (no per-row float pass). Each inner loop
+// stores one group of 4 streams, which the compiler turns into interleaved
+// vector stores. (Q3_K, Q5_K and Q6_K read two sources per weight and spill
+// registers in this form, so they keep the row dequantizers.)
+#define ROWS4_K_HEAD(BLOCK) \
+    const BLOCK* b[4]; \
+    for (int r = 0; r < 4; r++) b[r] = (const BLOCK*)((const char*)src + r * row_size); \
+    int nb = k / QK_K;
+
+static void HOT_KERNEL rows4_q4_K(const void* src, size_t row_size, float* restrict dst, int k) {
+    ROWS4_K_HEAD(block_q4_K)
+    for (int i = 0; i < nb; i++) {
+        float d[4], dmin[4];
+        const uint8_t* q[4];
+        for (int r = 0; r < 4; r++) {
+            d[r] = fp16_to_fp32(b[r][i].d);
+            dmin[r] = fp16_to_fp32(b[r][i].dmin);
+            q[r] = b[r][i].qs;
+        }
+        float* restrict out = dst + i * (4 * QK_K);
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            float d1[4], m1[4], d2[4], m2[4];
+            for (int r = 0; r < 4; r++) {
+                uint8_t sc, m;
+                get_scale_min_k4(is + 0, b[r][i].scales, &sc, &m);
+                d1[r] = d[r] * sc;
+                m1[r] = dmin[r] * m;
+                get_scale_min_k4(is + 1, b[r][i].scales, &sc, &m);
+                d2[r] = d[r] * sc;
+                m2[r] = dmin[r] * m;
+            }
+            const uint8_t* restrict q0 = q[0];
+            const uint8_t* restrict q1 = q[1];
+            const uint8_t* restrict q2 = q[2];
+            const uint8_t* restrict q3 = q[3];
+            float* restrict lo = out;
+            float* restrict hi = out + 4 * 32;
+            for (int l = 0; l < 32; ++l) {
+                lo[4 * l]     = d1[0] * (q0[l] & 0xF) - m1[0];
+                lo[4 * l + 1] = d1[1] * (q1[l] & 0xF) - m1[1];
+                lo[4 * l + 2] = d1[2] * (q2[l] & 0xF) - m1[2];
+                lo[4 * l + 3] = d1[3] * (q3[l] & 0xF) - m1[3];
+            }
+            for (int l = 0; l < 32; ++l) {
+                hi[4 * l]     = d2[0] * (q0[l] >> 4) - m2[0];
+                hi[4 * l + 1] = d2[1] * (q1[l] >> 4) - m2[1];
+                hi[4 * l + 2] = d2[2] * (q2[l] >> 4) - m2[2];
+                hi[4 * l + 3] = d2[3] * (q3[l] >> 4) - m2[3];
+            }
+            out += 4 * 64;
+            for (int r = 0; r < 4; r++) q[r] += 32;
+            is += 2;
+        }
+    }
+}
+
+// 32 Q2_K values of 4 rows at one 2-bit position (see dequantize_q2_K_32)
+static inline void rows4_q2_K_32(float* restrict out, const uint8_t* const* q, int shift,
+                                 const float* dl1, const float* ml1, const float* dl2, const float* ml2) {
+    const uint8_t* restrict q0 = q[0];
+    const uint8_t* restrict q1 = q[1];
+    const uint8_t* restrict q2 = q[2];
+    const uint8_t* restrict q3 = q[3];
+    float* restrict hi = out + 4 * 16;
+    for (int l = 0; l < 16; ++l) {
+        out[4 * l]     = dl1[0] * ((q0[l] >> shift) & 3) - ml1[0];
+        out[4 * l + 1] = dl1[1] * ((q1[l] >> shift) & 3) - ml1[1];
+        out[4 * l + 2] = dl1[2] * ((q2[l] >> shift) & 3) - ml1[2];
+        out[4 * l + 3] = dl1[3] * ((q3[l] >> shift) & 3) - ml1[3];
+    }
+    for (int l = 0; l < 16; ++l) {
+        hi[4 * l]     = dl2[0] * ((q0[l + 16] >> shift) & 3) - ml2[0];
+        hi[4 * l + 1] = dl2[1] * ((q1[l + 16] >> shift) & 3) - ml2[1];
+        hi[4 * l + 2] = dl2[2] * ((q2[l + 16] >> shift) & 3) - ml2[2];
+        hi[4 * l + 3] = dl2[3] * ((q3[l + 16] >> shift) & 3) - ml2[3];
+    }
+}
+
+static void HOT_KERNEL rows4_q2_K(const void* src, size_t row_size, float* restrict dst, int k) {
+    ROWS4_K_HEAD(block_q2_K)
+    for (int i = 0; i < nb; i++) {
+        float d[4], min[4];
+        const uint8_t* q[4];
+        const uint8_t* scales[4];
+        for (int r = 0; r < 4; r++) {
+            d[r] = fp16_to_fp32(b[r][i].d);
+            min[r] = fp16_to_fp32(b[r][i].dmin);
+            q[r] = b[r][i].qs;
+            scales[r] = b[r][i].scales;
+        }
+        float* restrict out = dst + i * (4 * QK_K);
+        for (int n = 0; n < QK_K; n += 128) {
+            float dl[8][4], ml[8][4];
+            for (int r = 0; r < 4; r++) {
+                for (int j = 0; j < 8; ++j) {
+                    uint8_t sc = scales[r][j];
+                    dl[j][r] = d[r] * (sc & 0xF);
+                    ml[j][r] = min[r] * (sc >> 4);
+                }
+            }
+            rows4_q2_K_32(out, q, 0, dl[0], ml[0], dl[1], ml[1]);
+            rows4_q2_K_32(out + 4 * 32, q, 2, dl[2], ml[2], dl[3], ml[3]);
+            rows4_q2_K_32(out + 4 * 64, q, 4, dl[4], ml[4], dl[5], ml[5]);
+            rows4_q2_K_32(out + 4 * 96, q, 6, dl[6], ml[6], dl[7], ml[7]);
+            out += 4 * 128;
+            for (int r = 0; r < 4; r++) {
+                q[r] += 32;
+                scales[r] += 8;
+            }
+        }
+    }
+}
+
+// 4 rows of Q6_K blocks -> interleaved floats (per-element expressions of
+// dequantize_row_q6_K). Only the whole-row kernel of the output projection uses
+// it: in the chunked kernel it loses to the row dequantizer (two sources per
+// weight spill registers)
+static void rows4_q6_K(const void* src, size_t row_size, float* restrict dst, int k) {
+    ROWS4_K_HEAD(block_q6_K)
+    for (int i = 0; i < nb; i++) {
+        float d[4];
+        const uint8_t* ql[4];
+        const uint8_t* qh[4];
+        const int8_t* sc[4];
+        for (int r = 0; r < 4; r++) {
+            d[r] = fp16_to_fp32(b[r][i].d);
+            ql[r] = b[r][i].ql;
+            qh[r] = b[r][i].qh;
+            sc[r] = b[r][i].scales;
+        }
+        float* restrict out = dst + i * (4 * QK_K);
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int h = 0; h < 2; h++) {
+                float d0[4], d2[4], d4[4], d6[4];
+                for (int r = 0; r < 4; r++) {
+                    d0[r] = d[r] * sc[r][h + 0];
+                    d2[r] = d[r] * sc[r][h + 2];
+                    d4[r] = d[r] * sc[r][h + 4];
+                    d6[r] = d[r] * sc[r][h + 6];
+                }
+                const uint8_t* restrict l0 = ql[0] + 16 * h;
+                const uint8_t* restrict l1 = ql[1] + 16 * h;
+                const uint8_t* restrict l2 = ql[2] + 16 * h;
+                const uint8_t* restrict l3 = ql[3] + 16 * h;
+                const uint8_t* restrict h0 = qh[0] + 16 * h;
+                const uint8_t* restrict h1 = qh[1] + 16 * h;
+                const uint8_t* restrict h2 = qh[2] + 16 * h;
+                const uint8_t* restrict h3 = qh[3] + 16 * h;
+                float* restrict y0 = out + 4 * (16 * h);
+                float* restrict y1 = y0 + 4 * 32;
+                float* restrict y2 = y0 + 4 * 64;
+                float* restrict y3 = y0 + 4 * 96;
+                for (int l = 0; l < 16; ++l) {
+                    y0[4 * l]     = d0[0] * ((int8_t)((l0[l] & 0xF) | (((h0[l] >> 0) & 3) << 4)) - 32);
+                    y0[4 * l + 1] = d0[1] * ((int8_t)((l1[l] & 0xF) | (((h1[l] >> 0) & 3) << 4)) - 32);
+                    y0[4 * l + 2] = d0[2] * ((int8_t)((l2[l] & 0xF) | (((h2[l] >> 0) & 3) << 4)) - 32);
+                    y0[4 * l + 3] = d0[3] * ((int8_t)((l3[l] & 0xF) | (((h3[l] >> 0) & 3) << 4)) - 32);
+                }
+                for (int l = 0; l < 16; ++l) {
+                    y1[4 * l]     = d2[0] * ((int8_t)((l0[l + 32] & 0xF) | (((h0[l] >> 2) & 3) << 4)) - 32);
+                    y1[4 * l + 1] = d2[1] * ((int8_t)((l1[l + 32] & 0xF) | (((h1[l] >> 2) & 3) << 4)) - 32);
+                    y1[4 * l + 2] = d2[2] * ((int8_t)((l2[l + 32] & 0xF) | (((h2[l] >> 2) & 3) << 4)) - 32);
+                    y1[4 * l + 3] = d2[3] * ((int8_t)((l3[l + 32] & 0xF) | (((h3[l] >> 2) & 3) << 4)) - 32);
+                }
+                for (int l = 0; l < 16; ++l) {
+                    y2[4 * l]     = d4[0] * ((int8_t)((l0[l] >> 4) | (((h0[l] >> 4) & 3) << 4)) - 32);
+                    y2[4 * l + 1] = d4[1] * ((int8_t)((l1[l] >> 4) | (((h1[l] >> 4) & 3) << 4)) - 32);
+                    y2[4 * l + 2] = d4[2] * ((int8_t)((l2[l] >> 4) | (((h2[l] >> 4) & 3) << 4)) - 32);
+                    y2[4 * l + 3] = d4[3] * ((int8_t)((l3[l] >> 4) | (((h3[l] >> 4) & 3) << 4)) - 32);
+                }
+                for (int l = 0; l < 16; ++l) {
+                    y3[4 * l]     = d6[0] * ((int8_t)((l0[l + 32] >> 4) | (((h0[l] >> 6) & 3) << 4)) - 32);
+                    y3[4 * l + 1] = d6[1] * ((int8_t)((l1[l + 32] >> 4) | (((h1[l] >> 6) & 3) << 4)) - 32);
+                    y3[4 * l + 2] = d6[2] * ((int8_t)((l2[l + 32] >> 4) | (((h2[l] >> 6) & 3) << 4)) - 32);
+                    y3[4 * l + 3] = d6[3] * ((int8_t)((l3[l + 32] >> 4) | (((h3[l] >> 6) & 3) << 4)) - 32);
+                }
+            }
+            out += 4 * 128;
+            for (int r = 0; r < 4; r++) {
+                ql[r] += 64;
+                qh[r] += 32;
+                sc[r] += 8;
+            }
+        }
+    }
+}
+
+// Get the 4-row conversion for a tensor (NULL: a format without one, or rows
+// whose length is not a multiple of 4)
 static inline rows4_func get_rows4_func(enum ggml_type type, int n_cols) {
     if (n_cols & 3) return NULL;
     switch (type) {
+        case GGML_TYPE_Q8_0:  return (n_cols % QK8_0) ? NULL : rows4_q8_0;
+        case GGML_TYPE_Q2_K:  return (n_cols % QK_K) ? NULL : rows4_q2_K;
+        case GGML_TYPE_Q4_K:  return (n_cols % QK_K) ? NULL : rows4_q4_K;
         case GGML_TYPE_F16:   return rows4_f16;
         case GGML_TYPE_BF16:
         case GGML_TYPE_BF16_ALT: return rows4_bf16;
@@ -2503,9 +2735,10 @@ static inline rows4_func get_rows4_func(enum ggml_type type, int n_cols) {
     }
 }
 
-// Columns converted per step: one K-quant block, 8 Q8_0 blocks (the converted
-// rows of a step stay in the L1 cache)
-#define ROWS4_CHUNK 256
+// Columns converted per step by the 32-column and float formats (the K-quants
+// take one 256-column block, whose converted rows stay in the L1 cache): each
+// weight row is read in fewer pieces, which the big matrices pay for
+#define ROWS4_CHUNK 384
 
 // cn columns of 4 consecutive weight rows -> interleaved floats. `rows` points
 // at the first of those columns in the first row; dequantized formats go
@@ -2514,7 +2747,7 @@ static inline void rows4_convert(const QuantizedTensor* qw, const char* rows, in
     if (qw->rows4_func) {
         qw->rows4_func(rows, qw->row_size, dst, cn);
     } else {
-        float rowbuf[4 * ROWS4_CHUNK];
+        float rowbuf[4 * 256];
         deq_row_func dfunc = qw->deq_func;
         size_t row_size = qw->row_size;
         dfunc(rows, rowbuf, cn);
@@ -2558,15 +2791,15 @@ static inline void store4(float* p, float4 v) {
     memcpy(p, &v, sizeof(v));
 }
 
-// 32 running sums (8 groups of 4 rows, buf + 4 * cn * group) over cn columns of one token
+// 32 running sums (8 groups of 4 rows, buf + gs * group) over cn columns of one token
 #define DOT32_BODY(STEP) \
-    const float* b1 = buf + 4 * cn; \
-    const float* b2 = buf + 8 * cn; \
-    const float* b3 = buf + 12 * cn; \
-    const float* b4 = buf + 16 * cn; \
-    const float* b5 = buf + 20 * cn; \
-    const float* b6 = buf + 24 * cn; \
-    const float* b7 = buf + 28 * cn; \
+    const float* b1 = buf + gs; \
+    const float* b2 = buf + 2 * gs; \
+    const float* b3 = buf + 3 * gs; \
+    const float* b4 = buf + 4 * gs; \
+    const float* b5 = buf + 5 * gs; \
+    const float* b6 = buf + 6 * gs; \
+    const float* b7 = buf + 7 * gs; \
     float4 a0 = load4(sums), a1 = load4(sums + 4), a2 = load4(sums + 8), a3 = load4(sums + 12); \
     float4 a4 = load4(sums + 16), a5 = load4(sums + 20), a6 = load4(sums + 24), a7 = load4(sums + 28); \
     for (int j = 0; j < cn; j++) { \
@@ -2583,11 +2816,11 @@ static inline void store4(float* p, float4 v) {
     store4(sums, a0); store4(sums + 4, a1); store4(sums + 8, a2); store4(sums + 12, a3); \
     store4(sums + 16, a4); store4(sums + 20, a5); store4(sums + 24, a6); store4(sums + 28, a7);
 
-static void dot32_fused(float* sums, const float* buf, int cn, const float* x) {
+static void dot32_fused(float* sums, const float* buf, int gs, int cn, const float* x) {
     DOT32_BODY(FUSED4_STEP)
 }
 
-static void dot32_split(float* sums, const float* buf, int cn, const float* x) {
+static void dot32_split(float* sums, const float* buf, int gs, int cn, const float* x) {
     DOT32_BODY(SPLIT4_STEP)
 }
 
@@ -2632,9 +2865,130 @@ static void dot8x8_split(float* sums, const float* wa, const float* wb, int cn, 
     DOT8X8_BODY(SPLIT4_STEP)
 }
 
+// 24 and 16 running sums (6 and 4 groups of 4 rows, buf + gs * group) over cn
+// columns of one token, like DOT32_BODY
+#define DOT24_BODY(STEP) \
+    const float* b1 = buf + gs; \
+    const float* b2 = buf + 2 * gs; \
+    const float* b3 = buf + 3 * gs; \
+    const float* b4 = buf + 4 * gs; \
+    const float* b5 = buf + 5 * gs; \
+    float4 a0 = load4(sums), a1 = load4(sums + 4), a2 = load4(sums + 8); \
+    float4 a3 = load4(sums + 12), a4 = load4(sums + 16), a5 = load4(sums + 20); \
+    for (int j = 0; j < cn; j++) { \
+        float xj = x[j]; \
+        STEP(a0, load4(buf + 4 * j), xj); \
+        STEP(a1, load4(b1 + 4 * j), xj); \
+        STEP(a2, load4(b2 + 4 * j), xj); \
+        STEP(a3, load4(b3 + 4 * j), xj); \
+        STEP(a4, load4(b4 + 4 * j), xj); \
+        STEP(a5, load4(b5 + 4 * j), xj); \
+    } \
+    store4(sums, a0); store4(sums + 4, a1); store4(sums + 8, a2); \
+    store4(sums + 12, a3); store4(sums + 16, a4); store4(sums + 20, a5);
+
+#define DOT16_BODY(STEP) \
+    const float* b1 = buf + gs; \
+    const float* b2 = buf + 2 * gs; \
+    const float* b3 = buf + 3 * gs; \
+    float4 a0 = load4(sums), a1 = load4(sums + 4), a2 = load4(sums + 8), a3 = load4(sums + 12); \
+    for (int j = 0; j < cn; j++) { \
+        float xj = x[j]; \
+        STEP(a0, load4(buf + 4 * j), xj); \
+        STEP(a1, load4(b1 + 4 * j), xj); \
+        STEP(a2, load4(b2 + 4 * j), xj); \
+        STEP(a3, load4(b3 + 4 * j), xj); \
+    } \
+    store4(sums, a0); store4(sums + 4, a1); store4(sums + 8, a2); store4(sums + 12, a3);
+
+static void dot24_fused(float* sums, const float* buf, int gs, int cn, const float* x) {
+    DOT24_BODY(FUSED4_STEP)
+}
+
+static void dot24_split(float* sums, const float* buf, int gs, int cn, const float* x) {
+    DOT24_BODY(SPLIT4_STEP)
+}
+
+static void dot16_fused(float* sums, const float* buf, int gs, int cn, const float* x) {
+    DOT16_BODY(FUSED4_STEP)
+}
+
+static void dot16_split(float* sums, const float* buf, int gs, int cn, const float* x) {
+    DOT16_BODY(SPLIT4_STEP)
+}
+
+// Single-token matmul of the output projection (65536 rows or more) for the
+// formats with a 4-row converter: whole rows, G groups of 4 rows per pass (8
+// or 6, as many as the thread's region holds), so every weight row is read
+// once and sequentially instead of in column chunks, which is what a matrix
+// of that many rows is bound by (the layer matrices lose with it: their
+// converted rows no longer fit the L1 cache). The groups sit gs floats apart.
+// Same conversion and the same per-row left-to-right sums as the chunked
+// kernel, so the results are identical.
+static void HOT_KERNEL matmul_rows_full(float* xout, const float* x, const QuantizedTensor* qw, rows4_func conv, int G, int gs) {
+    int d = qw->rows;
+    int n = qw->cols;
+    size_t row_size = qw->row_size;
+    const char* data = (const char*)qw->data;
+    int fused = (qw->deq_func != NULL);
+    int R = 4 * G;
+    int ngroups = d / R;
+    int g;
+    #pragma omp parallel for private(g)
+    for (g = 0; g < ngroups; g++) {
+        int i = g * R;
+        float* buf = deq_buf + omp_get_thread_num() * deq_buf_stride;
+        float sums[32] = {0};
+        for (int q = 0; q < G; q++) {
+            conv(data + (size_t)(i + 4 * q) * row_size, row_size, buf + q * gs, n);
+        }
+        if (G == 8) {
+            if (fused) dot32_fused(sums, buf, gs, n, x); else dot32_split(sums, buf, gs, n, x);
+        } else if (G == 6) {
+            if (fused) dot24_fused(sums, buf, gs, n, x); else dot24_split(sums, buf, gs, n, x);
+        } else {
+            if (fused) dot16_fused(sums, buf, gs, n, x); else dot16_split(sums, buf, gs, n, x);
+        }
+        memcpy(xout + i, sums, R * sizeof(float));
+    }
+
+    int done = ngroups * R;
+    if (done < d) {
+        if (fused) {
+            QuantizedTensor tail = *qw;
+            tail.data = (void*)(data + (size_t)done * row_size);
+            tail.rows = d - done;
+            matmul_deq_16row(xout + done, x, &tail);
+        } else {
+            cached_dot_func dot_func = qw->dot_func;
+            for (int r = done; r < d; r++) {
+                xout[r] = dot_func(x, data + (size_t)r * row_size, n);
+            }
+        }
+    }
+}
+
+// Groups of 4 whole rows the thread's region holds for n columns (8, 6, 4 or
+// 0) and their stride: 16 floats of padding between groups when it fits
+static inline int rows_full_groups(int n, int* gs_out) {
+    int gs = 4 * n + 16;
+    int G = (int)(deq_buf_stride / gs);
+    int gs0 = 4 * n;
+    int G0 = (int)(deq_buf_stride / gs0);
+    int c = G >= 8 ? 8 : G >= 6 ? 6 : G >= 4 ? 4 : 0;
+    int c0 = G0 >= 8 ? 8 : G0 >= 6 ? 6 : G0 >= 4 ? 4 : 0;
+    if (c0 > c) {
+        gs = gs0;
+        c = c0;
+    }
+    *gs_out = gs;
+    return c;
+}
+
 // Single-token matmul: 32 rows per pass, converted in column chunks into the
-// per-thread deq_buf (8 interleaved groups of 4 rows)
-static void matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw) {
+// per-thread deq_buf (8 interleaved groups of 4 rows); whole rows instead when
+// the format has a 4-row converter and at least 16 rows fit the region
+static void HOT_KERNEL matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw) {
     int d = qw->rows;
     int n = qw->cols;
     size_t row_size = qw->row_size;
@@ -2643,10 +2997,38 @@ static void matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw
     size_t type_size = get_type_size(qw->type);
     int fused = (qw->deq_func != NULL);
 
-    // Column chunks are whole blocks; the 32 converted rows of a chunk fit the thread's region
-    int chunk = deq_buf_stride / 32;
-    if (chunk > ROWS4_CHUNK) chunk = ROWS4_CHUNK;
+    if (d >= 65536) {
+        rows4_func conv = qw->rows4_func;
+        if (!conv && qw->type == GGML_TYPE_Q6_K && (n % QK_K) == 0) conv = rows4_q6_K;
+        if (conv) {
+            int gs;
+            int G = rows_full_groups(n, &gs);
+            // 16 rows only pay for the dequantized formats (their conversion
+            // dominates); the float formats need 24 or more
+            if (G >= 6 || (G >= 4 && fused)) {
+                matmul_rows_full(xout, x, qw, conv, G, gs);
+                return;
+            }
+        }
+    }
+
+    // Column chunks are whole blocks; the 32 converted rows of a chunk fit the
+    // thread's region. For the 32-column and float formats the 8 groups of 4
+    // rows sit 16 floats (64 bytes) further apart than their size when there is
+    // room, so the 8 streams dot32 reads do not fall on the same cache sets when
+    // 16 * cn bytes is a power of two (the K-quants keep their 256-column
+    // layout: their conversion dominates and showed no gain).
+    int max_chunk = block_size >= 256 ? 256 : ROWS4_CHUNK;
+    int pad = block_size >= 256 ? 0 : 16;
+    int chunk = (deq_buf_stride - 7 * pad) / 32;
+    if (chunk > max_chunk) chunk = max_chunk;
     chunk -= chunk % block_size;
+    if (chunk <= 0) {
+        pad = 0;
+        chunk = deq_buf_stride / 32;
+        if (chunk > max_chunk) chunk = max_chunk;
+        chunk -= chunk % block_size;
+    }
 
     int ngroups = chunk > 0 ? d / 32 : 0;
     int g;
@@ -2659,13 +3041,14 @@ static void matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw
             int cn = n - c0;
             if (cn > chunk) cn = chunk;
             size_t boff = (size_t)(c0 / block_size) * type_size;
+            int gs = 4 * cn + pad;
             for (int q = 0; q < 8; q++) {
-                rows4_convert(qw, data + (size_t)(i + 4 * q) * row_size + boff, cn, buf + q * 4 * cn);
+                rows4_convert(qw, data + (size_t)(i + 4 * q) * row_size + boff, cn, buf + q * gs);
             }
             if (fused) {
-                dot32_fused(sums, buf, cn, x + c0);
+                dot32_fused(sums, buf, gs, cn, x + c0);
             } else {
-                dot32_split(sums, buf, cn, x + c0);
+                dot32_split(sums, buf, gs, cn, x + c0);
             }
         }
         memcpy(xout + i, sums, sizeof(sums));
@@ -2690,7 +3073,7 @@ static void matmul_rows32(float* xout, const float* x, const QuantizedTensor* qw
 // Prefill matmul: 8 rows per pass, converted in column chunks and multiplied
 // with the tokens of the batch 8 at a time (a last group with fewer tokens
 // repeats its first one and drops the extra results)
-static void matmul_rows8_batch(float* xout, const float* x, const QuantizedTensor* qw,
+static void HOT_KERNEL matmul_rows8_batch(float* xout, const float* x, const QuantizedTensor* qw,
                                int batch_size, int in_stride, int out_stride) {
     int d = qw->rows;
     int n = qw->cols;
@@ -2700,9 +3083,19 @@ static void matmul_rows8_batch(float* xout, const float* x, const QuantizedTenso
     size_t type_size = get_type_size(qw->type);
     int fused = (qw->deq_func != NULL);
 
-    int chunk = deq_buf_stride / 8;
-    if (chunk > ROWS4_CHUNK) chunk = ROWS4_CHUNK;
+    // 256 columns per step; for the 32-column and float formats the second
+    // group of 4 rows sits 16 floats past the first when the buffer has room
+    // (see matmul_rows32)
+    int pad = block_size >= 256 ? 0 : 16;
+    int chunk = (deq_buf_stride - pad) / 8;
+    if (chunk > 256) chunk = 256;
     chunk -= chunk % block_size;
+    if (chunk <= 0) {
+        pad = 0;
+        chunk = deq_buf_stride / 8;
+        if (chunk > 256) chunk = 256;
+        chunk -= chunk % block_size;
+    }
 
     int ngroups = (chunk > 0 && batch_size <= PREFILL_BATCH_SIZE) ? d / 8 : 0;
     int g;
@@ -2717,16 +3110,16 @@ static void matmul_rows8_batch(float* xout, const float* x, const QuantizedTenso
             if (cn > chunk) cn = chunk;
             size_t boff = (size_t)(c0 / block_size) * type_size;
             rows4_convert(qw, data + (size_t)i * row_size + boff, cn, buf);
-            rows4_convert(qw, data + (size_t)(i + 4) * row_size + boff, cn, buf + 4 * cn);
+            rows4_convert(qw, data + (size_t)(i + 4) * row_size + boff, cn, buf + 4 * cn + pad);
             for (int b = 0; b < batch_size; b += 8) {
                 const float* xt[8];
                 for (int t = 0; t < 8; t++) {
                     xt[t] = x + (size_t)(b + t < batch_size ? b + t : b) * in_stride + c0;
                 }
                 if (fused) {
-                    dot8x8_fused(sums[b / 8], buf, buf + 4 * cn, cn, xt);
+                    dot8x8_fused(sums[b / 8], buf, buf + 4 * cn + pad, cn, xt);
                 } else {
-                    dot8x8_split(sums[b / 8], buf, buf + 4 * cn, cn, xt);
+                    dot8x8_split(sums[b / 8], buf, buf + 4 * cn + pad, cn, xt);
                 }
             }
         }
@@ -2758,7 +3151,7 @@ static void matmul_rows8_batch(float* xout, const float* x, const QuantizedTenso
 // Computes xout = W @ x where W is quantized (d rows, n cols)
 // W is stored row-major: each row has n elements in quantized form
 // Uses Q8_0 quantized input path when available for integer dot products
-void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
+void HOT_KERNEL matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
     // Dequantizable types (Q8_0, K-quants) and float formats (F16, BF16, F32):
     // 32-row convert-then-dot kernel
     if ((qw->deq_func || qw->rows4_func) && deq_buf) {
@@ -2821,7 +3214,7 @@ void matmul_quantized(float* xout, const float* x, const QuantizedTensor* qw) {
 // identical to matmul_deq_4row (same dequantized values, same sequential
 // sum += w * x), so results match it bit for bit; rows left over after the
 // 16-row groups go through matmul_deq_4row itself.
-static void matmul_deq_16row(float* xout, const float* x, const QuantizedTensor* qw) {
+static void HOT_KERNEL matmul_deq_16row(float* xout, const float* x, const QuantizedTensor* qw) {
     int d = qw->rows;
     int n = qw->cols;
     size_t row_size = qw->row_size;
@@ -3077,7 +3470,7 @@ void matmul_quantized_preq8(float* xout, const QuantizedTensor* qw) {
 }
 
 // Batched matmul: read each weight row once, compute dot products for all batch elements
-void matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* qw,
+void HOT_KERNEL matmul_quantized_batch(float* xout, const float* x, const QuantizedTensor* qw,
                             int batch_size, int in_stride, int out_stride,
                             block_q8_0* q8_bufs, int q8_stride) {
     // Dequantizable types (Q8_0, K-quants) and float formats (F16, BF16, F32):
@@ -4031,7 +4424,7 @@ void softmax(float* x, int size) {
 
 // Transformer forward pass with GQA support and Gemma3 extensions
 // compute_logits: 1 = compute logits (for sampling), 0 = skip (prompt prefill)
-void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w, int compute_logits) {
+void HOT_KERNEL transformer(int token, int pos, Config* p, RunState* s, TransformerWeights* w, int compute_logits) {
     float *x = s->x;
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
@@ -4145,10 +4538,11 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
         // save key,value at this time step (pos) to our kv cache (Q8_0 quantized)
         // Per-head layout: [layer][kv_head][position][head_data]
         int head_q8_bytes = s->head_q8_bytes;
+        int kv_pos_bytes = s->kv_pos_bytes;
         size_t head_seq_bytes = s->head_seq_bytes;
         size_t loff = (size_t)l * s->kv_cache_layer_size;
         for (int kh = 0; kh < p->n_kv_heads; kh++) {
-            size_t cache_offset = loff + kh * head_seq_bytes + pos * head_q8_bytes;
+            size_t cache_offset = loff + kh * head_seq_bytes + (size_t)pos * kv_pos_bytes;
             quantize_to_q8_0_cache(s->k + kh * head_size, s->key_cache + cache_offset, head_size);
             quantize_to_q8_0_cache(s->v + kh * head_size, s->value_cache + cache_offset, head_size);
         }
@@ -4177,7 +4571,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 
             // Score all Q heads in this GQA group against all K positions
             for (int t = start_t; t <= pos; t++) {
-                size_t kOff = kBase + t * head_q8_bytes;
+                size_t kOff = kBase + (size_t)t * kv_pos_bytes;
                 const uint8_t* kQ8 = s->key_cache + kOff;
                 const int8_t* kI8 = (const int8_t*)kQ8;
                 for (int mh = 0; mh < kv_mul; mh++) {
@@ -4198,7 +4592,7 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
                 // Value accumulation - position-first for V cache locality
                 float* xb = s->xb + s->head_q_offsets[h];
                 for (int t = start_t; t <= pos; t++) {
-                    size_t vOff = kBase + t * head_q8_bytes;
+                    size_t vOff = kBase + (size_t)t * kv_pos_bytes;
                     accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
                 }
             }
@@ -4281,9 +4675,13 @@ void transformer(int token, int pos, Config* p, RunState* s, TransformerWeights*
 }
 
 // Batched prefill transformer: processes multiple prompt tokens per layer pass,
-// reading weight data once and reusing across all batch elements
-void transformer_prefill(int* tokens, int start_pos, int batch_size,
-                         Config* p, RunState* s, TransformerWeights* w) {
+// reading weight data once and reusing across all batch elements.
+// last_logits: this batch ends the prompt, so its last token also goes through
+// the last layer, the final norm and the output projection, and its logits are
+// left in s->logits (inside the scratch block, in a region the batch no longer
+// needs): the prompt's last token does not need a separate pass over the weights.
+void HOT_KERNEL transformer_prefill(int* tokens, int start_pos, int batch_size,
+                         Config* p, RunState* s, TransformerWeights* w, int last_logits) {
     int dim = p->dim;
     int hidden_dim = p->hidden_dim;
     int head_size = s->head_size;
@@ -4296,6 +4694,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
     int half = head_size / 2;
     int kv_mul = s->kv_mul;
     int head_q8_bytes = s->head_q8_bytes;
+    int kv_pos_bytes = s->kv_pos_bytes;
     size_t head_seq_bytes = s->head_seq_bytes;
     float attn_scale = s->attn_scale;
 
@@ -4323,8 +4722,9 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
     for (int l = 0; l < p->n_layers; l++) {
         // Prefill tokens only feed later positions through the KV cache, so the
         // last layer needs nothing beyond K and V: Q, attention, wo and the FFN
-        // would only produce a hidden state that nobody reads.
-        int kv_only = (l == p->n_layers - 1);
+        // would only produce a hidden state that nobody reads (unless the
+        // logits of the last token are wanted).
+        int kv_only = (l == p->n_layers - 1) && !last_logits;
 
         // Batch rmsnorm
         if (p->is_gemma3 && l == 0) {
@@ -4345,6 +4745,24 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
         }
         matmul_quantized_batch(bk, bxb, &w->wk[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
         matmul_quantized_batch(bv, bxb, &w->wv[l], batch_size, max_dim, kv_dim, bq8, q8_stride);
+
+        if (last_logits) {
+            // transformer() quantizes xb once and multiplies Q, K and V with the
+            // integer kernels whenever wq is a block-32 format, a Q8_0 wk/wv
+            // included; the batch dispatches every matrix on its own type. The
+            // last token takes that path for the matrices that differ, so its KV
+            // entries and its logits match transformer()'s bit for bit.
+            int bl = batch_size - 1;
+            if (w->wq[l].q8_func && q8_buf && !w->wq[l].deq_func) {
+                int q8_k = get_unpack_b32_func(w->wk[l].type, &(int){0}) == NULL;
+                int q8_v = get_unpack_b32_func(w->wv[l].type, &(int){0}) == NULL;
+                if (q8_k || q8_v) {
+                    quantize_row_q8_0(bxb + bl * max_dim, q8_buf, w->wq[l].cols);
+                    if (q8_k) matmul_quantized_preq8(bk + bl * kv_dim, &w->wk[l]);
+                    if (q8_v) matmul_quantized_preq8(bv + bl * kv_dim, &w->wv[l]);
+                }
+            }
+        }
 
         // Per-token: QK norms, RoPE, KV cache write, attention
         int is_swa_layer = (p->swa_pattern > 0) && (l % p->swa_pattern < p->swa_pattern - 1);
@@ -4417,7 +4835,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
             // Per-head KV cache write
             for (int kh = 0; kh < p->n_kv_heads; kh++) {
-                size_t cache_offset = loff + kh * head_seq_bytes + (size_t)pos * head_q8_bytes;
+                size_t cache_offset = loff + kh * head_seq_bytes + (size_t)pos * kv_pos_bytes;
                 quantize_to_q8_0_cache(k_arr + kh * head_size, s->key_cache + cache_offset, head_size);
                 quantize_to_q8_0_cache(v_arr + kh * head_size, s->value_cache + cache_offset, head_size);
             }
@@ -4445,7 +4863,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
                 // Score all Q heads in this GQA group against all K positions
                 for (int t = start_t; t <= pos; t++) {
-                    size_t kOff = kBase + t * head_q8_bytes;
+                    size_t kOff = kBase + (size_t)t * kv_pos_bytes;
                     const uint8_t* kQ8 = s->key_cache + kOff;
                     const int8_t* kI8 = (const int8_t*)kQ8;
                     for (int mh = 0; mh < kv_mul; mh++) {
@@ -4465,7 +4883,7 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
 
                     float* xb = xb_arr + s->head_q_offsets[h];
                     for (int t = start_t; t <= pos; t++) {
-                        size_t vOff = kBase + (size_t)t * head_q8_bytes;
+                        size_t vOff = kBase + (size_t)t * kv_pos_bytes;
                         accum_q8_0_cache(xb, s->value_cache + vOff, att[t - start_t], head_size);
                     }
                 }
@@ -4499,6 +4917,14 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
         // Batch FFN gate and up matmuls
         matmul_quantized_batch(bhb, bxb, &w->w1[l], batch_size, max_dim, hidden_dim, bq8, q8_stride);
         matmul_quantized_batch(bhb2, bxb, &w->w3[l], batch_size, max_dim, hidden_dim, bq8, q8_stride);
+
+        if (last_logits && w->w1[l].q8_func && q8_buf && !w->w1[l].deq_func
+            && get_unpack_b32_func(w->w3[l].type, &(int){0}) == NULL) {
+            // Same for w3 when w1 is block-32 and w3 is not (see the QKV note)
+            int bl = batch_size - 1;
+            quantize_row_q8_0(bxb + bl * max_dim, q8_buf, w->w1[l].cols);
+            matmul_quantized_preq8(bhb2 + bl * hidden_dim, &w->w3[l]);
+        }
 
         // Per-token activation
         if (p->is_gemma3) {
@@ -4540,7 +4966,25 @@ void transformer_prefill(int* tokens, int start_pos, int batch_size,
             accum(bx + b * dim, bxb + b * max_dim, dim);
         }
     }
-    // No final norm or logits - prefill only fills KV cache
+    if (!last_logits) {
+        return;  // prefill only fills the KV cache
+    }
+
+    // Logits of the last token: final norm and output projection. They go to
+    // the part of the scratch block past the batch buffers when it is big
+    // enough (the tokenizer's tables used it, nothing does now), else to the
+    // hb/hb2 buffers, whose contents are dead by now; main() picked which.
+    int bl = batch_size - 1;
+    float* x_last = bx + bl * dim;
+    float* xb_last = bxb + bl * max_dim;
+    rmsnorm(xb_last, x_last, w->rms_final_weight, dim, inv_dim, eps);
+    matmul_quantized(s->logits, xb_last, &w->wcls);
+    if (p->is_gemma3 && p->final_logit_softcapping > 0.0f) {
+        float cap = p->final_logit_softcapping;
+        for (int i = 0; i < p->vocab_size; i++) {
+            s->logits[i] = cap * fast_tanhf(s->logits[i] / cap);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -5546,10 +5990,22 @@ static int generated_tokens_cap = 0;
 static int repetition_detected = 0;
 static int step = 0;
 
+// The prefill left the logits of the current position in state.logits
+static int logits_ready = 0;
+
 void generate_token(void) {
     // Skip logit computation during prompt prefill (major speedup)
     int need_logits = (pos >= num_prompt_tokens - 1) ? 1 : 0;
-    transformer(token, pos, &config, &state, &weights, need_logits);
+    if (logits_ready) {
+        logits_ready = 0;
+    } else {
+        if (state.logits != (float*)run_scratch) {
+            // First pass after a prefill that ended with its logits elsewhere
+            use_logits_buffer(&state, &config);
+        }
+        transformer(token, pos, &config, &state, &weights, need_logits);
+    }
+    // Logits of position pos are ready
 
     // Debug: print first few logits to see if they make sense
     if (debug_mode && pos >= num_prompt_tokens - 1 && pos < num_prompt_tokens + 3) {
@@ -6136,19 +6592,39 @@ int main(int argc, char *argv[]) {
 
     long start = 0;
 
-    // Batched prefill: process all prompt tokens except the last in batches
+    // Batched prefill: all prompt tokens in batches; the last batch also leaves
+    // the logits of the last token, so generate_token() starts by sampling it
+    // instead of running that token through the weights again
+    int folded = 0;
     if (num_prompt_tokens > 1) {
         use_prefill_buffers(&state, &config);
-        int prefill_end = num_prompt_tokens - 1;
+        size_t prefill_bytes = prefill_buffers_size(&state, &config);
+        size_t logits_bytes = (size_t)config.vocab_size * sizeof(float);
+        float* first_logits = NULL;
+        if (prefill_bytes + logits_bytes <= run_scratch_size) {
+            first_logits = (float*)((char*)run_scratch + prefill_bytes);
+        } else if ((size_t)2 * PREFILL_BATCH_SIZE * config.hidden_dim * sizeof(float) >= logits_bytes) {
+            first_logits = state.batch_hb;  // hb and hb2 are contiguous and dead by then
+        }
+        int prefill_end = first_logits ? num_prompt_tokens : num_prompt_tokens - 1;
         while (pos < prefill_end) {
             int bs = prefill_end - pos;
             if (bs > PREFILL_BATCH_SIZE) bs = PREFILL_BATCH_SIZE;
-            transformer_prefill(prompt_tokens, pos, bs, &config, &state, &weights);
+            int last = first_logits && pos + bs == prefill_end;
+            if (last) state.logits = first_logits;
+            transformer_prefill(prompt_tokens, pos, bs, &config, &state, &weights, last);
             pos += bs;
+        }
+        if (first_logits) {
+            pos = num_prompt_tokens - 1;
+            folded = 1;
+            logits_ready = 1;
         }
         token = prompt_tokens[pos];
     }
-    use_logits_buffer(&state, &config);
+    if (!folded) {
+        use_logits_buffer(&state, &config);
+    }
 
     while (pos < max_tokens) {
         generate_token();
