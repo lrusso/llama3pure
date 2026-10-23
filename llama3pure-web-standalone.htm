@@ -370,10 +370,6 @@
                   event.preventDefault()
                   try {
                     document.querySelectorAll(".actions_container button")[0].click()
-                    setTimeout(function () {
-                      inputTextbox.blur()
-                      inputTextbox.focus()
-                    }, 25)
                   } catch (err) {
                     //
                   }
@@ -383,10 +379,6 @@
                   event.preventDefault()
                   try {
                     document.querySelectorAll(".actions_container button")[1].click()
-                    setTimeout(function () {
-                      inputTextbox.blur()
-                      inputTextbox.focus()
-                    }, 25)
                   } catch (err) {
                     //
                   }
@@ -396,10 +388,6 @@
                   event.preventDefault()
                   try {
                     document.querySelectorAll(".actions_container button")[2].click()
-                    setTimeout(function () {
-                      inputTextbox.blur()
-                      inputTextbox.focus()
-                    }, 25)
                   } catch (err) {
                     //
                   }
@@ -797,8 +785,7 @@
           var resultText = newReply.replace(/\</g, "&#60;")
           promptResult.innerHTML = markdownToHTML(resultText)
 
-          var selection = window.getSelection()
-          selection.removeAllRanges()
+          inputTextbox.focus()
         })
 
         buttonRegenerate.type = "button"
@@ -830,9 +817,7 @@
           chatHistory.pop()
           ask(prompt, true)
 
-          if (!isMobileDevice()) {
-            inputTextbox.focus()
-          }
+          inputTextbox.focus()
         })
 
         buttonCopy.type = "button"
