@@ -659,6 +659,7 @@
           buttonCopy.appendChild(ICON_COPY())
           buttonCopy.addEventListener("click", function () {
             copyToClipboard(promptContent, buttonCopy)
+            inputTextbox.focus()
           })
           buttonCopy.children[0].classList.add("active")
           buttonCopy.style.cursor = "pointer"
@@ -824,6 +825,7 @@
         buttonCopy.appendChild(ICON_COPY())
         buttonCopy.addEventListener("click", function () {
           copyToClipboard(promptResult, buttonCopy)
+          inputTextbox.focus()
         })
 
         if (replies.length === 1) {
