@@ -300,6 +300,9 @@ A standalone version is available [here](https://lrusso.github.io/llama3pure/lla
 | Next reply        |  Command + 1   |     Ctrl + 1     |    Ctrl + 1     |
 | Regenerate        |  Command + 2   |     Ctrl + 2     |    Ctrl + 2     |
 | Copy to clipboard |  Command + 3   |     Ctrl + 3     |    Ctrl + 3     |
+| Send              |     Enter      |      Enter       |      Enter      |
+| New line          | Shift + Enter  |  Shift + Enter   |  Shift + Enter  |
+| Cancel editing    |     Escape     |      Escape      |     Escape      |
 
 ## Author's Notes
 
