@@ -780,7 +780,12 @@
 
           chatHistory.pop()
           chatHistory.pop()
-          chatHistory.push({ type: "user", text: prompt })
+          var formattedPrompt = prompt
+          customPromptRegexRules.forEach(function (rule) {
+            formattedPrompt = formattedPrompt.replace(rule.regex, rule.replacement)
+          })
+
+          chatHistory.push({ type: "user", text: customPrefix + formattedPrompt })
 
           if (!replies[selectedReply + 1]) {
             selectedReply = 0
