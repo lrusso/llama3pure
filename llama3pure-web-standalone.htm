@@ -1158,6 +1158,8 @@
           // the underscores inside a word (e.g. my_var_name) are not an emphasis
           { regex: /\b__(.*?)__\b/g, replacement: "<strong>$1</strong>" },
           { regex: /\b_(.*?)_\b/g, replacement: "<em>$1</em>" },
+          // ~~text~~ is a strikethrough (the tildes must be next to the text too)
+          { regex: /~~([^\s~](?:.*?[^\s~])?)~~/g, replacement: "<del>$1</del>" },
           {
             regex: /^(#{1,6})\s+(.*)$/gm,
             replacement: function replacement(_match, hashes, content) {
