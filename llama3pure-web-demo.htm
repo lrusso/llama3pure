@@ -430,9 +430,11 @@
               reply = reply + data.token
               patchDOM(
                 lastReply,
-                markdownToHTML(
-                  reply.replace(/&/g, "&#38;").replace(/\</g, "&#60;")
-                ) + '<div class="pointer"></div>'
+                addPointer(
+                  markdownToHTML(
+                    reply.replace(/&/g, "&#38;").replace(/\</g, "&#60;")
+                  )
+                )
               )
               break
 
@@ -625,6 +627,25 @@
 
           reconcileChildren(existingNode, newNode)
         }
+      }
+
+      function addPointer(html) {
+        var pointer = '<div class="pointer"></div>'
+
+        // while a table is being written (it's the end of the reply), the pointer goes
+        // at the end of its last cell (or in a new cell when a row has just started)
+        // instead of under the table
+        var pointerInTable = html
+          .replace(
+            /<\/td><\/tr><\/tbody><\/table>$/,
+            pointer + "</td></tr></tbody></table>"
+          )
+          .replace(
+            /<tr><\/tr><\/tbody><\/table>$/,
+            "<tr><td>" + pointer + "</td></tr></tbody></table>"
+          )
+
+        return pointerInTable !== html ? pointerInTable : html + pointer
       }
 
       function ask(prompt, hidePrompt) {
