@@ -1066,8 +1066,14 @@
         // fence and the last line break of the code (with the indentation of the
         // closing fence, e.g. inside a list) are removed, as they would add empty lines
         markdown = markdown.replace(
-          /([ \t]*)\`\`\`[^\n]*(?:\n|$)([\s\S]*?)(?:\`\`\`\n?|$)/g,
-          function (_match, indent, group) {
+          /([ \t]*)\`\`\`(?:([^`\n]+?)\`\`\`|[^\n]*(?:\n|$)([\s\S]*?)(?:\`\`\`\n?|$))/g,
+          function (_match, indent, inline, group) {
+            // three backticks closed on the same line (e.g. ```npm install```) are
+            // inline code, not a code block
+            if (inline) {
+              return indent + "`" + inline + "`"
+            }
+
             // the indentation of the fence (e.g. inside a list) isn't part of the code,
             // so it's removed from every line of the code and from before the block
             // (where it would add an empty line too)
