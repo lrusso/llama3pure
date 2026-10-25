@@ -1069,16 +1069,16 @@
         // fence and the last line break of the code (with the indentation of the
         // closing fence, e.g. inside a list) are removed, as they would add empty lines
         markdown = markdown.replace(
-          /\`\`\`[^\n]*(?:\n|$)([\s\S]*?)(?:\`\`\`\n?|$)/g,
-          function (_match, group) {
-            codeBlocks.push(group.replace(/\n[ \t]*$/, ""))
+          /([ \t]*)\`\`\`[^\n]*(?:\n|$)([\s\S]*?)(?:\`\`\`\n?|$)/g,
+          function (_match, indent, group) {
+            // the indentation of the fence (e.g. inside a list) isn't part of the code,
+            // so it's removed from every line of the code and from before the block
+            // (where it would add an empty line too)
+            var code = group.replace(new RegExp("^" + indent, "gm"), "")
+            codeBlocks.push(code.replace(/\n[ \t]*$/, ""))
             return "%%CODELLAMABLOCK" + (codeBlocks.length - 1) + "%%"
           }
         )
-
-        // the indentation before a code block (e.g. inside a list) would add an empty
-        // line too
-        markdown = markdown.replace(/\n[ \t]+(%%CODELLAMABLOCK\d+%%)/g, "\n$1")
 
         // storing and removing all the inline code (so it's not touched by the
         // emphasis rules below, e.g. __init__ becoming <strong>init</strong>)
@@ -1171,9 +1171,10 @@
         var rules = [
           { regex: /^---$\n?/gm, replacement: "<hr>" },
           // before the emphasis rules, so the asterisk of a bullet isn't an <em>.
-          // the indented bullets (sublists) keep their indentation
+          // the indented bullets (sublists) keep their indentation, and the spaces
+          // after the bullet (e.g. "*   text") become just one
           {
-            regex: /^([ \t]*)[\*\-\+] (.+)$/gm,
+            regex: /^([ \t]*)[\*\-\+][ \t]+(.+)$/gm,
             replacement: function replacement(_match, indent, item) {
               return indent + "&#8226; " + item
             },
