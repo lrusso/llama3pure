@@ -636,17 +636,13 @@
         var pointer = '<div class="pointer"></div>'
 
         // while a table is being written (it's the end of the reply), the pointer goes
-        // at the end of its last cell (or in a new cell when a row has just started)
-        // instead of under the table
-        var pointerInTable = html
-          .replace(
-            /<\/td><\/tr><\/tbody><\/table>$/,
-            pointer + "</td></tr></tbody></table>"
-          )
-          .replace(
-            /<tr><\/tr><\/tbody><\/table>$/,
-            "<tr><td>" + pointer + "</td></tr></tbody></table>"
-          )
+        // at the end of the cell being written (the last one with content before the
+        // empty ones, or the first one when a row has just started) instead of under
+        // the table
+        var pointerInTable = html.replace(
+          /<\/td>((?:<td><\/td>)*)<\/tr><\/tbody><\/table>$/,
+          pointer + "</td>$1</tr></tbody></table>"
+        )
 
         return pointerInTable !== html ? pointerInTable : html + pointer
       }
@@ -1188,6 +1184,12 @@
             })
             html = html + "</tr></thead><tbody>"
             rows.forEach(function (row) {
+              // the row has all the columns of the table, even while its first cells are
+              // still being written
+              while (row.length < headers.length) {
+                row.push("")
+              }
+
               html = html + "<tr>"
               row.forEach(function (cell) {
                 html = html + "<td>" + cell + "</td>"
