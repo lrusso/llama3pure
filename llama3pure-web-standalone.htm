@@ -257,6 +257,7 @@
       var rendering = false
       var chatHistory = []
       var replies = []
+      var renderedReplies = []
       var selectedReply = 0
       var toastTimeout = null
       var promptBeforeEdit = ""
@@ -843,8 +844,9 @@
 
           chatHistory.push({ type: "model", response: [newReply] })
 
-          var resultText = newReply.replace(/&/g, "&#38;").replace(/\</g, "&#60;")
-          promptResult.innerHTML = markdownToHTML(resultText)
+          // the reply was already converted while it was written, so switching to it
+          // doesn't apply the markdown rules again (slow on phones with long replies)
+          promptResult.innerHTML = renderedReplies[selectedReply]
 
           inputTextbox.focus()
         })
@@ -916,6 +918,9 @@
         if (pointerElement) {
           pointerElement.remove()
         }
+
+        // the converted reply is kept for the next reply button
+        renderedReplies.push(promptResult.innerHTML)
 
         rendering = false
       }
@@ -1005,6 +1010,7 @@
         chatHistory.pop()
         chatHistory.pop()
         replies.splice(0, replies.length)
+        renderedReplies.splice(0, renderedReplies.length)
         ask(newPrompt, true)
       }
 
@@ -1400,6 +1406,7 @@
 
         if (prompt) {
           replies.splice(0, replies.length)
+          renderedReplies.splice(0, renderedReplies.length)
           ask(prompt)
         }
 
