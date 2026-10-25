@@ -171,6 +171,7 @@
           download: "Download",
           downloading: "Downloading...",
           system_prompt: "You are a useful AI assistant.",
+          today: "Today is",
           system_welcome: "Hello, how can I help you today?",
           disclaimer: "Llama is AI and can make mistakes.",
           copied: "Copied to clipboard.",
@@ -196,6 +197,7 @@
           download: "Descargar",
           downloading: "Descargando...",
           system_prompt: "Eres un asistente de IA \xFAtil.",
+          today: "Hoy es",
           system_welcome: "Hola, \xBFc\xF3mo puedo ayudarte hoy?",
           disclaimer: "Llama es una IA y puede cometer errores.",
           copied: "Copiado al portapapeles.",
@@ -414,7 +416,13 @@
 
               resizeInputText()
 
-              chatHistory.push({ type: "system", text: t("system_prompt") })
+              // the system prompt goes with the date of today, since the model can't know it
+              // (e.g. "You are a useful AI assistant. Today is Sun Oct 25 2026.")
+              var today = t("today") + " " + new Date().toDateString() + "."
+              chatHistory.push({
+                type: "system",
+                text: t("system_prompt") + " " + today,
+              })
 
               appendMessage("reply", markdownToHTML(t("system_welcome")))
 
