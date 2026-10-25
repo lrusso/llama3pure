@@ -1199,6 +1199,10 @@
         // setting the markdown rules
         var rules = [
           { regex: /^---$\n?/gm, replacement: "<hr>" },
+          // the other ways to write that line (e.g. ***, ___, ----, - - - or * * *), only
+          // once the line is complete, so a line that starts with *** (bold and italic)
+          // isn't a line for a moment while it's being written
+          { regex: /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*\n/gm, replacement: "<hr>" },
           // before the emphasis rules, so the asterisk of a bullet isn't an <em>.
           // the indented bullets (sublists) keep their indentation, and the spaces
           // after the bullet (e.g. "*   text") become just one
