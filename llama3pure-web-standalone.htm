@@ -272,6 +272,9 @@
       var reply = ""
       var stableReplyLength = 0
       var stableReplyNodes = 0
+      var renderedReplyLength = 0
+      var replyFrame = null
+      var replyFrameTime = 0
       var lastReply = null
       var lastPrompt = ""
 
@@ -442,10 +445,14 @@
                 document.title = t("title") + " - " + t("writing")
               }
               reply = reply + data.token
-              renderReply()
               break
 
             case "complete":
+              // the last tokens are shown right away
+              window.cancelAnimationFrame(replyFrame)
+              if (renderedReplyLength !== reply.length) {
+                renderReply()
+              }
               handleReply(
                 document.querySelector(".content"),
                 reply,
@@ -822,6 +829,20 @@
         )
       }
 
+      function renderReplyFrame(time) {
+        // while the reply is received, what arrived so far is shown up to 12 times per
+        // second (instead of once per chunk, which can be many more times)
+        if (
+          time - replyFrameTime >= 1000 / 12 &&
+          renderedReplyLength !== reply.length
+        ) {
+          replyFrameTime = time
+          renderedReplyLength = reply.length
+          renderReply()
+        }
+        replyFrame = window.requestAnimationFrame(renderReplyFrame)
+      }
+
       function ask(prompt, hidePrompt) {
         var content = document.querySelector(".content")
         var inputTextbox = document.querySelector(".input_textbox")
@@ -933,11 +954,14 @@
         reply = ""
         stableReplyLength = 0
         stableReplyNodes = 0
+        renderedReplyLength = 0
 
         worker.postMessage({
           type: "generate",
           chatHistory: chatHistory,
         })
+
+        replyFrame = window.requestAnimationFrame(renderReplyFrame)
       }
 
       function handleReply(content, reply, promptResult, prompt) {
