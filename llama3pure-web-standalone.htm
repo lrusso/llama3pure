@@ -275,13 +275,6 @@
       var lastReply = null
       var lastPrompt = ""
 
-      // a code block (or three backticks closed on the same line, e.g. ```npm install```).
-      // it starts with the backticks, so it's only tried where there are backticks. the
-      // last group is the closing fence, which is empty while the block is still being
-      // written
-      var CODE_BLOCK_REGEX =
-        /\`\`\`(?:([^`\n]+?)\`\`\`|[^\n]*(?:\n|$)([\s\S]*?)(\`\`\`\n?|$))/g
-
       function ICON_REGENERATE() {
         var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
         svg.setAttribute("class", "regenerate")
@@ -662,34 +655,109 @@
         return pointerInTable !== html ? pointerInTable : html + pointer
       }
 
-      function getStableLength(text) {
-        // the complete lines don't change anymore while the reply is written, except the
-        // ones that go together with the next line: the lines of a code block, a table row
-        // ("|"), a quote (">"), an empty line (a title without text yet takes the next
-        // line), and the title, the divider and the end of a code block (they take the
-        // line break after them, so the next line is converted right after them)
-        var codeBlocks = []
-        var codeBlock = null
-        CODE_BLOCK_REGEX.lastIndex = 0
-        while ((codeBlock = CODE_BLOCK_REGEX.exec(text))) {
-          // a code block still being written goes until the end of the text
-          var blockEnd =
-            codeBlock[3] === "" ? text.length + 1 : CODE_BLOCK_REGEX.lastIndex
-          codeBlocks.push([codeBlock.index, blockEnd])
+      function getCodeBlock(text, start) {
+        // the code that starts with the three backticks at start, found with indexOf
+        // (much faster than a regex). three backticks closed on the same line (e.g.
+        // ```npm install```) are inline code, and a code block starts on the next line
+        // and goes until the next three backticks (or until the end while it's being
+        // written)
+        var backtick = text.indexOf("`", start + 3)
+        var lineBreak = text.indexOf("\n", start + 3)
+        if (
+          backtick > start + 3 &&
+          (lineBreak === -1 || backtick < lineBreak) &&
+          text.startsWith("```", backtick)
+        ) {
+          return { inline: text.slice(start + 3, backtick), end: backtick + 3 }
         }
 
-        var goesWithNextLine =
-          /^(?:[|>]|\s*$|#{1,6}(?:\s|$)| {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$)/
+        var codeStart = lineBreak === -1 ? text.length : lineBreak + 1
+        var closing = text.indexOf("```", codeStart)
+        if (closing === -1) {
+          return { code: text.slice(codeStart), end: text.length, isOpen: true }
+        }
+
+        // the line break after the closing three backticks is part of the block
+        return {
+          code: text.slice(codeStart, closing),
+          end: text[closing + 3] === "\n" ? closing + 4 : closing + 3,
+        }
+      }
+
+      function getStableLength(text) {
+        // the complete lines don't change anymore while the reply is written, except the
+        // ones that go together with the next line: the lines of a code block (until the
+        // line break after it), a table row ("|"), a quote (">"), an empty line, a title,
+        // a divider, the first line with text after a title without text yet (e.g. "##",
+        // which takes that line as its text) and a line with a link (a link without http,
+        // e.g. [](x), is removed, which can leave the line empty or starting with one of
+        // those). the title and the divider take the line break after them, so the next
+        // line is converted right after them
+
+        // with other line breaks (\r, \u2028 or \u2029, which some rules take as the end of
+        // a line too) the reply isn't cut, so it's converted whole like before
+        if (/[\r\u2028\u2029]/.test(text)) {
+          return 0
+        }
+
+        var codeBlocks = []
+        var fenceIndex = text.indexOf("```")
+        while (fenceIndex !== -1) {
+          var codeBlock = getCodeBlock(text, fenceIndex)
+          // a code block still being written goes until the end of the text
+          var blockEnd = codeBlock.isOpen ? text.length + 1 : codeBlock.end
+          codeBlocks.push([fenceIndex, blockEnd])
+          fenceIndex = text.indexOf("```", codeBlock.end)
+        }
+
+        var isDivider = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/
+        var goesWithNextLine = /^(?:[|>]|\s*$|#{1,6}(?:\s|$))|\]\(/
         var lines = text.split("\n")
         var lineEnd = text.length - lines[lines.length - 1].length
         for (var i = lines.length - 2; i >= 0; i--) {
+          var lineStart = lineEnd - lines[i].length - 1
           var isInCodeBlock = codeBlocks.some(function (block) {
             return block[0] < lineEnd && lineEnd <= block[1]
           })
-          if (!isInCodeBlock && !goesWithNextLine.test(lines[i])) {
-            return lineEnd
+
+          if (
+            !isInCodeBlock &&
+            !isDivider.test(lines[i]) &&
+            !goesWithNextLine.test(lines[i])
+          ) {
+            // the line break before a line can be taken by a code block (which goes in the
+            // middle of the line where it starts) or by a divider, so the line that ends
+            // here starts in the first of those lines
+            var first = i
+            var firstStart = lineStart
+            while (
+              first > 0 &&
+              (isDivider.test(lines[first - 1]) ||
+                codeBlocks.some(function (block) {
+                  return block[0] < firstStart && firstStart <= block[1]
+                }))
+            ) {
+              first = first - 1
+              firstStart = firstStart - lines[first].length - 1
+            }
+
+            // the first line with text after a title without text yet becomes its text
+            var previous = first - 1
+            while (previous >= 0 && /^\s*$/.test(lines[previous])) {
+              previous = previous - 1
+            }
+            var isTitleText =
+              previous >= 0 && /^#{1,6}\s*$|\]\(/.test(lines[previous])
+
+            if (
+              !isTitleText &&
+              !isDivider.test(lines[first]) &&
+              !goesWithNextLine.test(lines[first])
+            ) {
+              return lineEnd
+            }
           }
-          lineEnd = lineEnd - lines[i].length - 1
+          lineEnd = lineStart
         }
         return 0
       }
@@ -1168,33 +1236,33 @@
         // closing fence, e.g. inside a list) are removed, as they would add empty lines
         var withoutCode = ""
         var codeEnd = 0
-        var fence = null
-        CODE_BLOCK_REGEX.lastIndex = 0
-        while ((fence = CODE_BLOCK_REGEX.exec(markdown))) {
-          if (fence[1]) {
+        var fenceIndex = markdown.indexOf("```")
+        while (fenceIndex !== -1) {
+          var fence = getCodeBlock(markdown, fenceIndex)
+          if (fence.inline) {
             // three backticks closed on the same line (e.g. ```npm install```) are
             // inline code, not a code block
             withoutCode =
               withoutCode +
-              markdown.slice(codeEnd, fence.index) +
+              markdown.slice(codeEnd, fenceIndex) +
               "`" +
-              fence[1] +
+              fence.inline +
               "`"
           } else {
             // the indentation of the fence (e.g. inside a list) isn't part of the code,
             // so it's removed from every line of the code and from before the block
             // (where it would add an empty line too)
-            var fenceStart = fence.index
+            var fenceStart = fenceIndex
             while (
               fenceStart > codeEnd &&
               (markdown[fenceStart - 1] === " " || markdown[fenceStart - 1] === "\t")
             ) {
               fenceStart = fenceStart - 1
             }
-            var indent = markdown.slice(fenceStart, fence.index)
+            var indent = markdown.slice(fenceStart, fenceIndex)
             var code = indent
-              ? fence[2].replace(new RegExp("^" + indent, "gm"), "")
-              : fence[2]
+              ? fence.code.replace(new RegExp("^" + indent, "gm"), "")
+              : fence.code
             // the last line break of the code is found by hand, since a regex would look
             // for it in the whole code
             var lastBreak = code.lastIndexOf("\n")
@@ -1210,7 +1278,8 @@
               (codeBlocks.length - 1) +
               "%%"
           }
-          codeEnd = CODE_BLOCK_REGEX.lastIndex
+          codeEnd = fence.end
+          fenceIndex = markdown.indexOf("```", codeEnd)
         }
         markdown = withoutCode + markdown.slice(codeEnd)
 
