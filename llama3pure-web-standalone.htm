@@ -270,8 +270,16 @@
 
       var worker = null
       var reply = ""
+      var stableReplyLength = 0
+      var stableReplyHTML = ""
       var lastReply = null
       var lastPrompt = ""
+
+      // a code block (or three backticks closed on the same line, e.g. ```npm install```)
+      // with the indentation before its fence. the last group is the closing fence, which
+      // is empty while the block is still being written
+      var CODE_BLOCK_REGEX =
+        /([ \t]*)\`\`\`(?:([^`\n]+?)\`\`\`|[^\n]*(?:\n|$)([\s\S]*?)(\`\`\`\n?|$))/g
 
       function ICON_REGENERATE() {
         var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
@@ -440,14 +448,7 @@
                 document.title = t("title") + " - " + t("writing")
               }
               reply = reply + data.token
-              patchDOM(
-                lastReply,
-                addPointer(
-                  markdownToHTML(
-                    reply.replace(/&/g, "&#38;").replace(/\</g, "&#60;")
-                  )
-                )
-              )
+              renderReply()
               break
 
             case "complete":
@@ -656,6 +657,65 @@
         return pointerInTable !== html ? pointerInTable : html + pointer
       }
 
+      function getStableLength(text) {
+        // the complete lines don't change anymore while the reply is written, except the
+        // ones that go together with the next line: the lines of a code block, a table row
+        // ("|"), a quote (">"), an empty line (a title without text yet takes the next
+        // line), and the title, the divider and the end of a code block (they take the
+        // line break after them, so the next line is converted right after them)
+        var codeBlocks = []
+        var codeBlock = null
+        CODE_BLOCK_REGEX.lastIndex = 0
+        while ((codeBlock = CODE_BLOCK_REGEX.exec(text))) {
+          // a code block still being written goes until the end of the text
+          var blockEnd =
+            codeBlock[4] === "" ? text.length + 1 : CODE_BLOCK_REGEX.lastIndex
+          codeBlocks.push([codeBlock.index, blockEnd])
+        }
+
+        var goesWithNextLine =
+          /^(?:[|>]|\s*$|#{1,6}(?:\s|$)| {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$)/
+        var lines = text.split("\n")
+        var lineEnd = text.length - lines[lines.length - 1].length
+        for (var i = lines.length - 2; i >= 0; i--) {
+          var isInCodeBlock = codeBlocks.some(function (block) {
+            return block[0] < lineEnd && lineEnd <= block[1]
+          })
+          if (!isInCodeBlock && !goesWithNextLine.test(lines[i])) {
+            return lineEnd
+          }
+          lineEnd = lineEnd - lines[i].length - 1
+        }
+        return 0
+      }
+
+      function renderReply() {
+        // the lines that can't change anymore are converted only once, so each chunk only
+        // converts (and looks for the place of the pointer in) the lines still being
+        // written, however long the reply is
+        var pending = reply.slice(stableReplyLength)
+        var stableLength = getStableLength(pending)
+
+        if (stableLength > 0) {
+          var stableText = pending.slice(0, stableLength)
+          stableReplyHTML =
+            stableReplyHTML +
+            markdownToHTML(stableText.replace(/&/g, "&#38;").replace(/\</g, "&#60;"))
+          stableReplyLength = stableReplyLength + stableLength
+        }
+
+        var writingText = pending.slice(stableLength)
+        patchDOM(
+          lastReply,
+          stableReplyHTML +
+            addPointer(
+              markdownToHTML(
+                writingText.replace(/&/g, "&#38;").replace(/\</g, "&#60;")
+              )
+            )
+        )
+      }
+
       function ask(prompt, hidePrompt) {
         var content = document.querySelector(".content")
         var inputTextbox = document.querySelector(".input_textbox")
@@ -765,6 +825,8 @@
         document.title = t("title") + " - " + t("thinking")
 
         reply = ""
+        stableReplyLength = 0
+        stableReplyHTML = ""
 
         worker.postMessage({
           type: "generate",
@@ -1100,7 +1162,7 @@
         // fence and the last line break of the code (with the indentation of the
         // closing fence, e.g. inside a list) are removed, as they would add empty lines
         markdown = markdown.replace(
-          /([ \t]*)\`\`\`(?:([^`\n]+?)\`\`\`|[^\n]*(?:\n|$)([\s\S]*?)(?:\`\`\`\n?|$))/g,
+          CODE_BLOCK_REGEX,
           function (_match, indent, inline, group) {
             // three backticks closed on the same line (e.g. ```npm install```) are
             // inline code, not a code block
