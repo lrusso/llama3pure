@@ -273,6 +273,7 @@
       var renderedReplyLength = 0
       var replyFrame = null
       var replyFrameTime = 0
+      var checkedReplyLength = 0
       var lastReply = null
       var lastPrompt = ""
 
@@ -599,6 +600,12 @@
       }
 
       function reconcileNode(parent, existingNode, newNode) {
+        // a node that is already the same (e.g. a line or a button that didn't change) is
+        // left as it is, without comparing its attributes and children one by one
+        if (existingNode.isEqualNode(newNode)) {
+          return
+        }
+
         if (
           existingNode.nodeType !== newNode.nodeType ||
           existingNode.nodeName !== newNode.nodeName
@@ -772,8 +779,14 @@
         // once, so each chunk only converts (and looks for the place of the pointer in,
         // and updates on the page) the lines still being written, however long the reply
         // is
+        // a line can only be finished by a line break, so without a new one since the
+        // last time there are no new finished lines to look for
         var pending = reply.slice(stableReplyLength)
-        var stableLength = getStableLength(pending)
+        var stableLength =
+          reply.indexOf("\n", checkedReplyLength) === -1
+            ? 0
+            : getStableLength(pending)
+        checkedReplyLength = reply.length
 
         if (stableLength > 0) {
           var stableText = pending.slice(0, stableLength)
@@ -944,6 +957,7 @@
         stableReplyLength = 0
         stableReplyNodes = 0
         renderedReplyLength = 0
+        checkedReplyLength = 0
 
         worker.postMessage({
           type: "generate",
