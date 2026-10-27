@@ -5650,6 +5650,13 @@ function llama3pure(data) {
     }
   } catch (err) {
     console.log(err)
+
+    // a reply that fails is ended anyway, so the chat doesn't wait for it forever: a
+    // space (in case it failed before sending any text) and then the end of the reply
+    if (data.type === "generate") {
+      postMessage({ type: "token", token: " " })
+      postMessage({ type: "complete", output: " " })
+    }
   }
 }
 
