@@ -777,11 +777,12 @@
       function renderReply() {
         // the lines that can't change anymore are converted and added to the page only
         // once, so each chunk only converts (and looks for the place of the pointer in,
-        // and updates on the page) the lines still being written, however long the reply
-        // is
+        // and updates on the page) the lines still being written, however long the
+        // reply is
+        var pending = reply.slice(stableReplyLength)
+
         // a line can only be finished by a line break, so without a new one since the
         // last time there are no new finished lines to look for
-        var pending = reply.slice(stableReplyLength)
         var stableLength =
           reply.indexOf("\n", checkedReplyLength) === -1
             ? 0
