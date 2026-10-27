@@ -2374,7 +2374,6 @@ function matmulQ8_0Local(out, x, qw) {
   }
 }
 
-
 // Dequantize one Q8_0 row (even number of blocks) through the Int32 view
 function deqRowQ8_0I32(I32, p, dst, dstOff, cols) {
   var nbp = cols >> 6
@@ -2627,9 +2626,7 @@ function matmulQ5_KRows(out, x, qw, i) {
         var pk = (pq + k) | 0
         var hk = (p + 4 + k) | 0
         var q
-        q =
-          ((I32[pk] >> sh) & 0x0f0f0f0f) |
-          (((I32[hk] >> c) & 0x01010101) << 4)
+        q = ((I32[pk] >> sh) & 0x0f0f0f0f) | (((I32[hk] >> c) & 0x01010101) << 4)
         s0 = s0 + x0 * (k0 * (q & 0xff) - m0)
         s0 = s0 + x1 * (k0 * ((q >>> 8) & 0xff) - m0)
         s0 = s0 + x2 * (k0 * ((q >>> 16) & 0xff) - m0)
@@ -2747,8 +2744,8 @@ function matmulK16Rows(out, x, qw, i) {
         var hk = (hb + k) | 0
         var q
         q =
-          ((DV.getInt32((lk) | 0, true) >> loShift) & loMask) |
-          (((DV.getInt32((hk) | 0, true) >> hiShift) & hiMask) << hiUp)
+          ((DV.getInt32(lk | 0, true) >> loShift) & loMask) |
+          (((DV.getInt32(hk | 0, true) >> hiShift) & hiMask) << hiUp)
         s0 = s0 + x0 * (e0 * ((q & 0xff) - bias))
         s0 = s0 + x1 * (e0 * (((q >>> 8) & 0xff) - bias))
         s0 = s0 + x2 * (e0 * (((q >>> 16) & 0xff) - bias))
@@ -3035,7 +3032,7 @@ function rmsnorm(out, x, off, w, size, eps, invSize) {
   for (var i = off; i < end; i = i + 1, wi = wi + 1) {
     out[i] = w[wi] * ss * x[i]
   }
-}// Fused embedding scale + RMS norm for Gemma first layer (scales x in place)
+} // Fused embedding scale + RMS norm for Gemma first layer (scales x in place)
 function rmsnormGemmaFusedScale(out, x, w, size, eps, invSize, scale) {
   var ss = 0.0
   for (var i = 0; i < size; i = i + 1) {
@@ -4284,7 +4281,15 @@ function transformer(token, pos, computeLogits) {
 
     if (isGemma && l === 0) {
       // First layer: fused embed scale + rmsnorm
-      rmsnormGemmaFusedScale(xbArr, xArr, lw.rmsAttWeight, dim, eps, invDim, s.embedScale)
+      rmsnormGemmaFusedScale(
+        xbArr,
+        xArr,
+        lw.rmsAttWeight,
+        dim,
+        eps,
+        invDim,
+        s.embedScale
+      )
     } else {
       rmsnorm(xbArr, xArr, 0, lw.rmsAttWeight, dim, normEps, invDim)
     }
@@ -4453,7 +4458,15 @@ function transformerPrefill(allTokens, startPos, n) {
     for (var b = 0; b < n; b = b + 1) {
       if (isGemma && l === 0) {
         // First layer: fused embed scale + rmsnorm
-        rmsnormGemmaFusedScale(bXb[b], bX[b], lw.rmsAttWeight, dim, eps, invDim, s.embedScale)
+        rmsnormGemmaFusedScale(
+          bXb[b],
+          bX[b],
+          lw.rmsAttWeight,
+          dim,
+          eps,
+          invDim,
+          s.embedScale
+        )
       } else {
         rmsnorm(bXb[b], bX[b], 0, lw.rmsAttWeight, dim, normEps, invDim)
       }
@@ -4466,7 +4479,14 @@ function transformerPrefill(allTokens, startPos, n) {
       matmulQuantizedBatch(bQ, bXb, lw.wq, n, stC, tq)
     }
     matmulQuantizedBatch(bK, bXb, lw.wk, n, stC, tk && !tq)
-    matmulQuantizedBatch(bV, bXb, lw.wv, n, stC, (lw.wv.k.kind & 1) !== 0 && !tq && !tk)
+    matmulQuantizedBatch(
+      bV,
+      bXb,
+      lw.wv,
+      n,
+      stC,
+      (lw.wv.k.kind & 1) !== 0 && !tq && !tk
+    )
 
     // QK norms, RoPE, KV cache write, attention of every token
     var loff = l * s.kvCacheLayerSize
@@ -4487,11 +4507,27 @@ function transformerPrefill(allTokens, startPos, n) {
         if (lw.attnQNorm && lw.attnKNorm) {
           if (!kvOnly) {
             for (var h = 0; h < nHeads; h = h + 1) {
-              rmsnorm(qArr, qArr, h * headSize, lw.attnQNorm, headSize, eps, invHeadSize)
+              rmsnorm(
+                qArr,
+                qArr,
+                h * headSize,
+                lw.attnQNorm,
+                headSize,
+                eps,
+                invHeadSize
+              )
             }
           }
           for (var h = 0; h < nKvHeads; h = h + 1) {
-            rmsnorm(kArr, kArr, h * headSize, lw.attnKNorm, headSize, eps, invHeadSize)
+            rmsnorm(
+              kArr,
+              kArr,
+              h * headSize,
+              lw.attnKNorm,
+              headSize,
+              eps,
+              invHeadSize
+            )
           }
         }
         // NEOX RoPE with fused attnScale on Q
@@ -4551,7 +4587,7 @@ function transformerPrefill(allTokens, startPos, n) {
       // Quantize all Q heads to Q8_0
       quantizeToQ8_0Cache(qArr, 0, qQ8, qQ8i8, 0, qDim)
 
-        // SWA window enforcement
+      // SWA window enforcement
       var startT =
         isSwaLayer && config.swaWindow > 0
           ? Math.max(0, pos - config.swaWindow + 1)
@@ -5629,9 +5665,7 @@ function llama3pure(data) {
         if (data.model instanceof ArrayBuffer) {
           loadModel(data.model)
         } else {
-          console.log(
-            "The model parameter is required and must be an ArrayBuffer."
-          )
+          console.log("The model parameter is required and must be an ArrayBuffer.")
           return
         }
         postMessage({
