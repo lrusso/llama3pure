@@ -249,6 +249,32 @@
         return GET_APP_STRING[stringName] || ""
       }
 
+      function decodeUrlParameter(text) {
+        var spaced = text.replace(/\+/g, " ")
+
+        try {
+          return decodeURIComponent(spaced)
+        } catch (err) {
+          return spaced
+        }
+      }
+
+      function getUrlParameter(name) {
+        var pairs = window.location.search.substring(1).split("&")
+
+        for (var i = 0; i < pairs.length; i++) {
+          var separator = pairs[i].indexOf("=")
+          var key = separator === -1 ? pairs[i] : pairs[i].substring(0, separator)
+          var value = separator === -1 ? "" : pairs[i].substring(separator + 1)
+
+          if (decodeUrlParameter(key) === name) {
+            return decodeUrlParameter(value)
+          }
+        }
+
+        return null
+      }
+
       var customResponseRegexRules = []
       var customPromptRegexRules = []
       var customPrefix = ""
@@ -1881,13 +1907,12 @@
             inputTextbox.focus()
           })
 
-          var currentURL = new URL(window.location.href).searchParams
-          var requiredLightMode = currentURL.has("lightmode")
-          var requiredDarkMode = currentURL.has("darkmode")
-          var customMaxTokens = currentURL.get("maxTokens")
-          var customContextSize = currentURL.get("contextSize")
-          var customTopP = currentURL.get("topP")
-          var customTopK = currentURL.get("topK")
+          var requiredLightMode = getUrlParameter("lightmode") !== null
+          var requiredDarkMode = getUrlParameter("darkmode") !== null
+          var customMaxTokens = getUrlParameter("maxTokens")
+          var customContextSize = getUrlParameter("contextSize")
+          var customTopP = getUrlParameter("topP")
+          var customTopK = getUrlParameter("topK")
 
           var styleNode = document.createElement("style")
           if (requiredLightMode) {
