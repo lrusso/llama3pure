@@ -185,6 +185,8 @@
           error_filesize:
             "Error. Due to universal browser memory constraints regarding ArrayBuffer size limits, this Web engine can only read GGUF files up to 2 GB.",
           error_download: "Error. Something went wrong during the download process.",
+          error_context:
+            "Context length exceeded: the prompt has {prompt} tokens and the limit is {limit}.",
         },
         es: {
           title: "Llama",
@@ -211,6 +213,8 @@
             "Error. Debido a las restricciones de memoria de los navegadores con el tama\xF1o de los ArrayBuffer, este motor Web no puede leer archivos GGUF que superen los 2 GB.",
           error_download:
             "Error. Ha ocurrido un problema durante el proceso de descarga.",
+          error_context:
+            "Se super\xF3 el tama\xF1o del contexto: el prompt tiene {prompt} tokens y el l\xEDmite es {limit}.",
         },
       }
 
@@ -464,6 +468,14 @@
               break
 
             case "complete":
+              // a null reply means that the prompt didn't fit in the context: the
+              // reply is the error, with the token counts sent by the engine
+              if (data.output === null) {
+                reply = t("error_context")
+                  .replace("{prompt}", data.promptTokens)
+                  .replace("{limit}", data.tokenLimit)
+              }
+
               // the last tokens are shown right away
               window.cancelAnimationFrame(replyFrame)
               if (renderedReplyLength !== reply.length) {

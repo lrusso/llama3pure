@@ -5008,6 +5008,9 @@ typedef struct {
     int start_header_token;
     int end_header_token;
     int eot_token;
+    // Capacity of the prompt token buffer: tokens past it are counted, not
+    // stored (the count tells main() that the prompt does not fit the context)
+    int prompt_capacity;
 } Tokenizer;
 
 Tokenizer tokenizer;
@@ -5381,8 +5384,14 @@ static int vocab_longest_match(const unsigned char* text, size_t limit, int* mat
 // Global flag for tokenizer type (0 = tiktoken/BPE, 1 = SentencePiece)
 int use_sentencepiece = 0;
 
-void bpe_encode(const char *text, int *tokens, int *n_tokens) {
-    *n_tokens = 0;
+// Append a prompt token (only counted past tokenizer.prompt_capacity)
+static void push_token(int *tokens, int *n_tokens, int id) {
+    if (*n_tokens < tokenizer.prompt_capacity) tokens[*n_tokens] = id;
+    (*n_tokens)++;
+}
+
+// Tokenize text and append its tokens to tokens[*n_tokens...]
+void bpe_append(const char *text, int *tokens, int *n_tokens) {
     if (!text || !*text) return;
 
     // Convert text based on tokenizer type
@@ -5409,7 +5418,7 @@ void bpe_encode(const char *text, int *tokens, int *n_tokens) {
         int best_id = vocab_longest_match(bytes + pos, limit, &best_len);
 
         if (best_id != -1) {
-            tokens[(*n_tokens)++] = best_id;
+            push_token(tokens, n_tokens, best_id);
             pos += best_len;
         } else {
             // No token starts here - skip this byte
@@ -5418,6 +5427,11 @@ void bpe_encode(const char *text, int *tokens, int *n_tokens) {
     }
 
     free(encoded_text);
+}
+
+void bpe_encode(const char *text, int *tokens, int *n_tokens) {
+    *n_tokens = 0;
+    bpe_append(text, tokens, n_tokens);
 }
 
 // Initialize tokenizer from GGUF vocabulary
@@ -5693,8 +5707,6 @@ void free_chat_history(ChatMessage* messages, int count) {
 // Encode chat history with Llama3 instruct format
 void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char* sys_prompt, int* tokens, int* n_tokens) {
     *n_tokens = 0;
-    int temp_tokens[8192];
-    int temp_n = 0;
 
     int bos_token = find_special_token("<|begin_of_text|>");
     if (bos_token < 0) bos_token = LLAMA3_BOS_TOKEN;
@@ -5705,20 +5717,18 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
     int eot_token = find_special_token("<|eot_id|>");
     if (eot_token < 0) eot_token = LLAMA3_EOT;
 
-    tokens[(*n_tokens)++] = bos_token;
+    push_token(tokens, n_tokens, bos_token);
 
     if (sys_prompt && strlen(sys_prompt) > 0) {
-        tokens[(*n_tokens)++] = start_header;
-        bpe_encode("system", temp_tokens, &temp_n);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
-        tokens[(*n_tokens)++] = end_header;
+        push_token(tokens, n_tokens, start_header);
+        bpe_append("system", tokens, n_tokens);
+        push_token(tokens, n_tokens, end_header);
 
         char* sys_text = malloc(strlen(sys_prompt) + 4);
         sprintf(sys_text, "\n\n%s", sys_prompt);
-        bpe_encode(sys_text, temp_tokens, &temp_n);
+        bpe_append(sys_text, tokens, n_tokens);
         free(sys_text);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
-        tokens[(*n_tokens)++] = eot_token;
+        push_token(tokens, n_tokens, eot_token);
     }
 
     for (int m = 0; m < msg_count; m++) {
@@ -5728,33 +5738,27 @@ void encode_llama3_chat_history(ChatMessage* messages, int msg_count, const char
         // Llama uses "assistant" instead of "model"
         const char* llama_role = (strcmp(messages[m].role, "model") == 0) ? "assistant" : messages[m].role;
 
-        tokens[(*n_tokens)++] = start_header;
-        bpe_encode(llama_role, temp_tokens, &temp_n);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
-        tokens[(*n_tokens)++] = end_header;
+        push_token(tokens, n_tokens, start_header);
+        bpe_append(llama_role, tokens, n_tokens);
+        push_token(tokens, n_tokens, end_header);
 
         char* msg_text = malloc(strlen(messages[m].content) + 4);
         sprintf(msg_text, "\n\n%s", messages[m].content);
-        bpe_encode(msg_text, temp_tokens, &temp_n);
+        bpe_append(msg_text, tokens, n_tokens);
         free(msg_text);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
-        tokens[(*n_tokens)++] = eot_token;
+        push_token(tokens, n_tokens, eot_token);
     }
 
-    tokens[(*n_tokens)++] = start_header;
-    bpe_encode("assistant", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
-    tokens[(*n_tokens)++] = end_header;
+    push_token(tokens, n_tokens, start_header);
+    bpe_append("assistant", tokens, n_tokens);
+    push_token(tokens, n_tokens, end_header);
 
-    bpe_encode("\n\n", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+    bpe_append("\n\n", tokens, n_tokens);
 }
 
 // Encode chat history with Gemma3 instruct format
 void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char* sys_prompt, int* tokens, int* n_tokens) {
     *n_tokens = 0;
-    int temp_tokens[8192];
-    int temp_n = 0;
 
     int bos_token = find_special_token("<bos>");
     if (bos_token < 0) bos_token = GEMMA3_BOS_TOKEN;
@@ -5763,7 +5767,7 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
     int end_turn = find_special_token("<end_of_turn>");
     if (end_turn < 0) end_turn = GEMMA3_END_TURN;
 
-    tokens[(*n_tokens)++] = bos_token;
+    push_token(tokens, n_tokens, bos_token);
 
     int system_used = 0;
     for (int m = 0; m < msg_count; m++) {
@@ -5773,7 +5777,7 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
         // The system message is merged into the first user message
         if (strcmp(role, "system") == 0) continue;
 
-        tokens[(*n_tokens)++] = start_turn;
+        push_token(tokens, n_tokens, start_turn);
 
         char* role_text;
         if (!system_used && strcmp(role, "user") == 0 && sys_prompt && strlen(sys_prompt) > 0) {
@@ -5785,27 +5789,22 @@ void encode_gemma3_chat_history(ChatMessage* messages, int msg_count, const char
             sprintf(role_text, "%s\n%s", role, content);
         }
 
-        bpe_encode(role_text, temp_tokens, &temp_n);
+        bpe_append(role_text, tokens, n_tokens);
         free(role_text);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
 
-        tokens[(*n_tokens)++] = end_turn;
+        push_token(tokens, n_tokens, end_turn);
 
-        bpe_encode("\n", temp_tokens, &temp_n);
-        for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+        bpe_append("\n", tokens, n_tokens);
     }
 
-    tokens[(*n_tokens)++] = start_turn;
-    bpe_encode("model\n", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) tokens[(*n_tokens)++] = temp_tokens[i];
+    push_token(tokens, n_tokens, start_turn);
+    bpe_append("model\n", tokens, n_tokens);
 }
 
 // Encode a prompt with Gemma3 instruct format
 // Format: <bos><start_of_turn>user\n{prompt}<end_of_turn>\n<start_of_turn>model\n
 void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* tokens, int* n_tokens) {
     *n_tokens = 0;
-    int temp_tokens[8192];
-    int temp_n = 0;
 
     // Look up special tokens in vocabulary (or use defaults)
     int bos_token = find_special_token("<bos>");
@@ -5818,7 +5817,7 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
     if (end_turn < 0) end_turn = GEMMA3_END_TURN;
 
     // <bos>
-    tokens[(*n_tokens)++] = bos_token;
+    push_token(tokens, n_tokens, bos_token);
 
     // Optional system prompt (Gemma puts it in first user turn or as separate turn)
     // Gemma3 prefers system instructions in the user message
@@ -5832,34 +5831,25 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
     }
 
     // <start_of_turn>
-    tokens[(*n_tokens)++] = start_turn;
+    push_token(tokens, n_tokens, start_turn);
 
     // "user\n" + prompt - encode via BPE
     char* user_text = malloc(strlen(full_prompt) + 8);
     sprintf(user_text, "user\n%s", full_prompt);
-    bpe_encode(user_text, temp_tokens, &temp_n);
+    bpe_append(user_text, tokens, n_tokens);
     free(user_text);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
 
     // <end_of_turn>
-    tokens[(*n_tokens)++] = end_turn;
+    push_token(tokens, n_tokens, end_turn);
 
     // "\n" - encode via BPE
-    bpe_encode("\n", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
+    bpe_append("\n", tokens, n_tokens);
 
     // <start_of_turn>
-    tokens[(*n_tokens)++] = start_turn;
+    push_token(tokens, n_tokens, start_turn);
 
     // "model\n" - encode via BPE
-    bpe_encode("model\n", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
+    bpe_append("model\n", tokens, n_tokens);
 
     free(full_prompt);
 }
@@ -5868,8 +5858,6 @@ void encode_gemma3_chat(const char* prompt, const char* system_prompt, int* toke
 // Format: <|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n
 void encode_llama3_chat(const char* prompt, const char* system_prompt, int* tokens, int* n_tokens) {
     *n_tokens = 0;
-    int temp_tokens[8192];
-    int temp_n = 0;
 
     // Look up special tokens in vocabulary (or use defaults)
     int bos_token = find_special_token("<|begin_of_text|>");
@@ -5885,76 +5873,58 @@ void encode_llama3_chat(const char* prompt, const char* system_prompt, int* toke
     if (eot_token < 0) eot_token = LLAMA3_EOT;
 
     // <|begin_of_text|>
-    tokens[(*n_tokens)++] = bos_token;
+    push_token(tokens, n_tokens, bos_token);
 
     // System prompt if provided
     if (system_prompt && strlen(system_prompt) > 0) {
         // <|start_header_id|>
-        tokens[(*n_tokens)++] = start_header;
+        push_token(tokens, n_tokens, start_header);
 
         // "system" - encode via BPE
-        bpe_encode("system", temp_tokens, &temp_n);
-        for (int i = 0; i < temp_n; i++) {
-            tokens[(*n_tokens)++] = temp_tokens[i];
-        }
+        bpe_append("system", tokens, n_tokens);
 
         // <|end_header_id|>
-        tokens[(*n_tokens)++] = end_header;
+        push_token(tokens, n_tokens, end_header);
 
         // "\n\n" + system_prompt (encode via BPE)
         char* sys_text = malloc(strlen(system_prompt) + 4);
         sprintf(sys_text, "\n\n%s", system_prompt);
-        bpe_encode(sys_text, temp_tokens, &temp_n);
+        bpe_append(sys_text, tokens, n_tokens);
         free(sys_text);
-        for (int i = 0; i < temp_n; i++) {
-            tokens[(*n_tokens)++] = temp_tokens[i];
-        }
 
         // <|eot_id|>
-        tokens[(*n_tokens)++] = eot_token;
+        push_token(tokens, n_tokens, eot_token);
     }
 
     // <|start_header_id|>
-    tokens[(*n_tokens)++] = start_header;
+    push_token(tokens, n_tokens, start_header);
 
     // "user" - encode via BPE
-    bpe_encode("user", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
+    bpe_append("user", tokens, n_tokens);
 
     // <|end_header_id|>
-    tokens[(*n_tokens)++] = end_header;
+    push_token(tokens, n_tokens, end_header);
 
     // "\n\n" + prompt (encode via BPE)
     char* user_text = malloc(strlen(prompt) + 4);
     sprintf(user_text, "\n\n%s", prompt);
-    bpe_encode(user_text, temp_tokens, &temp_n);
+    bpe_append(user_text, tokens, n_tokens);
     free(user_text);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
 
     // <|eot_id|>
-    tokens[(*n_tokens)++] = eot_token;
+    push_token(tokens, n_tokens, eot_token);
 
     // <|start_header_id|>
-    tokens[(*n_tokens)++] = start_header;
+    push_token(tokens, n_tokens, start_header);
 
     // "assistant" - encode via BPE
-    bpe_encode("assistant", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
+    bpe_append("assistant", tokens, n_tokens);
 
     // <|end_header_id|>
-    tokens[(*n_tokens)++] = end_header;
+    push_token(tokens, n_tokens, end_header);
 
     // "\n\n" (encode via BPE)
-    bpe_encode("\n\n", temp_tokens, &temp_n);
-    for (int i = 0; i < temp_n; i++) {
-        tokens[(*n_tokens)++] = temp_tokens[i];
-    }
+    bpe_append("\n\n", tokens, n_tokens);
 }
 
 // ----------------------------------------------------------------------------
@@ -6528,6 +6498,7 @@ int main(int argc, char *argv[]) {
     }
 
     prompt_tokens = (int*)malloc(config.seq_len * sizeof(int));
+    tokenizer.prompt_capacity = config.seq_len;
 
     if (chat_history_file != NULL) {
         // Read chat history from file
@@ -6589,6 +6560,14 @@ int main(int argc, char *argv[]) {
 
     // The prompt is tokenized: the vocabulary lookup tables are not needed anymore
     free_vocab_hash();
+
+    // A prompt that fills the context leaves no position to reply in: the reply
+    // is the error and nothing is computed
+    if (num_prompt_tokens >= max_tokens) {
+        printf("Context length exceeded: the prompt has %d tokens and the limit is %d.\n",
+               num_prompt_tokens, max_tokens);
+        goto cleanup;
+    }
 
     long start = 0;
 

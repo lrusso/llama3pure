@@ -5479,6 +5479,18 @@ function generate(chatHistory) {
     effectiveMaxTokens = config.seqLen
   }
 
+  // A prompt that fills the context leaves no position to reply in: nothing
+  // is computed and the reply is null, with both token counts for the caller
+  if (numPromptTokens >= effectiveMaxTokens) {
+    postMessage({
+      type: "complete",
+      output: null,
+      promptTokens: numPromptTokens,
+      tokenLimit: effectiveMaxTokens,
+    })
+    return null
+  }
+
   // Reuse the KV cache of the previous call: positions whose tokens match the
   // start of this prompt stay (the last prompt token always runs again). With
   // Q8_0 layer matrices only prefilled positions are kept: the single-token
@@ -5605,12 +5617,6 @@ function generate(chatHistory) {
       output = output + remaining
       postMessage({ type: "token", token: remaining })
     }
-  }
-
-  // A prompt longer than the context ran past the KV cache: nothing is trusted
-  if (numPromptTokens - 1 > config.seqLen) {
-    state.kvCount = 0
-    state.kvBatch = 0
   }
 
   // Release the scratch of this call (logits included)
