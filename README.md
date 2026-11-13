@@ -49,7 +49,7 @@ llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 | -prompt        |    No    | Input prompt text (single-turn, alternative to -chathistory).                                           |               -                |
 | -chathistory   |    No    | Path to a .txt file containing a JSON chat history (multi-turn, alternative to -prompt).                |               -                |
 | -system_prompt |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| -max_tokens    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| -max_tokens    |    No    | Maximum number of tokens of a conversation, counting the prompt and the response.                       |       -1 (context size)        |
 | -context_size  |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
 | -temperature   |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
 | -top_p         |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
@@ -57,6 +57,8 @@ llama3pure.exe -model Llama3.gguf -chathistory chat.txt
 | -debug         |    No    | Show detailed model loading and performance logs (including tok/s).                                     |            disabled            |
 
 Sample chat history in [tests.txt](https://github.com/lrusso/llama3pure/blob/main/tests.txt). A message with `"type": "system"` sets the system prompt, taking precedence over `-system_prompt`.
+
+When the prompt doesn't fit in the context (or in `-max_tokens`), nothing is generated and the engine prints `Context length exceeded: the prompt has N tokens and the limit is M.`
 
 ## Running in Node.js
 
@@ -103,9 +105,9 @@ llama3pure({
 | :----------- | :---------: | :------: | :------------------------------------------------------------------------------------------------------ | :----------------------------: |
 | type         |   string    |   Yes    | Must be `load`                                                                                          |               -                |
 | model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                           |               -                |
-| cbRender     |  function   |   Yes    | Callback invoked with each generated token as a string.                                                 |               -                |
+| cbRender     |  function   |    No    | Callback invoked with each generated token as a string.                                                 |               -                |
 | systemPrompt |   string    |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| maxTokens    |   number    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| maxTokens    |   number    |    No    | Maximum number of tokens of a conversation, counting the prompt and the response.                       |       -1 (context size)        |
 | contextSize  |   number    |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
 | temperature  |   number    |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
 | topP         |   number    |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
@@ -136,15 +138,18 @@ llama3pure({
 | type        | string |   Yes    | Must be `generate`.                                     |
 | chatHistory | array  |   Yes    | Array of message objects representing the conversation. |
 
+When the prompt doesn't fit in the context (or in `maxTokens`), nothing is generated and `cbRender` isn't called.
+
 Full example in [llama3pure-nodejs-demo.js](https://github.com/lrusso/llama3pure/blob/main/llama3pure-nodejs-demo.js).
 
 ## Running in Web Environments
 
 - Step 1: Load a model
 
-Read the GGUF file as an ArrayBuffer and send it to the worker with type: "load". The ArrayBuffer is transferred (not copied) for performance.
+Create the Worker as a module, read the GGUF file as an ArrayBuffer and send it to the worker with type: "load". The ArrayBuffer is transferred (not copied) for performance.
 
 ```javascript
+const worker = new Worker("llama3pure-js-engine.js", { type: "module" })
 const reader = new FileReader()
 
 reader.onload = (event) => {
@@ -172,7 +177,7 @@ reader.readAsArrayBuffer(file)
 | type         |   string    |   Yes    | Must be `load`                                                                                          |               -                |
 | model        | ArrayBuffer |   Yes    | The GGUF model file contents.                                                                           |               -                |
 | systemPrompt |   string    |    No    | System prompt prepended to every conversation.                                                          | `You are a helpful assistant.` |
-| maxTokens    |   number    |    No    | Maximum number of tokens to generate per response.                                                      |         -1 (unlimited)         |
+| maxTokens    |   number    |    No    | Maximum number of tokens of a conversation, counting the prompt and the response.                       |       -1 (context size)        |
 | contextSize  |   number    |    No    | Context window size (capped by the model's own limit).                                                  |          Model's max.          |
 | temperature  |   number    |    No    | Sampling temperature. Higher values produce more varied output.                                         |              0.9               |
 | topP         |   number    |    No    | Nucleus sampling threshold. Only tokens whose cumulative probability reaches this value are considered. |              0.9               |
@@ -235,11 +240,13 @@ worker.onmessage = function (e) {
 | token    | token (string)  | Emitted for each token as it is generated, enabling real-time streaming of the response. |
 | complete | output (string) | Emitted when generation finishes. Contains the full generated text.                      |
 
-When the prompt doesn't fit in the context, nothing is generated: `complete` is emitted with `output` set to `null`, together with `promptTokens` (tokens of the prompt) and `tokenLimit` (the limit that was exceeded).
+When the prompt doesn't fit in the context (or in `maxTokens`), nothing is generated: `complete` is emitted with `output` set to `null`, together with `promptTokens` (tokens of the prompt) and `tokenLimit` (the limit that was exceeded).
 
 Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
 
 A standalone version is available [here](https://lrusso.github.io/llama3pure/llama3pure-web-standalone.htm); it offers the same functionality as the standard version but uses a base64-embedded Worker, allowing you to run it as a local file without a web server.
+
+In both versions, the gear icon opens the settings: the theme (automatic, light or dark) and the context size, which can be chosen until a model is loaded.
 
 ## Suggested Models and Engines
 
