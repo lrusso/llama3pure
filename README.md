@@ -237,7 +237,7 @@ worker.onmessage = function (e) {
 
 When the prompt doesn't fit in the context, nothing is generated: `complete` is emitted with `output` set to `null`, together with `promptTokens` (tokens of the prompt) and `tokenLimit` (the limit that was exceeded).
 
-Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm) or with custom `maxTokens`, `contextSize`, `topP` and `topK` [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm?maxTokens=2048&contextSize=4096&topP=0.9&topK=40).
+Try the Web engine [here](https://lrusso.github.io/llama3pure/llama3pure-web-demo.htm).
 
 A standalone version is available [here](https://lrusso.github.io/llama3pure/llama3pure-web-standalone.htm); it offers the same functionality as the standard version but uses a base64-embedded Worker, allowing you to run it as a local file without a web server.
 
