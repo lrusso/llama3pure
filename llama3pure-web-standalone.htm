@@ -322,32 +322,6 @@
         return GET_APP_STRING[stringName] || ""
       }
 
-      function decodeUrlParameter(text) {
-        var spaced = text.replace(/\+/g, " ")
-
-        try {
-          return decodeURIComponent(spaced)
-        } catch (err) {
-          return spaced
-        }
-      }
-
-      function getUrlParameter(name) {
-        var pairs = window.location.search.substring(1).split("&")
-
-        for (var i = 0; i < pairs.length; i++) {
-          var separator = pairs[i].indexOf("=")
-          var key = separator === -1 ? pairs[i] : pairs[i].substring(0, separator)
-          var value = separator === -1 ? "" : pairs[i].substring(separator + 1)
-
-          if (decodeUrlParameter(key) === name) {
-            return decodeUrlParameter(value)
-          }
-        }
-
-        return null
-      }
-
       var customResponseRegexRules = []
       var customPromptRegexRules = []
       var customPrefix = ""
@@ -2021,11 +1995,6 @@
             inputTextbox.focus()
           })
 
-          var customMaxTokens = getUrlParameter("maxTokens")
-          var customContextSize = getUrlParameter("contextSize")
-          var customTopP = getUrlParameter("topP")
-          var customTopK = getUrlParameter("topK")
-
           var headerTheme = document.querySelector(".header_theme")
           var themeOverlay = document.querySelector(".theme_overlay")
           var themeMenu = document.querySelector(".theme_menu")
@@ -2076,22 +2045,6 @@
             }
           })
 
-          if (
-            customMaxTokens &&
-            /^\d+$/.test(customMaxTokens) &&
-            parseInt(customMaxTokens) > 0
-          ) {
-            MAX_TOKENS = parseInt(customMaxTokens)
-          }
-
-          if (
-            customContextSize &&
-            /^\d+$/.test(customContextSize) &&
-            parseInt(customContextSize) > 0
-          ) {
-            CONTEXT_SIZE = parseInt(customContextSize)
-          }
-
           // the menu also has the context size, which goes with the next model that
           // is loaded
           themeOverlay.setAttribute("data-context", CONTEXT_SIZE)
@@ -2104,19 +2057,6 @@
               themeOverlay.setAttribute("data-context", context)
             }
           })
-
-          if (
-            customTopP &&
-            !isNaN(parseFloat(customTopP)) &&
-            parseFloat(customTopP) > 0 &&
-            parseFloat(customTopP) <= 1
-          ) {
-            TOP_P = parseFloat(customTopP)
-          }
-
-          if (customTopK && /^\d+$/.test(customTopK) && parseInt(customTopK) > 0) {
-            TOP_K = parseInt(customTopK)
-          }
 
           pleaseWait.style.display = "none"
           container.style.display = "block"
