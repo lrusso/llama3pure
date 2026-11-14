@@ -80,7 +80,7 @@ const readFileAsArrayBuffer = (filePath) => {
 const testModelUsingC = (model) => {
   try {
     execSync(
-      //`./llama3pure -model "${model}" -prompt "Tell me in 1 line what is Microsoft." -max_tokens -1 -context_size 2048`,
+      //`./llama3pure -model "${model}" -prompt "Tell me in one line what Microsoft is." -max_tokens -1 -context_size 2048`,
       `./llama3pure -model "${model}" -chathistory tests.txt -max_tokens -1 -context_size 2048`,
       {
         stdio: "inherit",
@@ -108,7 +108,7 @@ const testModelUsingNode = (model) => {
     type: "generate",
     chatHistory: [
       { type: "system", text: "You are a helpful assistant." },
-      { type: "user", text: "Tell me in 1 line what is Microsoft." },
+      { type: "user", text: "Tell me in one line what Microsoft is." },
       {
         type: "model",
         response: [
@@ -165,7 +165,7 @@ const testPerformance = () => {
     type: "generate",
     chatHistory: [
       { type: "system", text: "You are a helpful assistant." },
-      { type: "user", text: "Tell me in 1 line what is Microsoft." },
+      { type: "user", text: "Tell me in one line what Microsoft is." },
       {
         type: "model",
         response: [

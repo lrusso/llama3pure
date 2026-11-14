@@ -42,7 +42,7 @@ const main = () => {
   llama3pure({
     type: "generate",
     chatHistory: [
-      { type: "user", text: "Tell me in 1 line what is Microsoft." },
+      { type: "user", text: "Tell me in one line what Microsoft is." },
       {
         type: "model",
         response: [
