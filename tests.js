@@ -1,11 +1,22 @@
-import llama3pure from "./llama3pure-js-engine.js"
 import { execSync, spawnSync } from "child_process"
+import { createRequire } from "module"
 import { fileURLToPath } from "url"
 import path from "path"
 import fs from "fs"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
+const require = createRequire(import.meta.url)
+
+const ENGINE = "llama3pure-js-engine.js"
+const ENGINE_DEV = "llama3pure-js-engine-dev.js"
+const PERF_ROUNDS = 5
+
+// the engine is loaded on demand, so a process only holds the engine it measures
+let llama3pure = null
+const loadEngine = (engineFile) => {
+  llama3pure = require(path.resolve(__dirname, engineFile))
+}
 
 if (!process.execArgv.includes("--max-old-space-size=16384")) {
   execSync(
@@ -145,7 +156,9 @@ const perfColumns = [
 // one model, in a process of its own; its results go to the parent through fd 3.
 // it is a chat of two turns with the two questions of the normal tests: the reply to the
 // first question is sent back in the history of the second one
-const testPerformanceOfModel = (modelName) => {
+const testPerformanceOfModel = (engineFile, modelName) => {
+  loadEngine(engineFile)
+
   const MB = 1024 * 1024
   const m0 = process.memoryUsage().rss
   const t0 = performance.now()
@@ -263,39 +276,168 @@ const testPerformanceOfModel = (modelName) => {
   fs.writeSync(3, JSON.stringify(result))
 }
 
+// the average of a column in the rounds of an engine, or null when a round of the model
+// failed or the column is missing
+const perfAverage = (rounds, model, column) => {
+  let sum = 0
+  for (let i = 0; i < rounds.length; i++) {
+    const row = rounds[i].find((item) => item.Model === model)
+    if (!row || row.Error || row[column] === undefined) {
+      return null
+    }
+    sum = sum + parseFloat(row[column])
+  }
+  return rounds.length > 0 ? sum / rounds.length : null
+}
+
+// true when a reply column is the same text in every round of both engines
+const perfSameReplies = (baseRounds, devRounds, model, column) => {
+  const replies = baseRounds.concat(devRounds).map((round) => {
+    const row = round.find((item) => item.Model === model)
+    return row ? row[column] : undefined
+  })
+  return replies.every((reply) => reply !== undefined && reply === replies[0])
+}
+
+// the report of the dev engine with respect to the engine: per model, the columns where
+// it is faster, slower or equal and where it uses less, more or the same RAM, with the
+// percentage of difference between the averages of the rounds
+const perfReport = (baseRounds, devRounds, perfModels) => {
+  const lines = []
+  const totals = { better: 0, worse: 0, equal: 0, missing: 0 }
+  const columns = perfColumns.filter(
+    (column) => column.startsWith("RAM ") || column.startsWith("Speed ")
+  )
+  const percent = (base, dev) => {
+    const value = base !== 0 ? (dev / base - 1) * 100 : 0
+    return (value > 0 ? "+" : "") + value.toFixed(2) + " %"
+  }
+
+  lines.push(
+    "Results of " +
+      ENGINE_DEV +
+      " with respect to " +
+      ENGINE +
+      " (average of " +
+      PERF_ROUNDS +
+      " rounds per engine)"
+  )
+
+  perfModels.forEach((model) => {
+    const groups = {
+      Faster: [],
+      Slower: [],
+      "Same speed": [],
+      "Less RAM": [],
+      "More RAM": [],
+      "Same RAM": [],
+      "Not measured": [],
+    }
+
+    columns.forEach((column) => {
+      const isRam = column.startsWith("RAM ")
+      const base = perfAverage(baseRounds, model, column)
+      const dev = perfAverage(devRounds, model, column)
+      if (base === null || dev === null) {
+        groups["Not measured"].push(column)
+        totals.missing++
+      } else if (dev < base) {
+        groups[isRam ? "Less RAM" : "Faster"].push(column + " " + percent(base, dev))
+        totals.better++
+      } else if (dev > base) {
+        groups[isRam ? "More RAM" : "Slower"].push(column + " " + percent(base, dev))
+        totals.worse++
+      } else {
+        groups[isRam ? "Same RAM" : "Same speed"].push(column + " 0.00 %")
+        totals.equal++
+      }
+    })
+
+    lines.push("")
+    lines.push(model)
+    Object.keys(groups).forEach((group) => {
+      if (groups[group].length > 0) {
+        lines.push("  " + group + ": " + groups[group].join(", "))
+      }
+    })
+    lines.push(
+      "  Replies: " +
+        (perfSameReplies(baseRounds, devRounds, model, "Reply") &&
+        perfSameReplies(baseRounds, devRounds, model, "Reply turn 2")
+          ? "identical"
+          : "different")
+    )
+  })
+
+  lines.push("")
+  lines.push(
+    "Total: " +
+      totals.better +
+      " faster or with less RAM, " +
+      totals.worse +
+      " slower or with more RAM, " +
+      totals.equal +
+      " equal, " +
+      totals.missing +
+      " not measured"
+  )
+
+  return lines.join("\n")
+}
+
 // every model found in the folder (or the ones given as arguments), one process at a
-// time so the memory of a model is not counted in the next one. nothing is printed:
-// the results are saved in results.json, which is written again after every model
+// time so the memory of a model is not counted in the next one: first the rounds of
+// the engine and then the rounds of the dev engine. nothing is saved: the report of
+// the dev engine with respect to the engine is printed at the end
 const testPerformance = (requestedModels) => {
+  if (!fs.existsSync(path.resolve(__dirname, ENGINE_DEV))) {
+    console.log(ENGINE_DEV + " was not found: there is nothing to compare.")
+    return
+  }
+
   const perfModels = (requestedModels.length > 0 ? requestedModels : models).filter(
     (model) => fs.existsSync(path.resolve(__dirname, model))
   )
-  const resultsPath = path.resolve(__dirname, "results.json")
-  const results = []
+  const results = {}
 
-  perfModels.forEach((model) => {
-    const result = spawnSync(
-      process.execPath,
-      ["--max-old-space-size=16384", __filename, "perf-model", model],
-      { stdio: ["ignore", "ignore", "inherit", "pipe"] }
-    )
+  ;[ENGINE, ENGINE_DEV].forEach((engineFile) => {
+    results[engineFile] = []
 
-    const output =
-      result.output && result.output[3] ? result.output[3].toString() : ""
-    if (result.status === 0 && output.length > 0) {
-      results.push(JSON.parse(output))
-    } else {
-      results.push({ Model: model, Error: "The performance test failed." })
+    for (let round = 0; round < PERF_ROUNDS; round++) {
+      const rows = []
+      results[engineFile].push(rows)
+
+      perfModels.forEach((model) => {
+        const result = spawnSync(
+          process.execPath,
+          [
+            "--max-old-space-size=16384",
+            __filename,
+            "perf-model",
+            engineFile,
+            model,
+          ],
+          { stdio: ["ignore", "ignore", "inherit", "pipe"] }
+        )
+
+        const output =
+          result.output && result.output[3] ? result.output[3].toString() : ""
+        if (result.status === 0 && output.length > 0) {
+          rows.push(JSON.parse(output))
+        } else {
+          rows.push({ Model: model, Error: "The performance test failed." })
+        }
+      })
     }
-
-    fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2) + "\n")
   })
+
+  console.log(perfReport(results[ENGINE], results[ENGINE_DEV], perfModels))
 }
 
 const testAllModels = () => {
   const availableModels = models.filter((model) => fs.existsSync(model))
 
-  const jsBuildExists = fs.existsSync("llama3pure-js-engine.js")
+  const jsBuildExists = fs.existsSync(ENGINE)
   const nativeBuildExists =
     fs.existsSync("llama3pure") || fs.existsSync("llama3pure.exe")
 
@@ -310,6 +452,7 @@ const testAllModels = () => {
 
   if (jsBuildExists && availableModels.length > 0) {
     console.log("\x1b[1mRunning Node.js tests...\x1b[0m")
+    loadEngine(ENGINE)
 
     models.forEach(function (model) {
       if (fs.existsSync(model)) {
@@ -323,7 +466,7 @@ const testAllModels = () => {
 if (process.argv[2] === "perf") {
   testPerformance(process.argv.slice(3))
 } else if (process.argv[2] === "perf-model") {
-  testPerformanceOfModel(process.argv[3])
+  testPerformanceOfModel(process.argv[3], process.argv[4])
 } else {
   testAllModels()
 }

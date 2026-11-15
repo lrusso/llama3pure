@@ -24,7 +24,7 @@ The JavaScript engine is one file used both by Node.js and by the browser. The C
 | `llama3pure-web-demo.htm`       | Web chat client. Loads the engine from `llama3pure-js-engine.js`   |
 | `llama3pure-web-standalone.htm` | The same client with the engine embedded inside the page           |
 | `llama3pure-nodejs-demo.js`     | Minimal Node.js example                                            |
-| `tests.js`                      | Test runner (all models, or a timed run of every model)            |
+| `tests.js`                      | Test runner (all models, or the timed test of the dev engine)      |
 | `tests.txt`                     | Sample chat history in JSON, used by the C tests                   |
 | `index.html`                    | Landing page of the project site                                   |
 | `README.md`                     | User documentation: arguments, parameters, messages, tested models |
@@ -116,10 +116,10 @@ Two things must always hold:
 
 ```bash
 node tests.js        # every model found in the folder, with the C engine and with Node.js
-node tests.js perf   # one timed run of every model found in the folder, with Node.js
+node tests.js perf   # 5 timed rounds of every model with the engine, then 5 with the dev engine, and a report
 ```
 
-`node tests.js perf` runs every model found in the folder, one process at a time, holds a chat of two turns with each one (the two questions of the normal tests, with the reply to the first one sent back in the history of the second), prints nothing and saves everything in `results.json` (ignored by git, written again after every model and replaced by the next run): one object per model with the columns of the report below, followed by the columns of the second turn and by the two replies: the process memory at the start, after reading, after loading, after generating and at its peak, and the time to load, to prefill, to the first token, per token and in total. The prefill time is the time to the first token minus the average time per token. Model file names can be given after `perf` to run only those. It runs at temperature 0, so the same engine gives the same replies in every run and two versions of the engine can be compared column by column; a reply that changes means the output of the engine changed.
+`node tests.js perf` compares `llama3pure-js-engine-dev.js` (the engine with a possible improvement, placed next to the engine) with `llama3pure-js-engine.js`. It runs every model found in the folder, one process at a time: first 5 rounds with `llama3pure-js-engine.js` and then 5 rounds with `llama3pure-js-engine-dev.js`. If the dev engine is missing it says so and measures nothing. In every round it holds a chat of two turns with each one (the two questions of the normal tests, with the reply to the first one sent back in the history of the second), and measures, for every model, the columns of the report below, followed by the columns of the second turn and by the two replies: the process memory at the start, after reading, after loading, after generating and at its peak, and the time to load, to prefill, to the first token, per token and in total. The prefill time is the time to the first token minus the average time per token. Model file names can be given after `perf` to run only those. It runs at temperature 0, so the same engine gives the same replies in every run and two versions of the engine can be compared column by column; a reply that changes means the output of the engine changed. Nothing is saved to a file: when the 10 rounds are over it prints one report of the dev engine with respect to the engine: for every model, the instances where the dev engine is faster, slower or equal and where it uses less, more or the same RAM, with the percentage of difference between the averages of the 5 rounds, and whether the replies are identical.
 
 ## Rules for every improvement or fix
 
@@ -133,39 +133,39 @@ These rules have no exceptions. A change that breaks one of them is not acceptab
 How to work within the rules:
 
 - Measure with `node tests.js perf`. It is the tool for every measurement of the JavaScript engine: do not write another benchmark, harness or script for it. If a measurement is missing from it, add it to `tests.js`.
-- Measure the original code and the changed code with real models and compare their `results.json` files, as described in the next section. Do not estimate.
-- Run measurements one process at a time and repeat them, alternating the old and the new code, before concluding that a number went up or down.
+- Measure the original code and the changed code with real models, as described in the next section. Do not estimate.
+- Run measurements one process at a time: `node tests.js perf` repeats every model 5 times with each engine before a number is said to go up or down.
 - Check that the output did not change unless changing it is the purpose of the fix.
 - When a change cannot meet a rule, do not present it as finished: report the numbers and where the rule is broken.
 - Keep the two engines consistent when a change applies to both, rebuild the C binary after changing the C engine, and update the engine embedded in the standalone page after changing the JavaScript engine.
 
 ## Comparing a possible improvement with the original code
 
-A possible improvement is always judged against the original code of the project, and the comparison is always made between `results.json` files: the ones produced by the original code and the ones produced by the code with the possible improvement.
+A possible improvement is always judged against the original code of the project, and the comparison is always made by `node tests.js perf`, which measures both engines and prints the report of the comparison.
 
-- **The original code** is the code of the last commit, without the possible improvement. **The changed code** is the same code with the possible improvement applied.
-- Both are measured with the same `tests.js`, the same model files, the same machine and the same session. Results of the original code from an earlier session are not reused.
-- To run the original code without losing the changes, use a copy of the last commit in a temporary folder outside the repository, with `tests.js` next to it and the model files linked into that folder.
-- These steps are the whole procedure: follow them directly. Do not read or inspect `tests.js` before measuring. It looks for the engine and the model files in its own folder and writes `results.json` there, and nothing else about it is needed to run the comparison. Read `tests.js` only when the task is to change it.
-- Every run of `node tests.js perf` replaces `results.json`. After each run, copy the file to a temporary folder outside the repository, with a name that says which code produced it and which run it was (for example `original-1.json` and `changed-1.json`). These copies are never added to the repository.
-- The runs alternate between the original code and the changed code, one process at a time: the testing round described below applies to both, so each model ends with 5 `results.json` objects of the original code and 5 of the changed code.
-- The comparison is made model by model and key by key, between the objects of the same model:
-  - Each `RAM ...` and `Speed ...` key is one instance. Its value for a code is the average of the 5 runs of that code. The changed code reaches the expected result at that instance when its value is the same as the value of the original code, or lower.
-  - `Reply` and `Reply turn 2` must be identical in the original code and in the changed code, unless changing the output is the purpose of the fix.
-  - An object with an `Error` key, or a model that is missing from one of the files, is a failed measurement: its instances count as not measured.
+- **The original code** is `llama3pure-js-engine.js`, as it is in the last commit. **The changed code** is `llama3pure-js-engine-dev.js`: a copy of the engine, in the same folder, with the possible improvement applied.
+- **Everything is done in the repository folder.** It has all that is needed to work: the two engines, `tests.js` and the model files. Do not create temporary folders, copies of the repository or copies of the last commit anywhere else to measure or to compare.
+- **The new logic is created in `llama3pure-js-engine-dev.js` first.** `llama3pure-js-engine.js` is not modified while the improvement is being judged. The dev engine is a working file, ignored by git: it is never added to the repository.
+- One execution of `node tests.js perf` is the whole comparison: it runs 5 rounds of every model with `llama3pure-js-engine.js` and then 5 rounds with `llama3pure-js-engine-dev.js`, one process at a time, so both are measured with the same `tests.js`, the same model files, the same machine and the same session. Results from an earlier execution are not reused.
+- These steps are the whole procedure: follow them directly. Do not read or inspect `tests.js` before measuring. It looks for the two engines and the model files in its own folder and prints the report at the end, and nothing else about it is needed to run the comparison. Read `tests.js` only when the task is to change it.
+- The measurements are kept in memory, 5 rounds per engine and one object per model in every round, and nothing is saved to a file. The report printed at the end is made from them, model by model and key by key:
+  - Each `RAM ...` and `Speed ...` key is one instance. Its value for an engine is the average of the 5 rounds of that engine. The dev engine reaches the expected result at that instance when its value is the same as the value of the engine, or lower. The report lists every instance as faster, slower or equal (less, more or the same RAM), with the percentage of difference.
+  - `Reply` and `Reply turn 2` must be identical in the engine and in the dev engine, unless changing the output is the purpose of the fix.
+  - An object with an `Error` key, or a model that is missing from a round, is a failed measurement: its instances count as not measured.
 - The cells of the report table come from this comparison and from nothing else.
+- **Only when the improvement is valid, it is implemented from `llama3pure-js-engine-dev.js` into `llama3pure-js-engine.js`**, and the engine embedded in the standalone page is updated. An improvement that is not valid stays out of `llama3pure-js-engine.js`.
 
 ## Limit on testing rounds
 
-A testing round is the set of runs an AI agent makes to check one possible improvement. A test run is one execution of `node tests.js perf`.
+A testing round is the set of runs an AI agent makes to check one possible improvement: one execution of `node tests.js perf`, which runs every model 5 times with the engine and 5 times with the dev engine.
 
-- **Exactly 5 test runs per model in every round. Always 5: never fewer, never more.** Every model that is tested is run 5 times with the changed code and 5 times with the original code it is compared with, and then the round is over for that model.
-- If the result is not good enough after those 5 runs, the agent does not keep running the same thing. It tries something else (a different change or a different approach), and that new attempt gets its own round of exactly 5 runs per model, and so on.
+- **Exactly 5 runs per model and per engine in every round. Always 5: never fewer, never more.** That is what one execution of `node tests.js perf` does, so one possible improvement gets one execution, and then the round is over.
+- If the result is not good enough after that execution, the agent does not run the same thing again. It tries something else (a different change or a different approach), and that new attempt gets its own round, and so on.
 - The number applies to every model separately and to every round. It is not a total for the whole session.
 
 ## Report required at the end of every improvement
 
-When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the `results.json` files of the original code with the ones of the changed code, as described in "Comparing a possible improvement with the original code".
+When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by the comparison of the engine with the dev engine made by `node tests.js perf`, as described in "Comparing a possible improvement with the original code".
 
 - **One row per GGUF model that was tested.** Every model used in the tests appears, with its file name. Models that were not tested are not listed as if they had been.
 - **One single table, with one column per instance of the process.**
