@@ -161,6 +161,7 @@ A testing round is the set of runs an AI agent makes to check one possible impro
 
 - **Exactly 5 runs per model and per engine in every round. Always 5: never fewer, never more.** That is what one execution of `node tests.js perf` does, so one possible improvement gets one execution, and then the round is over.
 - If the result is not good enough after that execution, the agent does not run the same thing again. It tries something else (a different change or a different approach), and that new attempt gets its own round, and so on.
+- When the report shows more RAM or a slower result at any instance, the agent keeps trying with other logic directly. It does not ask the user whether to continue and it does not stop to wait for an answer: it goes straight to the next attempt.
 - The number applies to every model separately and to every round. It is not a total for the whole session.
 
 ## Report required at the end of every improvement
