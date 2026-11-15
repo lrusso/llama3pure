@@ -128,7 +128,7 @@ llama3pure({
         "Microsoft is a global technology leader known for its innovative products and services.",
       ],
     },
-    { type: "user", text: "Tell me in 1 line the names of the founders." },
+    { type: "user", text: "Tell me in one line who the founders are." },
   ],
 })
 ```
@@ -196,7 +196,7 @@ worker.postMessage({
         "Microsoft is a global technology leader known for its innovative products and services.",
       ],
     },
-    { type: "user", text: "Tell me in 1 line the names of the founders." },
+    { type: "user", text: "Tell me in one line who the founders are." },
   ],
 })
 ```
