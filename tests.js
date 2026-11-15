@@ -386,9 +386,10 @@ const perfReport = (baseRounds, devRounds, perfModels) => {
 }
 
 // every model found in the folder (or the ones given as arguments), one process at a
-// time so the memory of a model is not counted in the next one: first the rounds of
-// the engine and then the rounds of the dev engine. nothing is saved: the report of
-// the dev engine with respect to the engine is printed at the end
+// time so the memory of a model is not counted in the next one. the rounds alternate
+// (engine, dev engine, engine, dev engine...) so the order does not favor either of
+// them. nothing is saved: the report of the dev engine with respect to the engine is
+// printed at the end
 const testPerformance = (requestedModels) => {
   if (!fs.existsSync(path.resolve(__dirname, ENGINE_DEV))) {
     console.log(ENGINE_DEV + " was not found: there is nothing to compare.")
@@ -400,10 +401,11 @@ const testPerformance = (requestedModels) => {
   )
   const results = {}
 
-  ;[ENGINE, ENGINE_DEV].forEach((engineFile) => {
-    results[engineFile] = []
+  results[ENGINE] = []
+  results[ENGINE_DEV] = []
 
-    for (let round = 0; round < PERF_ROUNDS; round++) {
+  for (let round = 0; round < PERF_ROUNDS; round++) {
+    ;[ENGINE, ENGINE_DEV].forEach((engineFile) => {
       const rows = []
       results[engineFile].push(rows)
 
@@ -428,8 +430,8 @@ const testPerformance = (requestedModels) => {
           rows.push({ Model: model, Error: "The performance test failed." })
         }
       })
-    }
-  })
+    })
+  }
 
   console.log(perfReport(results[ENGINE], results[ENGINE_DEV], perfModels))
 }
