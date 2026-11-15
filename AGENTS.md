@@ -24,7 +24,7 @@ The JavaScript engine is one file used both by Node.js and by the browser. The C
 | `llama3pure-web-demo.htm` | Web chat client. Loads the engine from `llama3pure-js-engine.js` |
 | `llama3pure-web-standalone.htm` | The same client with the engine embedded inside the page |
 | `llama3pure-nodejs-demo.js` | Minimal Node.js example |
-| `tests.js` | Test runner (all models, or one performance run) |
+| `tests.js` | Test runner (all models, or a timed run of every model) |
 | `tests.txt` | Sample chat history in JSON, used by the C tests |
 | `index.html` | Landing page of the project site |
 | `README.md` | User documentation: arguments, parameters, messages, tested models |
@@ -116,10 +116,10 @@ Two things must always hold:
 
 ```bash
 node tests.js        # every model found in the folder, with the C engine and with Node.js
-node tests.js perf   # one timed run with gemma-3-1b-it-Q8_0.gguf
+node tests.js perf   # one timed run of every model found in the folder, with Node.js
 ```
 
-`node tests.js perf` prints the time to read the file, load the model and generate, the number of tokens, and the process memory at the start, after reading, after loading, after generating and at its peak. Its sampling is random, so the number of generated tokens changes from run to run; compare runs with that in mind.
+`node tests.js perf` runs every model found in the folder, one process at a time, holds a chat of two turns with each one (the two questions of the normal tests, with the reply to the first one sent back in the history of the second), prints each reply and ends with one table that has a row per model and the columns of the report below, followed by the columns of the second turn: the process memory at the start, after reading, after loading, after generating and at its peak, and the time to load, to prefill, to the first token, per token and in total. The prefill time is the time to the first token minus the average time per token. Model file names can be given after `perf` to run only those. It runs at temperature 0, so the same engine gives the same replies in every run and two versions of the engine can be compared column by column; a reply that changes means the output of the engine changed.
 
 ## Rules for every improvement or fix
 
@@ -132,6 +132,7 @@ These rules have no exceptions. A change that breaks one of them is not acceptab
 
 How to work within the rules:
 
+- Measure with `node tests.js perf`. It is the tool for every measurement of the JavaScript engine: do not write another benchmark, harness or script for it. If a measurement is missing from it, add it to `tests.js`.
 - Measure before and after with real models, on the unchanged code and on the changed code, and compare stage by stage. Do not estimate.
 - Run measurements one process at a time and repeat them, alternating the old and the new code, before concluding that a number went up or down.
 - Check that the output did not change unless changing it is the purpose of the fix.
@@ -140,7 +141,7 @@ How to work within the rules:
 
 ## Limit on testing rounds
 
-A testing round is the set of runs an AI agent makes to check one possible improvement.
+A testing round is the set of runs an AI agent makes to check one possible improvement. A test run is one execution of `node tests.js perf`.
 
 - **Exactly 5 test runs per model in every round. Always 5: never fewer, never more.** Every model that is tested is run 5 times for the improvement being tried, and then the round is over for that model.
 - If the result is not good enough after those 5 runs, the agent does not keep running the same thing. It tries something else (a different change or a different approach), and that new attempt gets its own round of exactly 5 runs per model, and so on.
@@ -148,31 +149,23 @@ A testing round is the set of runs an AI agent makes to check one possible impro
 
 ## Report required at the end of every improvement
 
-When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not.
+When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the values that `node tests.js perf` prints for the code before the change and for the code after it.
 
 - **One row per GGUF model that was tested.** Every model used in the tests appears, with its file name. Models that were not tested are not listed as if they had been.
-- **One column per instance of the process, for RAM and for speed.** The instances are the stages that were measured: start, after reading the model, after loading, prefill, first token, time per token, each chat turn, after generating, peak, and total.
+- **One single table, with one column per instance of the process.**
+- **The columns are mandatory.** Every table has these ten columns, in this order, and none of them may be left out: `RAM start`, `RAM after read`, `RAM after load`, `RAM after generate`, `RAM peak`, `Speed load`, `Speed prefill`, `Speed first token`, `Speed time per token` and `Speed total`. So every one of those instances must be measured in every round. When a chat of several turns is tested, one extra column per turn is added (for example `Speed first token turn 2`); extra columns never replace the mandatory ones.
 - **No numbers in the cells.** Each cell holds only one of two emojis:
   - ✅ the expected result was reached at that instance.
   - ❌ it was not.
 - **What ✅ means in a RAM cell:** at that instance the new code uses the same RAM as before, or less.
 - **What ✅ means in a speed cell:** at that instance the new code is as fast as before, or faster.
-- Any other outcome is ❌: more RAM at that instance, or slower at that instance. An instance that was not measured is left out of the table; it is never marked ✅.
+- Any other outcome is ❌: more RAM at that instance, or slower at that instance. A mandatory instance that was not measured is marked ❌; it is never marked ✅ and its column is never removed.
 
-Example of the layout (the cells are illustrative):
+Example of the layout (the cell values are illustrative, the columns are mandatory):
 
-RAM (same or less than before):
-
-| Model | Start | After read | After load | After generate | Peak |
-| :-- | :-: | :-: | :-: | :-: | :-: |
-| gemma-3-1b-it-Q8_0.gguf | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Llama-3.2-1B-Instruct-Q8_0.gguf | ✅ | ✅ | ✅ | ❌ | ❌ |
-
-Speed (same or faster than before):
-
-| Model | Load | Prefill | First token | Time per token | Total |
-| :-- | :-: | :-: | :-: | :-: | :-: |
-| gemma-3-1b-it-Q8_0.gguf | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Llama-3.2-1B-Instruct-Q8_0.gguf | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Model | RAM start | RAM after read | RAM after load | RAM after generate | RAM peak | Speed load | Speed prefill | Speed first token | Speed time per token | Speed total |
+| :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
+| gemma-3-1b-it-Q8_0.gguf | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Llama-3.2-1B-Instruct-Q8_0.gguf | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 A single ❌ anywhere in the table means the improvement breaks the rules above and must not be presented as valid.

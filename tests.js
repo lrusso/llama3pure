@@ -1,5 +1,5 @@
 import llama3pure from "./llama3pure-js-engine.js"
-import { execSync } from "child_process"
+import { execSync, spawnSync } from "child_process"
 import { fileURLToPath } from "url"
 import path from "path"
 import fs from "fs"
@@ -122,12 +122,32 @@ const testModelUsingNode = (model) => {
   process.stdout.write("\n")
 }
 
-const testPerformance = () => {
+const perfColumns = [
+  "Model",
+  "RAM start",
+  "RAM after read",
+  "RAM after load",
+  "RAM after generate",
+  "RAM peak",
+  "Speed load",
+  "Speed prefill",
+  "Speed first token",
+  "Speed time per token",
+  "Speed total",
+  "RAM after generate turn 2",
+  "Speed prefill turn 2",
+  "Speed first token turn 2",
+  "Speed time per token turn 2",
+]
+
+// one model, in a process of its own; the row of the table goes to the parent through fd 3.
+// it is a chat of two turns with the two questions of the normal tests: the reply to the
+// first question is sent back in the history of the second one
+const testPerformanceOfModel = (modelName) => {
+  const MB = 1024 * 1024
   const m0 = process.memoryUsage().rss
   const t0 = performance.now()
-  const modelName = "gemma-3-1b-it-Q8_0.gguf"
   const modelPathPerf = path.resolve(__dirname, modelName)
-  const fileSize = fs.statSync(modelPathPerf).size
 
   const buf = readFileAsArrayBuffer(modelPathPerf)
 
@@ -136,12 +156,20 @@ const testPerformance = () => {
 
   let tokenCount = 0
   let mPeak = Math.max(m0, m1)
+  let tFirstToken = 0
+  let tLastToken = 0
+  let reply = ""
 
   llama3pure({
     type: "load",
     model: buf,
     cbRender: (token) => {
+      tLastToken = performance.now()
+      if (tokenCount === 0) {
+        tFirstToken = tLastToken
+      }
       tokenCount++
+      reply = reply + token
       process.stdout.write(token)
       const r = process.memoryUsage().rss
       if (r > mPeak) {
@@ -150,9 +178,7 @@ const testPerformance = () => {
     },
     maxTokens: 256,
     contextSize: 2048,
-    temperature: 0.9,
-    topP: 0.9,
-    topK: 40,
+    temperature: 0,
   })
 
   const t2 = performance.now()
@@ -161,62 +187,107 @@ const testPerformance = () => {
     mPeak = m2
   }
 
-  llama3pure({
-    type: "generate",
-    chatHistory: [
-      { type: "system", text: "You are a helpful assistant." },
-      { type: "user", text: "Tell me in one line what Microsoft is." },
-      {
-        type: "model",
-        response: [
-          "Microsoft is a global technology leader known for its innovative products and services.",
-        ],
-      },
-      { type: "user", text: "Tell me in 1 line the names of the founders." },
-    ],
-  })
+  // one turn: the memory after it and the times of its prefill, first token and tokens.
+  // first token = prefill + one single-token pass, so the prefill is the time to the
+  // first token minus the average time of a single-token pass
+  const runTurn = (chatHistory) => {
+    tokenCount = 0
+    reply = ""
 
-  const t3 = performance.now()
-  const m3 = process.memoryUsage().rss
-  if (m3 > mPeak) {
-    mPeak = m3
+    const tStart = performance.now()
+
+    llama3pure({ type: "generate", chatHistory: chatHistory })
+
+    const ram = process.memoryUsage().rss
+    if (ram > mPeak) {
+      mPeak = ram
+    }
+
+    process.stdout.write("\n")
+
+    const firstToken = tokenCount > 0 ? tFirstToken - tStart : 0
+    const timePerToken =
+      tokenCount > 1 ? (tLastToken - tFirstToken) / (tokenCount - 1) : 0
+    const prefill = tokenCount > 1 ? Math.max(0, firstToken - timePerToken) : 0
+
+    return {
+      ram: ram / MB + " MB",
+      prefill: prefill + " ms",
+      firstToken: firstToken + " ms",
+      timePerToken: timePerToken + " ms",
+    }
   }
 
-  process.stdout.write("\n")
+  const chatHistory = [
+    { type: "system", text: "You are a helpful assistant." },
+    { type: "user", text: "Tell me in one line what Microsoft is." },
+  ]
 
-  const MB = 1024 * 1024
+  const turn1 = runTurn(chatHistory)
+
+  chatHistory.push({ type: "model", response: [reply] })
+  chatHistory.push({ type: "user", text: "Tell me in 1 line the names of the founders." })
+
+  const turn2 = runTurn(chatHistory)
+
+  const t3 = performance.now()
+
+  const row = [
+    modelName,
+    m0 / MB + " MB",
+    m1 / MB + " MB",
+    m2 / MB + " MB",
+    turn1.ram,
+    mPeak / MB + " MB",
+    t2 - t1 + " ms",
+    turn1.prefill,
+    turn1.firstToken,
+    turn1.timePerToken,
+    t3 - t0 + " ms",
+    turn2.ram,
+    turn2.prefill,
+    turn2.firstToken,
+    turn2.timePerToken,
+  ]
+
+  fs.writeSync(3, JSON.stringify(row))
+}
+
+// every model found in the folder (or the ones given as arguments), one process at a
+// time so the memory of a model is not counted in the next one, and one table at the end
+const testPerformance = (requestedModels) => {
+  const perfModels = (requestedModels.length > 0 ? requestedModels : models).filter(
+    (model) => fs.existsSync(path.resolve(__dirname, model))
+  )
+  const rows = []
+
+  perfModels.forEach((model) => {
+    console.log("\x1b[1m" + model + "\x1b[0m")
+
+    const result = spawnSync(
+      process.execPath,
+      ["--max-old-space-size=16384", __filename, "perf-model", model],
+      { stdio: ["inherit", "inherit", "inherit", "pipe"] }
+    )
+
+    const output = result.output && result.output[3] ? result.output[3].toString() : ""
+    if (result.status === 0 && output.length > 0) {
+      rows.push(JSON.parse(output))
+    } else {
+      console.log("The performance test of " + model + " failed.")
+    }
+  })
 
   console.log(
-    "\nModel: " +
-      modelName +
-      " | Size: " +
-      (fileSize / MB).toFixed(0) +
-      " MB\n" +
-      "Read: " +
-      (t1 - t0).toFixed(0) +
-      " ms | Load: " +
-      (t2 - t1).toFixed(0) +
-      " ms | Generate: " +
-      (t3 - t2).toFixed(0) +
-      " ms | Total: " +
-      (t3 - t0).toFixed(0) +
-      " ms | Tokens: " +
-      tokenCount +
-      " | ms/token: " +
-      ((t3 - t2) / tokenCount).toFixed(0) +
-      "\n" +
-      "RAM baseline: " +
-      (m0 / MB).toFixed(0) +
-      " MB | RAM after read: " +
-      (m1 / MB).toFixed(0) +
-      " MB | RAM after load: " +
-      (m2 / MB).toFixed(0) +
-      " MB | RAM after generate: " +
-      (m3 / MB).toFixed(0) +
-      " MB | RAM peak: " +
-      (mPeak / MB).toFixed(0) +
-      " MB"
+    "\n| " +
+      perfColumns.join(" | ") +
+      " |\n| " +
+      perfColumns.map((column, index) => (index === 0 ? ":--" : ":-:")).join(" | ") +
+      " |"
   )
+  rows.forEach((row) => {
+    console.log("| " + row.join(" | ") + " |")
+  })
 }
 
 const testAllModels = () => {
@@ -248,7 +319,9 @@ const testAllModels = () => {
 }
 
 if (process.argv[2] === "perf") {
-  testPerformance()
+  testPerformance(process.argv.slice(3))
+} else if (process.argv[2] === "perf-model") {
+  testPerformanceOfModel(process.argv[3])
 } else {
   testAllModels()
 }
