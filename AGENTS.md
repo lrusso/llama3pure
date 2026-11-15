@@ -133,23 +133,38 @@ These rules have no exceptions. A change that breaks one of them is not acceptab
 How to work within the rules:
 
 - Measure with `node tests.js perf`. It is the tool for every measurement of the JavaScript engine: do not write another benchmark, harness or script for it. If a measurement is missing from it, add it to `tests.js`.
-- Measure before and after with real models, on the unchanged code and on the changed code, and compare stage by stage. Do not estimate.
+- Measure the original code and the changed code with real models and compare their `results.json` files, as described in the next section. Do not estimate.
 - Run measurements one process at a time and repeat them, alternating the old and the new code, before concluding that a number went up or down.
 - Check that the output did not change unless changing it is the purpose of the fix.
 - When a change cannot meet a rule, do not present it as finished: report the numbers and where the rule is broken.
 - Keep the two engines consistent when a change applies to both, rebuild the C binary after changing the C engine, and update the engine embedded in the standalone page after changing the JavaScript engine.
 
+## Comparing a possible improvement with the original code
+
+A possible improvement is always judged against the original code of the project, and the comparison is always made between `results.json` files: the ones produced by the original code and the ones produced by the code with the possible improvement.
+
+- **The original code** is the code of the last commit, without the possible improvement. **The changed code** is the same code with the possible improvement applied.
+- Both are measured with the same `tests.js`, the same model files, the same machine and the same session. Results of the original code from an earlier session are not reused.
+- To run the original code without losing the changes, use a copy of the last commit in a temporary folder outside the repository, with `tests.js` next to it and the model files linked into that folder.
+- Every run of `node tests.js perf` replaces `results.json`. After each run, copy the file to a temporary folder outside the repository, with a name that says which code produced it and which run it was (for example `original-1.json` and `changed-1.json`). These copies are never added to the repository.
+- The runs alternate between the original code and the changed code, one process at a time: the testing round described below applies to both, so each model ends with 5 `results.json` objects of the original code and 5 of the changed code.
+- The comparison is made model by model and key by key, between the objects of the same model:
+  - Each `RAM ...` and `Speed ...` key is one instance. Its value for a code is the average of the 5 runs of that code. The changed code reaches the expected result at that instance when its value is the same as the value of the original code, or lower.
+  - `Reply` and `Reply turn 2` must be identical in the original code and in the changed code, unless changing the output is the purpose of the fix.
+  - An object with an `Error` key, or a model that is missing from one of the files, is a failed measurement: its instances count as not measured.
+- The cells of the report table come from this comparison and from nothing else.
+
 ## Limit on testing rounds
 
 A testing round is the set of runs an AI agent makes to check one possible improvement. A test run is one execution of `node tests.js perf`.
 
-- **Exactly 5 test runs per model in every round. Always 5: never fewer, never more.** Every model that is tested is run 5 times for the improvement being tried, and then the round is over for that model.
+- **Exactly 5 test runs per model in every round. Always 5: never fewer, never more.** Every model that is tested is run 5 times with the changed code and 5 times with the original code it is compared with, and then the round is over for that model.
 - If the result is not good enough after those 5 runs, the agent does not keep running the same thing. It tries something else (a different change or a different approach), and that new attempt gets its own round of exactly 5 runs per model, and so on.
 - The number applies to every model separately and to every round. It is not a total for the whole session.
 
 ## Report required at the end of every improvement
 
-When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the values that `node tests.js perf` saves in `results.json` for the code before the change and for the code after it.
+When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the `results.json` files of the original code with the ones of the changed code, as described in "Comparing a possible improvement with the original code".
 
 - **One row per GGUF model that was tested.** Every model used in the tests appears, with its file name. Models that were not tested are not listed as if they had been.
 - **One single table, with one column per instance of the process.**
