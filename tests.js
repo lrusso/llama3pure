@@ -138,9 +138,11 @@ const perfColumns = [
   "Speed prefill turn 2",
   "Speed first token turn 2",
   "Speed time per token turn 2",
+  "Reply",
+  "Reply turn 2",
 ]
 
-// one model, in a process of its own; the row of the table goes to the parent through fd 3.
+// one model, in a process of its own; its results go to the parent through fd 3.
 // it is a chat of two turns with the two questions of the normal tests: the reply to the
 // first question is sent back in the history of the second one
 const testPerformanceOfModel = (modelName) => {
@@ -170,7 +172,6 @@ const testPerformanceOfModel = (modelName) => {
       }
       tokenCount++
       reply = reply + token
-      process.stdout.write(token)
       const r = process.memoryUsage().rss
       if (r > mPeak) {
         mPeak = r
@@ -203,8 +204,6 @@ const testPerformanceOfModel = (modelName) => {
       mPeak = ram
     }
 
-    process.stdout.write("\n")
-
     const firstToken = tokenCount > 0 ? tFirstToken - tStart : 0
     const timePerToken =
       tokenCount > 1 ? (tLastToken - tFirstToken) / (tokenCount - 1) : 0
@@ -215,6 +214,7 @@ const testPerformanceOfModel = (modelName) => {
       prefill: prefill + " ms",
       firstToken: firstToken + " ms",
       timePerToken: timePerToken + " ms",
+      reply: reply,
     }
   }
 
@@ -248,45 +248,43 @@ const testPerformanceOfModel = (modelName) => {
     turn2.prefill,
     turn2.firstToken,
     turn2.timePerToken,
+    turn1.reply,
+    turn2.reply,
   ]
 
-  fs.writeSync(3, JSON.stringify(row))
+  const result = {}
+  perfColumns.forEach((column, index) => {
+    result[column] = row[index]
+  })
+
+  fs.writeSync(3, JSON.stringify(result))
 }
 
 // every model found in the folder (or the ones given as arguments), one process at a
-// time so the memory of a model is not counted in the next one, and one table at the end
+// time so the memory of a model is not counted in the next one. nothing is printed:
+// the results are saved in results.json, which is written again after every model
 const testPerformance = (requestedModels) => {
   const perfModels = (requestedModels.length > 0 ? requestedModels : models).filter(
     (model) => fs.existsSync(path.resolve(__dirname, model))
   )
-  const rows = []
+  const resultsPath = path.resolve(__dirname, "results.json")
+  const results = []
 
   perfModels.forEach((model) => {
-    console.log("\x1b[1m" + model + "\x1b[0m")
-
     const result = spawnSync(
       process.execPath,
       ["--max-old-space-size=16384", __filename, "perf-model", model],
-      { stdio: ["inherit", "inherit", "inherit", "pipe"] }
+      { stdio: ["ignore", "ignore", "inherit", "pipe"] }
     )
 
     const output = result.output && result.output[3] ? result.output[3].toString() : ""
     if (result.status === 0 && output.length > 0) {
-      rows.push(JSON.parse(output))
+      results.push(JSON.parse(output))
     } else {
-      console.log("The performance test of " + model + " failed.")
+      results.push({ Model: model, Error: "The performance test failed." })
     }
-  })
 
-  console.log(
-    "\n| " +
-      perfColumns.join(" | ") +
-      " |\n| " +
-      perfColumns.map((column, index) => (index === 0 ? ":--" : ":-:")).join(" | ") +
-      " |"
-  )
-  rows.forEach((row) => {
-    console.log("| " + row.join(" | ") + " |")
+    fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2) + "\n")
   })
 }
 

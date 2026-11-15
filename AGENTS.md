@@ -119,7 +119,7 @@ node tests.js        # every model found in the folder, with the C engine and wi
 node tests.js perf   # one timed run of every model found in the folder, with Node.js
 ```
 
-`node tests.js perf` runs every model found in the folder, one process at a time, holds a chat of two turns with each one (the two questions of the normal tests, with the reply to the first one sent back in the history of the second), prints each reply and ends with one table that has a row per model and the columns of the report below, followed by the columns of the second turn: the process memory at the start, after reading, after loading, after generating and at its peak, and the time to load, to prefill, to the first token, per token and in total. The prefill time is the time to the first token minus the average time per token. Model file names can be given after `perf` to run only those. It runs at temperature 0, so the same engine gives the same replies in every run and two versions of the engine can be compared column by column; a reply that changes means the output of the engine changed.
+`node tests.js perf` runs every model found in the folder, one process at a time, holds a chat of two turns with each one (the two questions of the normal tests, with the reply to the first one sent back in the history of the second), prints nothing and saves everything in `results.json` (ignored by git, written again after every model and replaced by the next run): one object per model with the columns of the report below, followed by the columns of the second turn and by the two replies: the process memory at the start, after reading, after loading, after generating and at its peak, and the time to load, to prefill, to the first token, per token and in total. The prefill time is the time to the first token minus the average time per token. Model file names can be given after `perf` to run only those. It runs at temperature 0, so the same engine gives the same replies in every run and two versions of the engine can be compared column by column; a reply that changes means the output of the engine changed.
 
 ## Rules for every improvement or fix
 
@@ -149,7 +149,7 @@ A testing round is the set of runs an AI agent makes to check one possible impro
 
 ## Report required at the end of every improvement
 
-When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the values that `node tests.js perf` prints for the code before the change and for the code after it.
+When an AI agent finishes a possible improvement, it must end its work with a results table. The table is mandatory, whether the improvement worked or not. Its cells are decided by comparing the values that `node tests.js perf` saves in `results.json` for the code before the change and for the code after it.
 
 - **One row per GGUF model that was tested.** Every model used in the tests appears, with its file name. Models that were not tested are not listed as if they had been.
 - **One single table, with one column per instance of the process.**
