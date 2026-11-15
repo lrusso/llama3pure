@@ -226,7 +226,10 @@ const testPerformanceOfModel = (modelName) => {
   const turn1 = runTurn(chatHistory)
 
   chatHistory.push({ type: "model", response: [reply] })
-  chatHistory.push({ type: "user", text: "Tell me in 1 line the names of the founders." })
+  chatHistory.push({
+    type: "user",
+    text: "Tell me in 1 line the names of the founders.",
+  })
 
   const turn2 = runTurn(chatHistory)
 
@@ -277,7 +280,8 @@ const testPerformance = (requestedModels) => {
       { stdio: ["ignore", "ignore", "inherit", "pipe"] }
     )
 
-    const output = result.output && result.output[3] ? result.output[3].toString() : ""
+    const output =
+      result.output && result.output[3] ? result.output[3].toString() : ""
     if (result.status === 0 && output.length > 0) {
       results.push(JSON.parse(output))
     } else {

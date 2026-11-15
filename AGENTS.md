@@ -6,28 +6,28 @@ Guide for anyone (human or AI agent) changing this repository: what each part do
 
 llama3pure runs Llama 3 and Gemma 3 language models from GGUF files with no external code. It has three ways to run the same inference:
 
-| Target | File | How it runs |
-| :-- | :-- | :-- |
-| Desktop (C) | `llama3pure-c-engine.c` | Command-line program built with `make llama3pure` |
-| Node.js | `llama3pure-js-engine.js` | Imported as a module and called as a function |
-| Web | `llama3pure-js-engine.js` | The same file, started as a Web Worker by a page |
+| Target      | File                      | How it runs                                       |
+| :---------- | :------------------------ | :------------------------------------------------ |
+| Desktop (C) | `llama3pure-c-engine.c`   | Command-line program built with `make llama3pure` |
+| Node.js     | `llama3pure-js-engine.js` | Imported as a module and called as a function     |
+| Web         | `llama3pure-js-engine.js` | The same file, started as a Web Worker by a page  |
 
 The JavaScript engine is one file used both by Node.js and by the browser. The C engine is a separate implementation of the same pipeline.
 
 ## Files
 
-| File | Purpose |
-| :-- | :-- |
-| `llama3pure-js-engine.js` | JavaScript inference engine (Node.js and Web Worker) |
-| `llama3pure-c-engine.c` | C inference engine, single source file |
-| `Makefile` | Builds the C engine. `make llama3pure` is the build that matters |
-| `llama3pure-web-demo.htm` | Web chat client. Loads the engine from `llama3pure-js-engine.js` |
-| `llama3pure-web-standalone.htm` | The same client with the engine embedded inside the page |
-| `llama3pure-nodejs-demo.js` | Minimal Node.js example |
-| `tests.js` | Test runner (all models, or a timed run of every model) |
-| `tests.txt` | Sample chat history in JSON, used by the C tests |
-| `index.html` | Landing page of the project site |
-| `README.md` | User documentation: arguments, parameters, messages, tested models |
+| File                            | Purpose                                                            |
+| :------------------------------ | :----------------------------------------------------------------- |
+| `llama3pure-js-engine.js`       | JavaScript inference engine (Node.js and Web Worker)               |
+| `llama3pure-c-engine.c`         | C inference engine, single source file                             |
+| `Makefile`                      | Builds the C engine. `make llama3pure` is the build that matters   |
+| `llama3pure-web-demo.htm`       | Web chat client. Loads the engine from `llama3pure-js-engine.js`   |
+| `llama3pure-web-standalone.htm` | The same client with the engine embedded inside the page           |
+| `llama3pure-nodejs-demo.js`     | Minimal Node.js example                                            |
+| `tests.js`                      | Test runner (all models, or a timed run of every model)            |
+| `tests.txt`                     | Sample chat history in JSON, used by the C tests                   |
+| `index.html`                    | Landing page of the project site                                   |
+| `README.md`                     | User documentation: arguments, parameters, messages, tested models |
 
 GGUF model files are not part of the repository. `tests.js` lists the file names it looks for in the repository folder and skips the ones that are missing.
 
@@ -179,9 +179,9 @@ When an AI agent finishes a possible improvement, it must end its work with a re
 
 Example of the layout (the cell values are illustrative, the columns are mandatory):
 
-| Model | RAM start | RAM after read | RAM after load | RAM after generate | RAM peak | Speed load | Speed prefill | Speed first token | Speed time per token | Speed total |
-| :-- | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: | :-: |
-| gemma-3-1b-it-Q8_0.gguf | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Llama-3.2-1B-Instruct-Q8_0.gguf | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Model                           | RAM start | RAM after read | RAM after load | RAM after generate | RAM peak | Speed load | Speed prefill | Speed first token | Speed time per token | Speed total |
+| :------------------------------ | :-------: | :------------: | :------------: | :----------------: | :------: | :--------: | :-----------: | :---------------: | :------------------: | :---------: |
+| gemma-3-1b-it-Q8_0.gguf         |    ✅     |       ✅       |       ✅       |         ✅         |    ✅    |     ✅     |      ✅       |        ✅         |          ✅          |     ✅      |
+| Llama-3.2-1B-Instruct-Q8_0.gguf |    ✅     |       ✅       |       ✅       |         ❌         |    ❌    |     ✅     |      ✅       |        ✅         |          ✅          |     ✅      |
 
 A single ❌ anywhere in the table means the improvement breaks the rules above and must not be presented as valid.
