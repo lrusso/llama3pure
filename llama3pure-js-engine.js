@@ -3451,7 +3451,7 @@ function loadWeights(gguf) {
   w.hasKQuant = false
   // Some matrix is block-32 (the prefill keeps a Q8_0 copy of every input)
   w.hasBlock32 = false
-  // Some layer matrix goes through the Q8_0 Int32 kernels (see generate)
+  // Some layer matrix goes through the Q8_0 Int32 kernels
   w.q8Layers = false
 
   // Load tensor as dequantized float (for small tensors like norms and embeddings)
@@ -3804,8 +3804,6 @@ function createRunState(p, hasBlock32) {
     // Token of every cached position; generate() keeps the matching prefix
     kvTokens: new Int32Array(0),
     kvCount: 0,
-    // How many of the leading positions were written by the batched prefill
-    kvBatch: 0,
     attnScale: 1.0 / Math.sqrt(headSize),
     embedScale: Math.sqrt(p.dim),
     // Cache config values to avoid property lookups in hot loops
@@ -4390,9 +4388,6 @@ function transformer(token, pos, computeLogits) {
   // Note which token this pass left in the KV cache
   s.kvTokens[pos] = token
   s.kvCount = pos + 1
-  if (s.kvBatch > pos) {
-    s.kvBatch = pos
-  }
 }
 
 // transformerPrefill: tokens allTokens[startPos .. startPos + n - 1] in one
@@ -4638,9 +4633,6 @@ function transformerPrefill(allTokens, startPos, n) {
     s.kvTokens[startPos + b] = allTokens[startPos + b]
   }
   s.kvCount = startPos + n
-  if (s.kvBatch >= startPos) {
-    s.kvBatch = startPos + n
-  }
 }
 
 // Dequantize one token's embedding row into dst
@@ -5492,14 +5484,9 @@ function generate(chatHistory) {
   }
 
   // Reuse the KV cache of the previous call: positions whose tokens match the
-  // start of this prompt stay (the last prompt token always runs again). With
-  // Q8_0 layer matrices only prefilled positions are kept: the single-token
-  // kernel sums in another order
+  // start of this prompt stay (the last prompt token always runs again)
   var kvTokens = state.kvTokens
   var reuse = state.kvCount
-  if (weights.q8Layers && reuse > state.kvBatch) {
-    reuse = state.kvBatch
-  }
   if (reuse > state.kvCapacity) {
     reuse = state.kvCapacity
   }
@@ -5510,9 +5497,6 @@ function generate(chatHistory) {
     pos = pos + 1
   }
   state.kvCount = pos
-  if (state.kvBatch > pos) {
-    state.kvBatch = pos
-  }
   token = promptTokens[pos]
 
   // Batched prefill: process all prompt tokens except the last in batches
