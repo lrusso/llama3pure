@@ -1131,10 +1131,10 @@
         replyFrame = window.requestAnimationFrame(renderReplyFrame)
       }
 
-      function handleReply(content, reply, promptResult, prompt) {
+      function handleReply(content, replyText, promptResult, prompt) {
         var inputTextbox = document.querySelector(".input_textbox")
 
-        if (reply === "") {
+        if (replyText === "") {
           setTimeout(function () {
             // removing the last user prompt and re-asking
             chatHistory.pop()
@@ -1143,8 +1143,8 @@
           return
         }
 
-        chatHistory.push({ type: "model", response: [reply] })
-        replies.push(reply)
+        chatHistory.push({ type: "model", response: [replyText] })
+        replies.push(replyText)
         selectedReply = replies.length
         document.title = t("title")
 
@@ -1518,8 +1518,8 @@
         var inlineCodes = []
         markdown = markdown.replace(
           /(^|[^`])(`+)(?!`)([^\n]*?[^`\n])\2(?!`)/g,
-          function (_match, before, _ticks, code) {
-            inlineCodes.push(code)
+          function (_match, before, _ticks, inlineCode) {
+            inlineCodes.push(inlineCode)
             return before + "%%CODELLAMAINLINE" + (inlineCodes.length - 1) + "%%"
           }
         )
@@ -1634,8 +1634,8 @@
           // after the bullet (e.g. "*   text") become just one
           {
             regex: /^([ \t]*)[\*\-\+][ \t]+(.+)$/gm,
-            replacement: function replacement(_match, indent, item) {
-              return indent + "&#8226; " + item
+            replacement: function replacement(_match, bulletIndent, item) {
+              return bulletIndent + "&#8226; " + item
             },
           },
           // the asterisks must be next to the text, so 5 * 3 * 2 isn't an emphasis
@@ -1699,8 +1699,8 @@
         markdown = markdown.replace(
           /%%CODELLAMABLOCK(\d+)%%/g,
           function (_match, index) {
-            var code = codeBlocks[index].replace(/```/g, "")
-            return "<code>" + getCodeCopyButton() + code + "</code>"
+            var blockCode = codeBlocks[index].replace(/```/g, "")
+            return "<code>" + getCodeCopyButton() + blockCode + "</code>"
           }
         )
 

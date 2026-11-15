@@ -1134,7 +1134,7 @@ function vecDotQ8_0(x, srcOffset, n) {
 // int8 + scales, then a 4-row x 3-token integer tile against the Q8_0 x
 
 // Unpack one row: int8 weights w8[wOff..], scales sc[scOff + b], mins mn (*_1)
-function unpackRowQ4_0(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
+function unpackRowQ4_0(u8, bo, w8, wOff, sc, scOff, _mn, _mnOff, nb) {
   var wi = wOff
   for (var b = 0; b < nb; b = b + 1) {
     sc[scOff + b] = fp16Table[u8[bo] | (u8[bo + 1] << 8)]
@@ -1163,7 +1163,7 @@ function unpackRowQ4_1(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
   }
 }
 
-function unpackRowQ5_0(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
+function unpackRowQ5_0(u8, bo, w8, wOff, sc, scOff, _mn, _mnOff, nb) {
   var wi = wOff
   for (var b = 0; b < nb; b = b + 1) {
     sc[scOff + b] = fp16Table[u8[bo] | (u8[bo + 1] << 8)]
@@ -1194,7 +1194,7 @@ function unpackRowQ5_1(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
   }
 }
 
-function unpackRowIQ4_NL(u8, bo, w8, wOff, sc, scOff, mn, mnOff, nb) {
+function unpackRowIQ4_NL(u8, bo, w8, wOff, sc, scOff, _mn, _mnOff, nb) {
   var wi = wOff
   var kv = kvalues_iq4nl
   for (var b = 0; b < nb; b = b + 1) {
@@ -3917,9 +3917,9 @@ function ensureBatchBuffers(s) {
   }
   var q8Stride = s._batchQ8Stride
   if (q8Stride > 0) {
-    var xQ8Size = s._batchXQ8Size
-    s.batchQ8 = tokenViews(Uint8Array, buf, off, q8Stride, xQ8Size, n)
-    s.batchQ8i8 = tokenViews(Int8Array, buf, off, q8Stride, xQ8Size, n)
+    var q8Size = s._batchXQ8Size
+    s.batchQ8 = tokenViews(Uint8Array, buf, off, q8Stride, q8Size, n)
+    s.batchQ8i8 = tokenViews(Int8Array, buf, off, q8Stride, q8Size, n)
   }
   setRopeSlots(s, PREFILL_BATCH_SIZE)
   s._batchBuffersReady = true
@@ -5655,6 +5655,7 @@ function llama3pure(data) {
         if (data.model instanceof ArrayBuffer) {
           loadModel(data.model)
         } else {
+          // eslint-disable-next-line no-console
           console.log("The model parameter is required and must be an ArrayBuffer.")
           return
         }
@@ -5673,6 +5674,7 @@ function llama3pure(data) {
         break
     }
   } catch (err) {
+    // eslint-disable-next-line no-console
     console.log(err)
 
     // a reply that fails is ended anyway, so the chat doesn't wait for it forever: a
