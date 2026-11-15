@@ -2479,6 +2479,8 @@ function matmulQ4_KRows(out, x, qw, i) {
   var s2 = 0.0
   var s3 = 0.0
   var xb = 0
+  var xs = rowsXSums
+  var gi = 0
   for (var b = 0; b < nb; b = b + 1) {
     // d, dmin and the three scale words of each row's block
     var h
@@ -2507,19 +2509,10 @@ function matmulQ4_KRows(out, x, qw, i) {
     var v3 = I32[(p + rw3 + 2) | 0]
     var w3 = I32[(p + rw3 + 3) | 0]
     for (var c = 0; c < 8; c = c + 1) {
-      var sm
-      sm = kScaleMin(c, u0, v0, w0)
-      var k0 = d0 * (sm & 0xff)
-      var m0 = n0 * (sm >>> 8)
-      sm = kScaleMin(c, u1, v1, w1)
-      var k1 = d1 * (sm & 0xff)
-      var m1 = n1 * (sm >>> 8)
-      sm = kScaleMin(c, u2, v2, w2)
-      var k2 = d2 * (sm & 0xff)
-      var m2 = n2 * (sm >>> 8)
-      sm = kScaleMin(c, u3, v3, w3)
-      var k3 = d3 * (sm & 0xff)
-      var m3 = n3 * (sm >>> 8)
+      var g0 = 0.0
+      var g1 = 0.0
+      var g2 = 0.0
+      var g3 = 0.0
       var sh = (c & 1) << 2
       var pq = (p + 4 + ((c >> 1) << 3)) | 0
       for (var k = 0; k < 8; k = k + 1) {
@@ -2531,26 +2524,46 @@ function matmulQ4_KRows(out, x, qw, i) {
         var pk = (pq + k) | 0
         var q
         q = (I32[pk] >> sh) & 0x0f0f0f0f
-        s0 = s0 + x0 * (k0 * (q & 0xff) - m0)
-        s0 = s0 + x1 * (k0 * ((q >>> 8) & 0xff) - m0)
-        s0 = s0 + x2 * (k0 * ((q >>> 16) & 0xff) - m0)
-        s0 = s0 + x3 * (k0 * (q >>> 24) - m0)
+        g0 =
+          g0 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q = (I32[(pk + rw) | 0] >> sh) & 0x0f0f0f0f
-        s1 = s1 + x0 * (k1 * (q & 0xff) - m1)
-        s1 = s1 + x1 * (k1 * ((q >>> 8) & 0xff) - m1)
-        s1 = s1 + x2 * (k1 * ((q >>> 16) & 0xff) - m1)
-        s1 = s1 + x3 * (k1 * (q >>> 24) - m1)
+        g1 =
+          g1 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q = (I32[(pk + rw2) | 0] >> sh) & 0x0f0f0f0f
-        s2 = s2 + x0 * (k2 * (q & 0xff) - m2)
-        s2 = s2 + x1 * (k2 * ((q >>> 8) & 0xff) - m2)
-        s2 = s2 + x2 * (k2 * ((q >>> 16) & 0xff) - m2)
-        s2 = s2 + x3 * (k2 * (q >>> 24) - m2)
+        g2 =
+          g2 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q = (I32[(pk + rw3) | 0] >> sh) & 0x0f0f0f0f
-        s3 = s3 + x0 * (k3 * (q & 0xff) - m3)
-        s3 = s3 + x1 * (k3 * ((q >>> 8) & 0xff) - m3)
-        s3 = s3 + x2 * (k3 * ((q >>> 16) & 0xff) - m3)
-        s3 = s3 + x3 * (k3 * (q >>> 24) - m3)
+        g3 =
+          g3 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
       }
+      // Scale and min of the group, once per row
+      var xsum = xs[gi]
+      gi = (gi + 1) | 0
+      var sm
+      sm = kScaleMin(c, u0, v0, w0)
+      s0 = s0 + (d0 * (sm & 0xff) * g0 - n0 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u1, v1, w1)
+      s1 = s1 + (d1 * (sm & 0xff) * g1 - n1 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u2, v2, w2)
+      s2 = s2 + (d2 * (sm & 0xff) * g2 - n2 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u3, v3, w3)
+      s3 = s3 + (d3 * (sm & 0xff) * g3 - n3 * (sm >>> 8) * xsum)
       xb = xb + 32
     }
     p = (p + 36) | 0
@@ -2574,6 +2587,8 @@ function matmulQ5_KRows(out, x, qw, i) {
   var s2 = 0.0
   var s3 = 0.0
   var xb = 0
+  var xs = rowsXSums
+  var gi = 0
   for (var b = 0; b < nb; b = b + 1) {
     // d, dmin and the three scale words of each row's block
     var h
@@ -2602,19 +2617,10 @@ function matmulQ5_KRows(out, x, qw, i) {
     var v3 = I32[(p + rw3 + 2) | 0]
     var w3 = I32[(p + rw3 + 3) | 0]
     for (var c = 0; c < 8; c = c + 1) {
-      var sm
-      sm = kScaleMin(c, u0, v0, w0)
-      var k0 = d0 * (sm & 0xff)
-      var m0 = n0 * (sm >>> 8)
-      sm = kScaleMin(c, u1, v1, w1)
-      var k1 = d1 * (sm & 0xff)
-      var m1 = n1 * (sm >>> 8)
-      sm = kScaleMin(c, u2, v2, w2)
-      var k2 = d2 * (sm & 0xff)
-      var m2 = n2 * (sm >>> 8)
-      sm = kScaleMin(c, u3, v3, w3)
-      var k3 = d3 * (sm & 0xff)
-      var m3 = n3 * (sm >>> 8)
+      var g0 = 0.0
+      var g1 = 0.0
+      var g2 = 0.0
+      var g3 = 0.0
       var sh = (c & 1) << 2
       var pq = (p + 12 + ((c >> 1) << 3)) | 0
       for (var k = 0; k < 8; k = k + 1) {
@@ -2627,32 +2633,52 @@ function matmulQ5_KRows(out, x, qw, i) {
         var hk = (p + 4 + k) | 0
         var q
         q = ((I32[pk] >> sh) & 0x0f0f0f0f) | (((I32[hk] >> c) & 0x01010101) << 4)
-        s0 = s0 + x0 * (k0 * (q & 0xff) - m0)
-        s0 = s0 + x1 * (k0 * ((q >>> 8) & 0xff) - m0)
-        s0 = s0 + x2 * (k0 * ((q >>> 16) & 0xff) - m0)
-        s0 = s0 + x3 * (k0 * (q >>> 24) - m0)
+        g0 =
+          g0 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((I32[(pk + rw) | 0] >> sh) & 0x0f0f0f0f) |
           (((I32[(hk + rw) | 0] >> c) & 0x01010101) << 4)
-        s1 = s1 + x0 * (k1 * (q & 0xff) - m1)
-        s1 = s1 + x1 * (k1 * ((q >>> 8) & 0xff) - m1)
-        s1 = s1 + x2 * (k1 * ((q >>> 16) & 0xff) - m1)
-        s1 = s1 + x3 * (k1 * (q >>> 24) - m1)
+        g1 =
+          g1 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((I32[(pk + rw2) | 0] >> sh) & 0x0f0f0f0f) |
           (((I32[(hk + rw2) | 0] >> c) & 0x01010101) << 4)
-        s2 = s2 + x0 * (k2 * (q & 0xff) - m2)
-        s2 = s2 + x1 * (k2 * ((q >>> 8) & 0xff) - m2)
-        s2 = s2 + x2 * (k2 * ((q >>> 16) & 0xff) - m2)
-        s2 = s2 + x3 * (k2 * (q >>> 24) - m2)
+        g2 =
+          g2 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((I32[(pk + rw3) | 0] >> sh) & 0x0f0f0f0f) |
           (((I32[(hk + rw3) | 0] >> c) & 0x01010101) << 4)
-        s3 = s3 + x0 * (k3 * (q & 0xff) - m3)
-        s3 = s3 + x1 * (k3 * ((q >>> 8) & 0xff) - m3)
-        s3 = s3 + x2 * (k3 * ((q >>> 16) & 0xff) - m3)
-        s3 = s3 + x3 * (k3 * (q >>> 24) - m3)
+        g3 =
+          g3 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
       }
+      // Scale and min of the group, once per row
+      var xsum = xs[gi]
+      gi = (gi + 1) | 0
+      var sm
+      sm = kScaleMin(c, u0, v0, w0)
+      s0 = s0 + (d0 * (sm & 0xff) * g0 - n0 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u1, v1, w1)
+      s1 = s1 + (d1 * (sm & 0xff) * g1 - n1 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u2, v2, w2)
+      s2 = s2 + (d2 * (sm & 0xff) * g2 - n2 * (sm >>> 8) * xsum)
+      sm = kScaleMin(c, u3, v3, w3)
+      s3 = s3 + (d3 * (sm & 0xff) * g3 - n3 * (sm >>> 8) * xsum)
       xb = xb + 32
     }
     p = (p + 44) | 0
@@ -2691,6 +2717,7 @@ function matmulK16Rows(out, x, qw, i) {
   var s2 = 0.0
   var s3 = 0.0
   var xb = 0
+  var xs = rowsXSums
   for (var blk = 0; blk < nb; blk = blk + 1) {
     var d0 = fp16Table[U16[(vb + r0 + blockWords - 1) | 0]]
     var d1 = fp16Table[U16[(vb + r0 + 1 * rowWords + blockWords - 1) | 0]]
@@ -2713,10 +2740,10 @@ function matmulK16Rows(out, x, qw, i) {
       sp = (sp + rowWords) | 0
     }
     for (var t = 0; t < 16; t = t + 1) {
-      var e0 = d0 * (sc[(0 + t) | 0] - scBias)
-      var e1 = d1 * (sc[(16 + t) | 0] - scBias)
-      var e2 = d2 * (sc[(32 + t) | 0] - scBias)
-      var e3 = d3 * (sc[(48 + t) | 0] - scBias)
+      var g0 = 0.0
+      var g1 = 0.0
+      var g2 = 0.0
+      var g3 = 0.0
       var h = t >> 3
       var g = (t >> 1) & 3
       var ss = (t & 1) << 3
@@ -2746,32 +2773,46 @@ function matmulK16Rows(out, x, qw, i) {
         q =
           ((DV.getInt32(lk | 0, true) >> loShift) & loMask) |
           (((DV.getInt32(hk | 0, true) >> hiShift) & hiMask) << hiUp)
-        s0 = s0 + x0 * (e0 * ((q & 0xff) - bias))
-        s0 = s0 + x1 * (e0 * (((q >>> 8) & 0xff) - bias))
-        s0 = s0 + x2 * (e0 * (((q >>> 16) & 0xff) - bias))
-        s0 = s0 + x3 * (e0 * ((q >>> 24) - bias))
+        g0 =
+          g0 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((DV.getInt32((lk + rb) | 0, true) >> loShift) & loMask) |
           (((DV.getInt32((hk + rb) | 0, true) >> hiShift) & hiMask) << hiUp)
-        s1 = s1 + x0 * (e1 * ((q & 0xff) - bias))
-        s1 = s1 + x1 * (e1 * (((q >>> 8) & 0xff) - bias))
-        s1 = s1 + x2 * (e1 * (((q >>> 16) & 0xff) - bias))
-        s1 = s1 + x3 * (e1 * ((q >>> 24) - bias))
+        g1 =
+          g1 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((DV.getInt32((lk + rb2) | 0, true) >> loShift) & loMask) |
           (((DV.getInt32((hk + rb2) | 0, true) >> hiShift) & hiMask) << hiUp)
-        s2 = s2 + x0 * (e2 * ((q & 0xff) - bias))
-        s2 = s2 + x1 * (e2 * (((q >>> 8) & 0xff) - bias))
-        s2 = s2 + x2 * (e2 * (((q >>> 16) & 0xff) - bias))
-        s2 = s2 + x3 * (e2 * ((q >>> 24) - bias))
+        g2 =
+          g2 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
         q =
           ((DV.getInt32((lk + rb3) | 0, true) >> loShift) & loMask) |
           (((DV.getInt32((hk + rb3) | 0, true) >> hiShift) & hiMask) << hiUp)
-        s3 = s3 + x0 * (e3 * ((q & 0xff) - bias))
-        s3 = s3 + x1 * (e3 * (((q >>> 8) & 0xff) - bias))
-        s3 = s3 + x2 * (e3 * (((q >>> 16) & 0xff) - bias))
-        s3 = s3 + x3 * (e3 * ((q >>> 24) - bias))
+        g3 =
+          g3 +
+          x0 * (q & 0xff) +
+          x1 * ((q >>> 8) & 0xff) +
+          x2 * ((q >>> 16) & 0xff) +
+          x3 * (q >>> 24)
       }
+      // Scale and bias of the group, once per row
+      var xbias = bias * xs[xb >> 4]
+      s0 = s0 + d0 * (sc[(0 + t) | 0] - scBias) * (g0 - xbias)
+      s1 = s1 + d1 * (sc[(16 + t) | 0] - scBias) * (g1 - xbias)
+      s2 = s2 + d2 * (sc[(32 + t) | 0] - scBias) * (g2 - xbias)
+      s3 = s3 + d3 * (sc[(48 + t) | 0] - scBias) * (g3 - xbias)
       xb = xb + 16
     }
     r0 = (r0 + blockWords) | 0
@@ -2784,6 +2825,8 @@ function matmulK16Rows(out, x, qw, i) {
 
 // DataView of the matrix being multiplied (Q3_K / Q6_K, see matmulRows)
 var rowsDataView = null
+// Sums of x per column group for the K-quant kernels, in an idle buffer
+var rowsXSums = null
 
 // Single-token matmul through a fused kernel; leftover rows: generic kernel
 function matmulRows(out, x, qw) {
@@ -2794,10 +2837,27 @@ function matmulRows(out, x, qw) {
     // Q3_K / Q6_K: DataView for 4-byte loads, only during the call
     rowsDataView = new DataView(ggufData, qw.dataOffset, qw.rows * qw.rowSize)
   }
+  if (qw.type >= GGML_TYPE.Q3_K && qw.type <= GGML_TYPE.Q6_K) {
+    // K-quants: sum of x over every group of 32 columns (16: Q3_K / Q6_K)
+    var gs = qw.view.BYTES_PER_ELEMENT === 2 ? 16 : 32
+    var xs = out === state.logits ? state.hb64 : state.logits64
+    var cols = qw.cols
+    var g = 0
+    for (var j = 0; j < cols; j = j + gs) {
+      var sum = 0.0
+      for (var k = 0; k < gs; k = k + 1) {
+        sum = sum + x[(j + k) | 0]
+      }
+      xs[g] = sum
+      g = g + 1
+    }
+    rowsXSums = xs
+  }
   for (var i = 0; i < rowsN; i = i + step) {
     rowsFunc(out, x, qw, i)
   }
   rowsDataView = null
+  rowsXSums = null
   if (rowsN < qw.rows) {
     matmulKQuantLocal(out, x, qw, rowsN)
   }
@@ -4639,13 +4699,28 @@ function transformerPrefill(allTokens, startPos, n) {
 function embedToken(dst, token) {
   var emb = weights.tokenEmbedding
   if (emb.k.kind === 3) {
+    // F16 / BF16 / F32: through the idle hb as Float64, the destination type
+    // of the prefill, so the row dequantizers see one kind of array
+    var cols = emb.cols
+    var stage = state.hb64
+    var direct =
+      stage.length < cols ||
+      (emb.type !== GGML_TYPE.F16 &&
+        emb.type !== GGML_TYPE.BF16 &&
+        emb.type !== 30 &&
+        emb.type !== GGML_TYPE.F32)
     emb.k.deqRowFunc(
       emb.view,
       emb.base + (token * emb.rowSize) / emb.view.BYTES_PER_ELEMENT,
-      dst,
+      direct ? dst : stage,
       0,
-      emb.cols
+      cols
     )
+    if (!direct) {
+      for (var j = 0; j < cols; j = j + 1) {
+        dst[j] = stage[j]
+      }
+    }
   } else {
     dequantizeRow(dst, emb.dataOffset + token * emb.rowSize, emb.cols, emb.type)
   }
