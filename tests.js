@@ -126,7 +126,7 @@ const testModelUsingNode = (model) => {
           "Microsoft is a global technology leader known for its innovative products and services.",
         ],
       },
-      { type: "user", text: "Tell me in 1 line the names of the founders." },
+      { type: "user", text: "Tell me in one line who the founders are." },
     ],
   })
 
@@ -241,7 +241,7 @@ const testPerformanceOfModel = (engineFile, modelName) => {
   chatHistory.push({ type: "model", response: [reply] })
   chatHistory.push({
     type: "user",
-    text: "Tell me in 1 line the names of the founders.",
+    text: "Tell me in one line who the founders are.",
   })
 
   const turn2 = runTurn(chatHistory)
