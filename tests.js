@@ -166,14 +166,18 @@ const perfColumns = [
   "RAM buffers after load",
   "RAM buffers after generate",
   "RAM buffers after generate turn 2",
+  "RAM heap peak",
+  "RAM buffers peak",
   "Reply",
   "Reply turn 2",
 ]
 
 // one model, in a process of its own; its results go to the parent through fd 3.
 // it is a chat of two turns with the two questions of the normal tests: the reply to the
-// first question is sent back in the history of the second one
-const testPerformanceOfModel = (engineFile, modelName) => {
+// first question is sent back in the history of the second one. with exactPeak, it is the
+// run that looks for the exact peaks: it forces a collection on every token, so its
+// times are not valid and only its two peak columns are used
+const testPerformanceOfModel = (engineFile, modelName, exactPeak) => {
   loadEngine(engineFile)
 
   const MB = 1024 * 1024
@@ -187,11 +191,19 @@ const testPerformanceOfModel = (engineFile, modelName) => {
   const collect = vm.runInNewContext("gc")
   let tCollect = 0
   let modelBytes = 0
+  let heapPeak = 0
+  let buffersPeak = 0
   const exactCounters = () => {
     const tStart = performance.now()
     collect()
     const usage = process.memoryUsage()
     tCollect = tCollect + (performance.now() - tStart)
+    if (usage.heapUsed > heapPeak) {
+      heapPeak = usage.heapUsed
+    }
+    if (usage.arrayBuffers - modelBytes > buffersPeak) {
+      buffersPeak = usage.arrayBuffers - modelBytes
+    }
     return {
       heap: usage.heapUsed / KB + " KB",
       buffers: (usage.arrayBuffers - modelBytes) / KB + " KB",
@@ -229,6 +241,9 @@ const testPerformanceOfModel = (engineFile, modelName) => {
       const r = process.memoryUsage().rss
       if (r > mPeak) {
         mPeak = r
+      }
+      if (exactPeak) {
+        exactCounters()
       }
     },
     maxTokens: 256,
@@ -316,6 +331,8 @@ const testPerformanceOfModel = (engineFile, modelName) => {
     exactLoad.buffers,
     turn1.buffers,
     turn2.buffers,
+    exactPeak ? heapPeak / KB + " KB" : undefined,
+    exactPeak ? buffersPeak / KB + " KB" : undefined,
     turn1.reply,
     turn2.reply,
   ]
@@ -418,20 +435,24 @@ const perfReport = (baseRounds, devRounds, perfModels) => {
       const dev = perfAverage(devRounds, model, column)
       const baseRange = perfRange(baseRounds, model, column)
       const devRange = perfRange(devRounds, model, column)
+      // the exact peaks come from one run per engine: there are no rounds to compare
+      const oneRun = column === "RAM heap peak" || column === "RAM buffers peak"
+      const note = (noOverlap) =>
+        oneRun ? " (one run per engine)" : noOverlap ? " (no overlap)" : " (overlap)"
       if (base === null || dev === null) {
         groups["Not measured"].push(column)
         totals.missing++
       } else if (dev < base) {
-        const noOverlap = devRange.max < baseRange.min
+        const noOverlap = !oneRun && devRange.max < baseRange.min
         groups[isRam ? "Less RAM" : "Faster"].push(
-          column + " " + percent(base, dev) + (noOverlap ? " (no overlap)" : " (overlap)")
+          column + " " + percent(base, dev) + note(noOverlap)
         )
         totals.better++
         totals.betterNoOverlap += noOverlap ? 1 : 0
       } else if (dev > base) {
-        const noOverlap = devRange.min > baseRange.max
+        const noOverlap = !oneRun && devRange.min > baseRange.max
         groups[isRam ? "More RAM" : "Slower"].push(
-          column + " " + percent(base, dev) + (noOverlap ? " (no overlap)" : " (overlap)")
+          column + " " + percent(base, dev) + note(noOverlap)
         )
         totals.worse++
         totals.worseNoOverlap += noOverlap ? 1 : 0
@@ -480,11 +501,33 @@ const perfReport = (baseRounds, devRounds, perfModels) => {
   return lines.join("\n")
 }
 
+// one model in a process of its own: its results, or null when it failed. the engine is
+// given as 0 or 1 and not by its name: the arguments are in the heap, and a longer name
+// would count as more heap in use
+const runPerformanceOfModel = (engineFile, model, exactPeak) => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "--max-old-space-size=16384",
+      __filename,
+      "perf-model",
+      engineFile === ENGINE ? "0" : "1",
+      model,
+      exactPeak ? "1" : "0",
+    ],
+    { stdio: ["ignore", "ignore", "inherit", "pipe"] }
+  )
+
+  const output = result.output && result.output[3] ? result.output[3].toString() : ""
+  return result.status === 0 && output.length > 0 ? JSON.parse(output) : null
+}
+
 // every model found in the folder (or the ones given as arguments), one process at a
 // time so the memory of a model is not counted in the next one. the rounds alternate
 // (engine, dev engine, engine, dev engine...) so the order does not favor either of
-// them. nothing is saved: the report of the dev engine with respect to the engine is
-// printed at the end
+// them. after the rounds, one more run per engine and model looks for the exact peaks,
+// which are the same in every round. nothing is saved: the report of the dev engine
+// with respect to the engine is printed at the end
 const testPerformance = (requestedModels) => {
   if (!fs.existsSync(path.resolve(__dirname, ENGINE_DEV))) {
     console.log(ENGINE_DEV + " was not found: there is nothing to compare.")
@@ -505,28 +548,30 @@ const testPerformance = (requestedModels) => {
       results[engineFile].push(rows)
 
       perfModels.forEach((model) => {
-        const result = spawnSync(
-          process.execPath,
-          [
-            "--max-old-space-size=16384",
-            __filename,
-            "perf-model",
-            engineFile === ENGINE ? "0" : "1",
-            model,
-          ],
-          { stdio: ["ignore", "ignore", "inherit", "pipe"] }
+        rows.push(
+          runPerformanceOfModel(engineFile, model, false) || {
+            Model: model,
+            Error: "The performance test failed.",
+          }
         )
-
-        const output =
-          result.output && result.output[3] ? result.output[3].toString() : ""
-        if (result.status === 0 && output.length > 0) {
-          rows.push(JSON.parse(output))
-        } else {
-          rows.push({ Model: model, Error: "The performance test failed." })
-        }
       })
     })
   }
+
+  perfModels.forEach((model) => {
+    ;[ENGINE, ENGINE_DEV].forEach((engineFile) => {
+      const peaks = runPerformanceOfModel(engineFile, model, true)
+      if (peaks) {
+        results[engineFile].forEach((rows) => {
+          const row = rows.find((item) => item.Model === model)
+          if (row && !row.Error) {
+            row["RAM heap peak"] = peaks["RAM heap peak"]
+            row["RAM buffers peak"] = peaks["RAM buffers peak"]
+          }
+        })
+      }
+    })
+  })
 
   console.log(perfReport(results[ENGINE], results[ENGINE_DEV], perfModels))
 }
@@ -563,11 +608,10 @@ const testAllModels = () => {
 if (process.argv[2] === "perf") {
   testPerformance(process.argv.slice(3))
 } else if (process.argv[2] === "perf-model") {
-  // the engine is given as 0 or 1 and not by its name: the arguments are in the heap, and
-  // a longer name would count as more heap in use
   testPerformanceOfModel(
     [ENGINE, ENGINE_DEV][process.argv[3]] || process.argv[3],
-    process.argv[4]
+    process.argv[4],
+    process.argv[5] === "1"
   )
 } else {
   testAllModels()
