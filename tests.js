@@ -566,7 +566,7 @@ if (process.argv[2] === "perf") {
   // the engine is given as 0 or 1 and not by its name: the arguments are in the heap, and
   // a longer name would count as more heap in use
   testPerformanceOfModel(
-    process.argv[3] === "0" ? ENGINE : process.argv[3] === "1" ? ENGINE_DEV : process.argv[3],
+    [ENGINE, ENGINE_DEV][process.argv[3]] || process.argv[3],
     process.argv[4]
   )
 } else {
