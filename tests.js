@@ -1,21 +1,31 @@
 import { execSync, spawnSync } from "child_process"
-import { createRequire } from "module"
+import Module from "module"
 import { fileURLToPath } from "url"
 import path from "path"
 import fs from "fs"
+import v8 from "v8"
+import vm from "vm"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
-const require = createRequire(import.meta.url)
 
 const ENGINE = "llama3pure-js-engine.js"
 const ENGINE_DEV = "llama3pure-js-engine-dev.js"
 const PERF_ROUNDS = 5
 
-// the engine is loaded on demand, so a process only holds the engine it measures
+// the engine is loaded on demand, so a process only holds the engine it measures. it is
+// always compiled under the name of the engine, because the heap in use depends on the
+// length of the file name: with its own name, an identical dev engine has more heap
 let llama3pure = null
 const loadEngine = (engineFile) => {
-  llama3pure = require(path.resolve(__dirname, engineFile))
+  const enginePath = path.resolve(__dirname, ENGINE)
+  const engineModule = new Module(enginePath)
+  engineModule.filename = enginePath
+  engineModule._compile(
+    fs.readFileSync(path.resolve(__dirname, engineFile), "utf8"),
+    enginePath
+  )
+  llama3pure = engineModule.exports
 }
 
 if (!process.execArgv.includes("--max-old-space-size=16384")) {
@@ -149,6 +159,13 @@ const perfColumns = [
   "Speed prefill turn 2",
   "Speed first token turn 2",
   "Speed time per token turn 2",
+  "RAM heap start",
+  "RAM heap after load",
+  "RAM heap after generate",
+  "RAM heap after generate turn 2",
+  "RAM buffers after load",
+  "RAM buffers after generate",
+  "RAM buffers after generate turn 2",
   "Reply",
   "Reply turn 2",
 ]
@@ -160,7 +177,30 @@ const testPerformanceOfModel = (engineFile, modelName) => {
   loadEngine(engineFile)
 
   const MB = 1024 * 1024
+  const KB = 1024
+
+  // the exact counters: the heap in use and the bytes of the buffers, read after a
+  // forced collection so that only what is still referenced is counted. the memory of
+  // the process is always read before the collection, and the time of the collections
+  // is taken out of the total
+  v8.setFlagsFromString("--expose-gc")
+  const collect = vm.runInNewContext("gc")
+  let tCollect = 0
+  let modelBytes = 0
+  const exactCounters = () => {
+    const tStart = performance.now()
+    collect()
+    const usage = process.memoryUsage()
+    tCollect = tCollect + (performance.now() - tStart)
+    return {
+      heap: usage.heapUsed / KB + " KB",
+      buffers: (usage.arrayBuffers - modelBytes) / KB + " KB",
+    }
+  }
+
   const m0 = process.memoryUsage().rss
+  const exactStart = exactCounters()
+  tCollect = 0
   const t0 = performance.now()
   const modelPathPerf = path.resolve(__dirname, modelName)
 
@@ -168,6 +208,7 @@ const testPerformanceOfModel = (engineFile, modelName) => {
 
   const t1 = performance.now()
   const m1 = process.memoryUsage().rss
+  modelBytes = buf.byteLength
 
   let tokenCount = 0
   let mPeak = Math.max(m0, m1)
@@ -200,6 +241,7 @@ const testPerformanceOfModel = (engineFile, modelName) => {
   if (m2 > mPeak) {
     mPeak = m2
   }
+  const exactLoad = exactCounters()
 
   // one turn: the memory after it and the times of its prefill, first token and tokens.
   // first token = prefill + one single-token pass, so the prefill is the time to the
@@ -221,9 +263,12 @@ const testPerformanceOfModel = (engineFile, modelName) => {
     const timePerToken =
       tokenCount > 1 ? (tLastToken - tFirstToken) / (tokenCount - 1) : 0
     const prefill = tokenCount > 1 ? Math.max(0, firstToken - timePerToken) : 0
+    const exact = exactCounters()
 
     return {
       ram: ram / MB + " MB",
+      heap: exact.heap,
+      buffers: exact.buffers,
       prefill: prefill + " ms",
       firstToken: firstToken + " ms",
       timePerToken: timePerToken + " ms",
@@ -259,11 +304,18 @@ const testPerformanceOfModel = (engineFile, modelName) => {
     turn1.prefill,
     turn1.firstToken,
     turn1.timePerToken,
-    t3 - t0 + " ms",
+    t3 - t0 - tCollect + " ms",
     turn2.ram,
     turn2.prefill,
     turn2.firstToken,
     turn2.timePerToken,
+    exactStart.heap,
+    exactLoad.heap,
+    turn1.heap,
+    turn2.heap,
+    exactLoad.buffers,
+    turn1.buffers,
+    turn2.buffers,
     turn1.reply,
     turn2.reply,
   ]
@@ -290,6 +342,23 @@ const perfAverage = (rounds, model, column) => {
   return rounds.length > 0 ? sum / rounds.length : null
 }
 
+// the lowest and the highest value of a column in the rounds of an engine, or null
+// when a round of the model failed or the column is missing
+const perfRange = (rounds, model, column) => {
+  let min = Infinity
+  let max = -Infinity
+  for (let i = 0; i < rounds.length; i++) {
+    const row = rounds[i].find((item) => item.Model === model)
+    if (!row || row.Error || row[column] === undefined) {
+      return null
+    }
+    const value = parseFloat(row[column])
+    min = Math.min(min, value)
+    max = Math.max(max, value)
+  }
+  return rounds.length > 0 ? { min: min, max: max } : null
+}
+
 // true when a reply column is the same text in every round of both engines
 const perfSameReplies = (baseRounds, devRounds, model, column) => {
   const replies = baseRounds.concat(devRounds).map((round) => {
@@ -301,10 +370,19 @@ const perfSameReplies = (baseRounds, devRounds, model, column) => {
 
 // the report of the dev engine with respect to the engine: per model, the columns where
 // it is faster, slower or equal and where it uses less, more or the same RAM, with the
-// percentage of difference between the averages of the rounds
+// percentage of difference between the averages of the rounds. a difference has no
+// overlap when every round of one engine is on the same side of every round of the
+// other one; with overlap, the rounds of both engines are mixed
 const perfReport = (baseRounds, devRounds, perfModels) => {
   const lines = []
-  const totals = { better: 0, worse: 0, equal: 0, missing: 0 }
+  const totals = {
+    better: 0,
+    worse: 0,
+    equal: 0,
+    missing: 0,
+    betterNoOverlap: 0,
+    worseNoOverlap: 0,
+  }
   const columns = perfColumns.filter(
     (column) => column.startsWith("RAM ") || column.startsWith("Speed ")
   )
@@ -338,15 +416,25 @@ const perfReport = (baseRounds, devRounds, perfModels) => {
       const isRam = column.startsWith("RAM ")
       const base = perfAverage(baseRounds, model, column)
       const dev = perfAverage(devRounds, model, column)
+      const baseRange = perfRange(baseRounds, model, column)
+      const devRange = perfRange(devRounds, model, column)
       if (base === null || dev === null) {
         groups["Not measured"].push(column)
         totals.missing++
       } else if (dev < base) {
-        groups[isRam ? "Less RAM" : "Faster"].push(column + " " + percent(base, dev))
+        const noOverlap = devRange.max < baseRange.min
+        groups[isRam ? "Less RAM" : "Faster"].push(
+          column + " " + percent(base, dev) + (noOverlap ? " (no overlap)" : " (overlap)")
+        )
         totals.better++
+        totals.betterNoOverlap += noOverlap ? 1 : 0
       } else if (dev > base) {
-        groups[isRam ? "More RAM" : "Slower"].push(column + " " + percent(base, dev))
+        const noOverlap = devRange.min > baseRange.max
+        groups[isRam ? "More RAM" : "Slower"].push(
+          column + " " + percent(base, dev) + (noOverlap ? " (no overlap)" : " (overlap)")
+        )
         totals.worse++
+        totals.worseNoOverlap += noOverlap ? 1 : 0
       } else {
         groups[isRam ? "Same RAM" : "Same speed"].push(column + " 0.00 %")
         totals.equal++
@@ -380,6 +468,13 @@ const perfReport = (baseRounds, devRounds, perfModels) => {
       " equal, " +
       totals.missing +
       " not measured"
+  )
+  lines.push(
+    "Without overlap between the rounds of both engines: " +
+      totals.betterNoOverlap +
+      " faster or with less RAM, " +
+      totals.worseNoOverlap +
+      " slower or with more RAM"
   )
 
   return lines.join("\n")
@@ -416,7 +511,7 @@ const testPerformance = (requestedModels) => {
             "--max-old-space-size=16384",
             __filename,
             "perf-model",
-            engineFile,
+            engineFile === ENGINE ? "0" : "1",
             model,
           ],
           { stdio: ["ignore", "ignore", "inherit", "pipe"] }
@@ -468,7 +563,12 @@ const testAllModels = () => {
 if (process.argv[2] === "perf") {
   testPerformance(process.argv.slice(3))
 } else if (process.argv[2] === "perf-model") {
-  testPerformanceOfModel(process.argv[3], process.argv[4])
+  // the engine is given as 0 or 1 and not by its name: the arguments are in the heap, and
+  // a longer name would count as more heap in use
+  testPerformanceOfModel(
+    process.argv[3] === "0" ? ENGINE : process.argv[3] === "1" ? ENGINE_DEV : process.argv[3],
+    process.argv[4]
+  )
 } else {
   testAllModels()
 }
